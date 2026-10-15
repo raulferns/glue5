@@ -1,0 +1,57 @@
+name: Build Glue5 IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+
+    env:
+      GLUE5_GAME_DIR: ${{ github.workspace }}/game
+      CARGO_BUILD_JOBS: "2"
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download your game code
+        env:
+          GAME_WASM_URL: ${{ secrets.GAME_WASM_URL }}
+        run: |
+          if [ -z "$GAME_WASM_URL" ]; then
+            echo "Add the GAME_WASM_URL repository secret first."
+            exit 1
+          fi
+          mkdir -p game/b/8b0b5899ed
+          curl --fail --location --retry 3 \
+            "$GAME_WASM_URL" \
+            --output game/b/8b0b5899ed/game.wasm
+
+      - name: Install build tools
+        uses: jdx/mise-action@v2
+
+      - name: Build unsigned iOS app
+        run: mise run ios:build
+
+      - name: Package IPA
+        run: |
+          mkdir -p package/Payload
+          cp -R \
+            "target/ios/derived/Build/Products/Release-iphoneos/Glue 5.app" \
+            package/Payload/
+          cd package
+          zip -qry Glue5.ipa Payload
+
+      - name: Save IPA download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Glue5-IPA
+          path: package/Glue5.ipa
+          retention-days: 3
