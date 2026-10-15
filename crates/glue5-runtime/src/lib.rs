@@ -25,6 +25,7 @@ pub mod qos;
 mod readback;
 mod scenario;
 mod shader_settings;
+mod shadow_reveal;
 mod script_assets;
 mod skin;
 mod stats;
@@ -261,6 +262,7 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     memory::hooks(&mut hooks);
     skin::hooks(&mut hooks);
     shader_settings::hooks(&mut hooks);
+    shadow_reveal::hooks(&mut hooks);
     device_reset::hooks(&mut hooks);
     readback::hooks(&mut hooks);
     audio_update::hooks(&mut hooks);
