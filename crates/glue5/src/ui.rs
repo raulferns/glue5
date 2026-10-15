@@ -19,10 +19,11 @@ use sdl3::keyboard::Scancode;
 use sdl3::mouse::MouseButton;
 use sdl3::video::Window;
 
-use crate::settings::Settings;
+use crate::settings::{PerfOverlay, Settings};
 
 mod credits;
 mod pages;
+mod perf;
 mod theme;
 mod widgets;
 use credits::credits_page;
@@ -98,6 +99,8 @@ pub struct Status<'a> {
     pub graphics_reset: bool,
     /// The window, in pixels.
     pub window: (u32, u32),
+    /// The game's back buffer, while it runs.
+    pub back_buffer: Option<(u32, u32)>,
     /// The upscalers this GPU has.
     pub upscalers: &'a [crate::settings::Upscaling],
     /// This GPU can generate frames (with MetalFX Temporal).
@@ -158,6 +161,7 @@ pub struct Ui {
     /// When egui wants to draw again (before the game, frames are drawn
     /// only for input or for this).
     repaint_at: Option<Instant>,
+    perf: perf::PerfHud,
 }
 
 impl Ui {
@@ -183,6 +187,7 @@ impl Ui {
             online_open: false,
             gear: None,
             repaint_at: Some(Instant::now()),
+            perf: Default::default(),
         }
     }
 
@@ -390,8 +395,9 @@ impl Ui {
         self.key(key, false, Default::default());
     }
 
-    /// Draws the open page, or over the game the touch controls (if given)
-    /// and the settings button (if given, at this opacity).
+    /// Draws the open page, or over the game the touch controls (if given),
+    /// the settings button (if given, at this opacity) and the performance
+    /// overlay (if on).
     pub fn frame(
         &mut self,
         window: &Window,
@@ -402,8 +408,13 @@ impl Ui {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let gear = gear.filter(|_| self.page.is_none());
-        if self.page.is_none() && touch.is_none() && gear.is_none() {
-            if self.drawn {
+        let hud = status.started.is_some() && self.page.is_none() && settings.overlay == PerfOverlay::Glue5;
+        if !hud {
+            self.perf.hide();
+        }
+        if self.page.is_none() && touch.is_none() && gear.is_none() && (!hud || !self.perf.due(settings.overlay_detail))
+        {
+            if self.drawn && !hud {
                 self.overlay.submit(Vec::new(), Default::default(), 1.0);
                 self.drawn = false;
             }
@@ -441,6 +452,9 @@ impl Ui {
             touch.draw(&ctx.layer_painter(LayerId::background()), settings.touch_opacity);
         }
         self.gear = gear.map(|alpha| draw_gear(&ctx, safe, settings.touch_size, alpha));
+        if hud {
+            self.perf.draw(&ctx, safe, settings, status);
+        }
         if self.page.is_some() && status.started.is_none() {
             theme::backdrop(&ctx, self.background.as_ref());
         }

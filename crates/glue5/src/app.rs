@@ -24,7 +24,7 @@ use sdl3::mouse::MouseButton;
 
 use crate::haptics;
 use crate::paths::{self, MOBILE};
-use crate::settings::{self, Settings, TouchMode, Upscaling};
+use crate::settings::{self, PerfOverlay, Settings, TouchMode, Upscaling};
 use crate::touch::Touch;
 use crate::ui::{self, Action, Mode, Page, Started, Status, Ui};
 use crate::{audio, benchmark, keymap, pads};
@@ -58,7 +58,7 @@ pub fn run() -> Result<()> {
     let user_dir = paths::user_dir()?;
     let mut settings = Settings::load(&user_dir);
     // Before the GPU opens; turned on later, it shows from the next launch.
-    let metal_hud = settings.metal_hud;
+    let metal_hud = cfg!(target_vendor = "apple") && settings.overlay == PerfOverlay::MetalHud;
     if metal_hud {
         // SAFETY: Apple's libc locks the environment for getenv and setenv
         // (elsewhere this does nothing).
@@ -79,7 +79,7 @@ pub fn run() -> Result<()> {
     settings.for_screen(pixels.1);
 
     let presentation = Presentation::new(pixels, settings.vsync, upscaler(&settings));
-    presentation.set_metal_hud(settings.metal_hud);
+    presentation.set_metal_hud(settings.overlay == PerfOverlay::MetalHud);
     let overlay = glue5_gpu::Overlay::default();
     let instance = glue5_gpu::instance();
     #[cfg(target_os = "android")]
@@ -415,7 +415,8 @@ impl App {
 
         // What applies at once (the engine's own frame limiter at its next start).
         self.presentation.set_vsync(self.settings.vsync);
-        self.presentation.set_metal_hud(self.settings.metal_hud);
+        self.presentation.set_metal_hud(self.settings.overlay == PerfOverlay::MetalHud);
+        glue5_gpu::perf::set_on(in_game && self.settings.overlay == PerfOverlay::Glue5);
         self.presentation.set_frame_rate(self.settings.max_fps);
         self.presentation.set_upscaler(upscaler(&self.settings));
         self.presentation.set_sharpness(self.settings.sharpness);
@@ -432,6 +433,7 @@ impl App {
                 last_failure: self.last_failure.as_deref(),
                 graphics_reset: self.graphics_reset,
                 window: self.window.size_in_pixels(),
+                back_buffer: self.game.as_ref().map(|g| g.back_buffer),
                 upscalers: &self.upscalers,
                 frame_generation: self.frame_generation,
                 metal_hud: self.metal_hud,

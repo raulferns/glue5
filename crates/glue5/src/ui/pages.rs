@@ -4,7 +4,7 @@ use super::widgets::{
 };
 use super::{Action, Mode, Page, SettingsTab, Status, WARN, theme};
 use crate::paths::{self, MOBILE};
-use crate::settings::{self, RENDER_SCALES, Settings, TouchMode, Upscaling};
+use crate::settings::{self, Corner, OverlayDetail, PerfOverlay, RENDER_SCALES, Settings, TouchMode, Upscaling};
 use egui::{Align, Align2, Color32, Id, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
 /// The only platform differences are capabilities, not layout.
@@ -654,14 +654,43 @@ fn settings_items(
                 |ui| choice(ui, &mut settings.max_fps, &rates),
             );
             setting(ui, "VSync", Control::Toggle, None, |ui| toggle(ui, &mut settings.vsync));
-            #[cfg(target_vendor = "apple")]
+            let mut overlays = vec![(PerfOverlay::Off, "Off")];
+            if cfg!(target_vendor = "apple") {
+                overlays.push((PerfOverlay::MetalHud, "Metal HUD"));
+            }
+            overlays.push((PerfOverlay::Glue5, "Glue 5"));
             setting(
                 ui,
-                "Metal HUD",
-                Control::Toggle,
-                (settings.metal_hud && !status.metal_hud).then_some("Next launch"),
-                |ui| toggle(ui, &mut settings.metal_hud),
+                "Performance overlay",
+                Control::Choice,
+                (settings.overlay == PerfOverlay::MetalHud && !status.metal_hud).then_some("Next launch"),
+                |ui| choice(ui, &mut settings.overlay, &overlays),
             );
+            if settings.overlay == PerfOverlay::Glue5 {
+                setting(ui, "Overlay detail", Control::Choice, None, |ui| {
+                    choice(
+                        ui,
+                        &mut settings.overlay_detail,
+                        &[
+                            (OverlayDetail::Minimal, "Minimal"),
+                            (OverlayDetail::Standard, "Standard"),
+                            (OverlayDetail::Full, "Full"),
+                        ],
+                    )
+                });
+                setting(ui, "Overlay position", Control::Choice, None, |ui| {
+                    choice(
+                        ui,
+                        &mut settings.overlay_corner,
+                        &[
+                            (Corner::TopLeft, "Top left"),
+                            (Corner::TopRight, "Top right"),
+                            (Corner::BottomLeft, "Bottom left"),
+                            (Corner::BottomRight, "Bottom right"),
+                        ],
+                    )
+                });
+            }
         }
         SettingsTab::Controls => {
             setting(ui, "Touch controls", Control::Choice, None, |ui| {
@@ -743,7 +772,7 @@ fn next_start(differs: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{Mode, SettingsTab, Status, settings_page, start_page, theme};
-    use crate::settings::{Settings, Upscaling};
+    use crate::settings::{PerfOverlay, Settings, Upscaling};
     use egui::{Id, Pos2, Rect, SafeAreaInsets, vec2};
     use std::path::Path;
 
@@ -755,6 +784,7 @@ mod tests {
             last_failure: None,
             graphics_reset: false,
             window: (1440, 900),
+            back_buffer: None,
             upscalers: &[Upscaling::Bicubic, Upscaling::MetalFx, Upscaling::MetalFxTemporal, Upscaling::Fsr],
             frame_generation: true,
             metal_hud: false,
@@ -822,9 +852,17 @@ mod tests {
     }
     #[test]
     fn phone_settings_use_the_height_and_keep_video_options_reachable() {
+        for (overlay, last) in [(PerfOverlay::Off, "Performance overlay"), (PerfOverlay::Glue5, "Overlay position")] {
+            let mut settings = Settings::default();
+            settings.overlay = overlay;
+            phone_video_options(settings, last);
+        }
+    }
+
+    /// The Video tab on a phone, `last` its last option.
+    fn phone_video_options(mut settings: Settings, last: &str) {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let mut settings = Settings::default();
         let mut tab = SettingsTab::Video;
         for pass in 0..8 {
             let mut output = ctx.run_ui(
@@ -836,7 +874,7 @@ mod tests {
                             egui::Event::PointerMoved(Pos2::new(430.0, 300.0)),
                             egui::Event::MouseWheel {
                                 unit: egui::MouseWheelUnit::Point,
-                                delta: vec2(0.0, -150.0),
+                                delta: vec2(0.0, -600.0),
                                 phase: egui::TouchPhase::Move,
                                 modifiers: egui::Modifiers::default(),
                             },
@@ -875,12 +913,19 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                assert_eq!(rows.len(), if cfg!(target_vendor = "apple") { 5 } else { 4 });
-                // The original options fit without scrolling. On Apple, the
-                // additional HUD row must be fully reachable by scrolling.
+                // The first four fit without scrolling; the last is fully
+                // reachable by scrolling (rows out of view are not drawn).
                 let visible = if pass == 3 { &rows[..4] } else { &rows[rows.len() - 1..] };
                 for (rect, clip) in visible {
                     assert!(clip.contains_rect(*rect), "clipped option: {rect:?} in {clip:?}");
+                }
+                if pass == 7 {
+                    let label = |s: &egui::epaint::ClippedShape| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == last => Some(t.visual_bounding_rect()),
+                        _ => None,
+                    };
+                    let rect = output.shapes.iter().find_map(label).expect("the last option is drawn");
+                    assert!(visible[0].0.contains_rect(rect), "{last} is not the last row shown");
                 }
             }
         }

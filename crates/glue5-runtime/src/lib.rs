@@ -8,6 +8,7 @@
 pub mod audio;
 mod audio_update;
 mod cloud;
+pub mod cpu;
 mod device_reset;
 mod dht;
 pub mod exit;
@@ -15,6 +16,7 @@ pub mod game_settings;
 mod gamer_tags;
 mod gamelog;
 pub mod gpu;
+mod granular;
 mod imports;
 pub mod input;
 pub mod memory;
@@ -266,6 +268,7 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     device_reset::hooks(&mut hooks);
     readback::hooks(&mut hooks);
     audio_update::hooks(&mut hooks);
+    granular::hooks(&mut hooks);
     script_assets::hooks(&mut hooks);
     gamer_tags::hooks(&mut hooks);
     scenario::hooks(&mut hooks);
