@@ -1,0 +1,24 @@
+# A release with the game's code (a .wasm) or an app built from it
+# (Glue5-*) goes back to draft as soon as it is published: published, anyone
+# could download them. See docs/github-build.md.
+name: Release guard
+
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    if: ${{ !github.event.release.draft }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+      - name: Back to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/draft.sh guard "${{ github.event.release.id }}"

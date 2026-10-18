@@ -7,6 +7,7 @@
 
 pub mod audio;
 mod audio_update;
+mod blips;
 mod boot_screen;
 mod cloud;
 pub mod cpu;
@@ -14,6 +15,7 @@ mod device_reset;
 mod dht;
 pub mod exit;
 mod files;
+pub mod friends;
 pub mod game_settings;
 mod gamer_tags;
 mod gamelog;
@@ -26,6 +28,7 @@ pub mod memory;
 mod online;
 mod overlay;
 mod p2p;
+pub mod prompts;
 pub mod qos;
 mod readback;
 mod scenario;
@@ -34,6 +37,7 @@ mod shadow_reveal;
 mod script_assets;
 mod skin;
 mod stats;
+mod stream;
 mod texts;
 mod threads;
 mod time;
@@ -74,9 +78,12 @@ pub mod layout {
         game.join("b").join(super::GAME_BUILD).join("shaders")
     }
 
-    /// Whether `game` holds the game, for this build.
+    /// Whether `game` holds the game, for this build (a stream's partial
+    /// copy does not).
     pub fn is_game_dir(game: &Path) -> bool {
-        data_dir(game).is_dir() && shader_dir(game).join("index.json").is_file()
+        data_dir(game).is_dir()
+            && shader_dir(game).join("index.json").is_file()
+            && !game.join(glue5_stream::cache::MARKER).exists()
     }
 }
 
@@ -86,8 +93,11 @@ use crate::vfs::Vfs;
 /// How the game is started.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The game directory: `b/<build>/` (shaders) and `data/`.
+    /// The game directory: `b/<build>/` (shaders) and `data/`. When the game
+    /// streams, the stream's copy ([`glue5_stream::Client::root`]).
     pub game_dir: PathBuf,
+    /// The game's files come from a server, through this client (ready).
+    pub stream: Option<std::sync::Arc<glue5_stream::Client>>,
     /// Where saves and settings go.
     pub user_dir: PathBuf,
     /// Back buffer size.
@@ -118,8 +128,9 @@ pub struct Config {
 pub struct Online {
     /// The player's name, as the others see it (16 characters at most).
     pub name: String,
-    /// A private lobby's code; empty: the lobby of everyone, where the
-    /// game's matchmaking puts the player in a session.
+    /// The lobby to start in: empty, everyone's, where the game's
+    /// matchmaking puts the player in a session; a friend's, to join it
+    /// there. The session's kind moves the player on (`online.rs`).
     pub lobby: String,
 }
 
@@ -169,8 +180,9 @@ impl Config {
         // for the GPU to finish the previous frame before it starts the
         // next. The game's benchmark ran 11-32 % faster with two on Windows
         // and 8 % on a Pixel 8a, for a frame more of latency. iPhones gained
-        // nothing (their CPU sets the pace): they keep one.
-        let ios = cfg!(target_os = "ios");
+        // nothing (their CPU sets the pace): they keep one, and so does the
+        // Apple TV (the same chips, and less memory).
+        let ios = cfg!(any(target_os = "ios", target_os = "tvos"));
         if !ios && !extra.iter().any(|a| a.to_ascii_lowercase().starts_with("-framequeuelimit")) {
             args.push("-FrameQueueLimit=2".into());
         }
@@ -244,7 +256,9 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     log::info!("engine log: {} (GLUE5_ENGINE_LOG=stdout also prints it)", log.display());
     glue5_game::set_trap_hook(trap_site::record);
     time::fine_timers();
-    let vfs = Vfs::new(data.clone(), config.user_dir.clone()).with_context(|| format!("opening {}", data.display()))?;
+    // Streaming, the engine's HTTP device serves /game (stream.rs).
+    let game_files = config.stream.is_none().then(|| data.clone());
+    let vfs = Vfs::new(game_files, config.user_dir.clone()).with_context(|| format!("opening {}", data.display()))?;
     let memory = WasmMemory::reserve()?;
     let runtime = Runtime {
         config,
@@ -267,6 +281,7 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     gamelog::hooks(&mut hooks);
     memory::hooks(&mut hooks);
     files::hooks(&mut hooks);
+    blips::hooks(&mut hooks);
     skin::hooks(&mut hooks);
     shader_settings::hooks(&mut hooks);
     shadow_reveal::hooks(&mut hooks);
@@ -280,9 +295,12 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     tour::hooks(&mut hooks);
     upscale::hooks(&mut hooks);
     boot_screen::hooks(&mut hooks);
+    stream::hooks(&mut hooks);
+    prompts::hooks(&mut hooks);
     if let Some(online) = &rt().config.online {
         online::start(online, &mut hooks);
     }
+    friends::set_playing(if rt().config.online.is_some() { friends::Playing::Online } else { friends::Playing::Story });
     glue5_game::install(glue5_game::imports_from!(imports), hooks);
     let engine = threads::spawn_main()?;
     Ok(Game { engine })

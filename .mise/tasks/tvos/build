@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Only build the Apple TV app, unsigned (checks that it links)"
+#MISE depends=["setup"]
+. "$(dirname "$0")/lib.sh"
+
+tvos_project
+xcodebuild_app generic/platform=tvOS CODE_SIGNING_ALLOWED=NO
+echo "built $app (unsigned)"

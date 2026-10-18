@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#MISE description="Build the Apple TV app for the simulator, install it there and launch it with its console"
+#MISE depends=["setup"]
+#MISE raw=true
+#USAGE arg "[simulator]" help="Name or UDID of a tvOS simulator (default: an Apple TV 4K (3rd generation))"
+# The Mac's GPU and memory, not an Apple TV's: it shows that the app works
+# on tvOS (pages, remote, streaming, the game), not how it runs there. The
+# simulator shares the Mac's network: Bonjour finds a computer sharing the
+# game, 127.0.0.1 is this Mac. Xcode needs its tvOS platform (Settings ›
+# Components).
+. "$(dirname "$0")/lib.sh"
+
+wanted=${usage_simulator:-Apple TV 4K (3rd generation)}
+sim=$(xcrun simctl list devices available tvOS | awk -v w="$wanted" '
+    index($0, "    " w " (") || index($0, "(" w ")") {
+        match($0, /\([0-9A-F-]+\) \(/)
+        print substr($0, RSTART + 1, RLENGTH - 4)
+        exit
+    }')
+[ -n "$sim" ] || die "no tvOS simulator named $wanted (xcrun simctl list devices tvOS)"
+xcrun simctl bootstatus "$sim" -b >/dev/null
+open -a Simulator --args -CurrentDeviceUDID "$sim"
+tvos_project aarch64-apple-tvos-sim
+xcodebuild_app "platform=tvOS Simulator,id=$sim"
+xcrun simctl install "$sim" "$sim_app"
+# The same switches as a desktop run: RUST_LOG and the GLUE5_* variables.
+for key in $(compgen -e | grep '^GLUE5_'); do
+    case $key in GLUE5_TEAM | GLUE5_GAME_DIR) continue ;; esac
+    export "SIMCTL_CHILD_$key=${!key}"
+done
+SIMCTL_CHILD_RUST_LOG=${RUST_LOG:-info} xcrun simctl launch --console-pty --terminate-running-process "$sim" "$bundle_id"

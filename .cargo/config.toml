@@ -9,6 +9,11 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 [target.aarch64-apple-ios]
 rustflags = ["-Ctarget-cpu=apple-a11"]
 
+# Apple TV: the A12 (Apple TV 4K, 2nd generation) and later; earlier ones
+# have too little memory for the game.
+[target.aarch64-apple-tvos]
+rustflags = ["-Ctarget-cpu=apple-a12"]
+
 # Android: ARMv8.2 (as the game's C, see glue5-game/build/main.rs) instead of
 # the ARMv8.0 default; Rust has no stable v8.2a feature, so its parts that
 # code generation uses: LSE atomics, RDM and CRC.

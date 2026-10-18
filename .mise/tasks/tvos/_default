@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#MISE description="Build the Apple TV app, install it on the Apple TV and launch it with its console"
+#MISE depends=["setup"]
+#MISE raw=true
+#USAGE arg "[device]" help="Name, identifier or UDID (default: the only one paired)"
+# Signed with the team in GLUE5_TEAM (e.g. in .mise/config.local.toml). The
+# Apple TV pairs with Xcode once (Settings › Remotes and Devices › Remote App
+# and Devices on the TV, Window › Devices and Simulators in Xcode). It keeps
+# no game: the app streams it from a computer sharing it (the start page's
+# Server button, or Settings › Game › Server; found by Bonjour).
+. "$(dirname "$0")/lib.sh"
+
+[ -n "${GLUE5_TEAM:-}" ] || die "set GLUE5_TEAM to your Apple development team id (Xcode > Settings > Accounts), e.g. in .mise/config.local.toml"
+pick_device "${usage_device:-}"
+tvos_project
+# Built for the device itself: Xcode registers it with the team and puts it
+# in the provisioning profile.
+xcodebuild_app "platform=tvOS,id=$udid" -allowProvisioningUpdates -allowProvisioningDeviceRegistration
+xcrun devicectl device install app --device "$device" "$app"
+# The first launch right after an install often fails on iOS; likewise here.
+started=$SECONDS
+launch || {
+    status=$?
+    [ $((SECONDS - started)) -lt 10 ] || exit $status
+    echo "launch failed; trying again" >&2
+    sleep 3
+    launch
+}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Launch the installed Apple TV app again, with its console"
+#MISE raw=true
+#USAGE arg "[device]" help="Name, identifier or UDID (default: the only one paired)"
+. "$(dirname "$0")/lib.sh"
+
+pick_device "${usage_device:-}"
+launch

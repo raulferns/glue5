@@ -123,7 +123,8 @@ impl PerfHud {
         *self = PerfHud::default();
     }
 
-    pub(super) fn draw(&mut self, ctx: &egui::Context, safe: Rect, settings: &Settings, status: &Status) {
+    /// Draws the overlay; returns where (what else is drawn keeps off it).
+    pub(super) fn draw(&mut self, ctx: &egui::Context, safe: Rect, settings: &Settings, status: &Status) -> Rect {
         let now = Instant::now();
         self.drawn_at = Some(now);
         let snapshot = glue5_gpu::perf::snapshot();
@@ -158,7 +159,7 @@ impl PerfHud {
             let rect = place(safe, settings.overlay_corner, galley.size() + vec2(PAD * 2.0, PAD * 1.4));
             painter.rect_filled(rect, 5.0, BACKGROUND);
             painter.galley(rect.min + vec2(PAD, PAD * 0.7), galley, TEXT);
-            return;
+            return rect;
         }
 
         let full = detail == OverlayDetail::Full;
@@ -211,7 +212,7 @@ impl PerfHud {
             y += ROW;
         }
         if !full {
-            return;
+            return rect;
         }
 
         let rule = |y: f32| painter.hline(left..=right, y + 3.0, Stroke::new(0.5, RULE));
@@ -248,6 +249,7 @@ impl PerfHud {
             None => format!("gpu {}", gb(f.gpu_bytes)),
         };
         row(y, "mem", memory, TEXT);
+        rect
     }
 }
 

@@ -840,28 +840,33 @@ impl Output {
     /// each of the game's).
     #[cfg(target_vendor = "apple")]
     pub fn show(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: Frame, generated: bool) {
-        use block2::RcBlock;
         use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDrawable};
         let drawable = match &frame.image {
             Image::Drawable(d) => d,
             Image::Offscreen => return self.show_offscreen(device, queue, &frame),
         };
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&**drawable);
-        let on_screen = RcBlock::new(|d: std::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
-            // 0: skipped (a newer frame replaced it).
-            let at = unsafe { d.as_ref() }.presentedTime();
-            if at > 0.0 {
-                ON_SCREEN.lock().unwrap().push(at);
-            }
-        });
-        unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&on_screen)) };
+        // tvOS has neither presented handlers nor presents after a minimum
+        // duration: its frames go out as the display takes them, unmeasured.
+        #[cfg(not(target_os = "tvos"))]
+        {
+            let on_screen = block2::RcBlock::new(|d: std::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                // 0: skipped (a newer frame replaced it).
+                let at = unsafe { d.as_ref() }.presentedTime();
+                if at > 0.0 {
+                    ON_SCREEN.lock().unwrap().push(at);
+                }
+            });
+            unsafe { drawable.addPresentedHandler(block2::RcBlock::as_ptr(&on_screen)) };
+        }
         let Some(queue) = (unsafe { queue.as_hal::<Metal>() }) else { return };
         let frame_time = self.on_screen_for(generated);
         autoreleasepool(|_| {
             let Some(commands) = queue.as_raw().commandBuffer() else { return };
             match frame_time {
+                #[cfg(not(target_os = "tvos"))]
                 Some(t) => commands.presentDrawable_afterMinimumDuration(drawable, t.as_secs_f64()),
-                None => commands.presentDrawable(drawable),
+                _ => commands.presentDrawable(drawable),
             }
             commands.commit();
         });

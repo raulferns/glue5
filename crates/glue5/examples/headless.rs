@@ -70,8 +70,9 @@ struct Args {
     /// GTA Online, as this player name.
     #[arg(long, value_name = "NAME")]
     online: Option<String>,
-    /// With --online: a private lobby instead of everyone.
-    #[arg(long, value_name = "CODE", requires = "online", default_value = "")]
+    /// With --online: the lobby to start in instead of everyone's (until
+    /// the game hosts or looks for a session).
+    #[arg(long, value_name = "NAME", requires = "online", default_value = "")]
     lobby: String,
     /// The game's benchmark (a fly-through of the map; the run ends with
     /// it, results in the user directory).
@@ -97,9 +98,23 @@ struct Args {
     /// No rendering at all.
     #[arg(long)]
     no_gpu: bool,
-    /// The game directory.
-    #[arg(long, value_name = "DIR", env = "GLUE5_GAME_DIR")]
-    game: PathBuf,
+    /// The game directory (not with --server).
+    #[arg(long, value_name = "DIR", env = "GLUE5_GAME_DIR", required_unless_present = "server")]
+    game: Option<PathBuf>,
+    /// Stream the game from a server (host or host:port, see glue5-serve)
+    /// instead of --game; the copy is kept in the user directory's
+    /// `stream`, and is used again by the next run.
+    #[arg(long, value_name = "ADDR")]
+    server: Option<String>,
+}
+
+/// Ends the run: the stream's index saved first (the next run starts from
+/// what this one received).
+fn quit(stream: Option<&glue5_stream::Client>, code: i32) -> ! {
+    if let Some(client) = stream {
+        client.flush();
+    }
+    std::process::exit(code)
 }
 
 fn parse_size(size: &str) -> Result<(u32, u32)> {
@@ -151,7 +166,30 @@ fn main() -> Result<()> {
         _ => None,
     };
     let user_dir = args.user_dir.unwrap_or_else(|| std::env::temp_dir().join("glue5-headless"));
-    let (game_dir, low) = (args.game, args.low);
+    let (mut game_dir, low) = (args.game.unwrap_or_default(), args.low);
+    let stream = match args.server {
+        Some(server) => {
+            let client = glue5_stream::Client::start(glue5_stream::Options {
+                server,
+                root: user_dir.join("stream"),
+                build: glue5_runtime::GAME_BUILD.into(),
+                low_memory: low,
+            });
+            let started = Instant::now();
+            while !client.is_ready() {
+                let status = client.status();
+                if let glue5_stream::Phase::Failed(why) = status.phase {
+                    bail!("{why}");
+                }
+                log::info!("stream: {:?}{}", status.phase, status.error.map(|e| format!(" ({e})")).unwrap_or_default());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            log::info!("stream: ready in {:.1?}", started.elapsed());
+            game_dir = client.root().to_owned();
+            Some(client)
+        }
+        None => None,
+    };
     if low {
         glue5_runtime::game_settings::apply_low_preset(&user_dir)?;
     }
@@ -184,9 +222,13 @@ fn main() -> Result<()> {
         log::info!("tour: {} stops, {} s each", stops.len(), stay.as_secs_f64());
         glue5_runtime::tour::start(stops, stay);
     }
+    if let Some(name) = &args.online {
+        glue5_runtime::friends::start(&user_dir, name);
+    }
     let game = glue5_runtime::start(
         glue5_runtime::Config {
             game_dir,
+            stream: stream.clone(),
             user_dir,
             width: args.size.0,
             height: args.size.1,
@@ -235,6 +277,9 @@ fn main() -> Result<()> {
             input.focus(true); // without focus the engine ignores input
             focused = true;
         }
+        for notice in glue5_runtime::friends::take_notices() {
+            log::info!("friends: notice {notice:?}");
+        }
         if let Some(input) = game.input() {
             for (at, vk, down, hold) in &mut keys {
                 let held = (*at..*at + *hold).contains(&t);
@@ -247,18 +292,18 @@ fn main() -> Result<()> {
         let buttons = presses.iter().filter(|(at, _)| (*at..at + HOLD).contains(&t)).fold(0, |b, (_, bits)| b | bits);
         input::set_gamepad(0, Gamepad { connected: true, buttons, right: spin, ..Default::default() });
         if args.run_for.is_some_and(|limit| t >= limit) {
-            std::process::exit(0);
+            quit(stream.as_deref(), 0);
         }
         if let Some(exit) = glue5_runtime::exit::requested() {
             log::info!("the engine asked for {exit:?} at {t:.1} s");
-            std::process::exit(0);
+            quit(stream.as_deref(), 0);
         }
         if glue5_runtime::tour::finished() {
             log::info!("tour: done at {t:.1} s");
-            std::process::exit(0);
+            quit(stream.as_deref(), 0);
         }
         if glue5_runtime::exit::failed().is_some() {
-            std::process::exit(1);
+            quit(stream.as_deref(), 1);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -275,7 +320,42 @@ fn command(line: &str, t: f64, game: &Game, presses: &mut Vec<(f64, u16)>, keys:
             let (w, h) = size.split_once('x').context("size <width>x<height>")?;
             game.input().context("no input yet")?.resize(w.parse()?, h.parse()?);
         }
-        _ => bail!("expected `press <button>`, `key <key>`, `hold <key> <s>`, `text <text>` or `size <w>x<h>`"),
+        ["friends", ..] => friends(&line.split_whitespace().collect::<Vec<_>>()[1..])?,
+        _ => bail!(
+            "expected `press <button>`, `key <key>`, `hold <key> <s>`, `text <text>`, `size <w>x<h>` or \
+             `friends code|ask <code>|accept|list|join|invite|play|add <name>`"
+        ),
+    }
+    Ok(())
+}
+
+/// The friends, as the application's page drives them.
+fn friends(words: &[&str]) -> Result<()> {
+    use glue5_runtime::friends;
+    match words {
+        ["code"] => log::info!("friends: code {}", friends::my_code().context("no friends")?),
+        ["ask", code] => friends::ask(code).map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        ["accept"] => friends::snapshot().requests.iter().for_each(|(key, _)| friends::answer(key, true)),
+        ["list"] => log::info!("friends: {:?}", friends::snapshot()),
+        ["join", name] => {
+            let f = friends::snapshot().friends.into_iter().find(|f| f.name == *name).context("no such friend")?;
+            friends::follow(&f.key);
+        }
+        ["invite", name] => {
+            let f = friends::snapshot().friends.into_iter().find(|f| f.name == *name).context("no such friend")?;
+            friends::invite(&f.key);
+        }
+        // A friend's invite accepted, or its session joined, from the game.
+        ["play", name] => {
+            let f = friends::snapshot().friends.into_iter().find(|f| f.name == *name).context("no such friend")?;
+            friends::join(&f.key);
+        }
+        // A player met in a session asked.
+        ["add", name] => {
+            let r = friends::snapshot().recent.into_iter().find(|r| r.name == *name).context("no such player")?;
+            friends::ask_player(&r.key);
+        }
+        _ => bail!("friends code|ask <code>|accept|list|join <name>|invite <name>|play <name>|add <name>"),
     }
     Ok(())
 }

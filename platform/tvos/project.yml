@@ -1,0 +1,66 @@
+# The Apple TV app: the iOS app's package (../ios) for tvOS, around the same
+# glue5 library. The Apple TV keeps no files for good, only caches the system
+# may empty: the game always streams from a computer sharing it (Bonjour, or
+# a server's address), into Library/Caches. `mise run tvos` / `tvos:build`
+# build the library, then generate the Xcode project (Glue5.xcodeproj,
+# Info.plist: ignored by git) next to this file; Xcode needs its tvOS
+# platform (Settings › Components).
+name: Glue5
+options:
+  deploymentTarget:
+    tvOS: "16.4"
+settings:
+  base:
+    PRODUCT_NAME: Glue 5
+    PRODUCT_BUNDLE_IDENTIFIER: local.glue5
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "3"
+    ARCHS: arm64
+    DEAD_CODE_STRIPPING: YES
+    DEVELOPMENT_TEAM: ${GLUE5_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    # The library built by cargo, for the Apple TV or its simulator. MetalFX
+    # from tvOS 27.1 (glue5-gpu asks before it uses it); the simulator has none.
+    OTHER_LDFLAGS: $(PROJECT_DIR)/../../target/aarch64-apple-tvos/release/libglue5.a -liconv -weak_framework MetalFX
+    "OTHER_LDFLAGS[sdk=appletvsimulator*]": $(PROJECT_DIR)/../../target/aarch64-apple-tvos-sim/release/libglue5.a -liconv
+targets:
+  Glue5:
+    type: application
+    platform: tvOS
+    scheme: {}
+    sources:
+      - path: ../ios/main.c
+    dependencies:
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: Foundation.framework
+      - sdk: GameController.framework
+      - sdk: Metal.framework
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Glue 5
+        UILaunchScreen: {}
+        # A game: the controller, not the Siri Remote, is what it is played
+        # with; the remote moves around the app's pages.
+        LSApplicationCategoryType: public.app-category.games
+        GCSupportedGameControllers:
+          - ProfileName: ExtendedGamepad
+          - ProfileName: MicroGamepad
+        UIRequiredDeviceCapabilities: [arm64]
+        # The game's files stream from a computer sharing them, found by
+        # Bonjour; GTA Online players on the same network find each other there.
+        # (tvOS asks nothing for the local network yet; iOS does.)
+        NSLocalNetworkUsageDescription: Glue 5 plays the game from a computer sharing it on your network, and finds GTA Online players there.
+        NSBonjourServices: [_glue5._tcp]

@@ -6,13 +6,23 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::MOBILE;
+use crate::paths::{MOBILE, TV};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The game directory, once found or chosen.
     pub game_dir: Option<PathBuf>,
+    /// Where the game's files come from: a folder on this device, or a
+    /// server (another device sharing its folder, or glue5-serve).
+    pub source: Source,
+    /// The server: `host` or `host:port`.
+    pub server: String,
+    /// This computer shares its game folder on the network (desktop).
+    pub share: bool,
+    /// The whole game comes from the server to this device (in its game
+    /// folder), to play without it.
+    pub download_all: bool,
     /// Smaller engine pools, and the game's graphics settings lowered once
     /// (the browser build's `?low=1`).
     pub low_memory: bool,
@@ -58,10 +68,8 @@ pub struct Settings {
     pub online: bool,
     /// The player's name online (made up when GTA Online is first opened).
     pub online_name: String,
-    /// A private lobby rather than everyone's, and its code (kept while the
-    /// public one is chosen).
-    pub online_private: bool,
-    pub online_lobby: String,
+    /// Friends' notifications show (Social Club's "Hide Notifications").
+    pub friend_notices: bool,
     /// Settings saved before the render scale: the back buffer's height.
     #[serde(skip_serializing)]
     render_height: Option<u32>,
@@ -72,6 +80,14 @@ pub struct Settings {
     /// Settings saved before the choice of overlays: Apple's HUD on or off.
     #[serde(skip_serializing)]
     metal_hud: Option<bool>,
+}
+
+/// Where the game's files come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Source {
+    Folder,
+    Server,
 }
 
 /// The performance overlay over the game.
@@ -182,6 +198,10 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             game_dir: None,
+            source: if TV { Source::Server } else { Source::Folder },
+            server: String::new(),
+            share: false,
+            download_all: false,
             low_memory: MOBILE && sdl3::cpuinfo::system_ram() < LOW_MEMORY_RAM_MB,
             low_preset_written: false,
             render_scale: None,
@@ -203,8 +223,7 @@ impl Default for Settings {
             sandbox: false,
             online: false,
             online_name: String::new(),
-            online_private: false,
-            online_lobby: String::new(),
+            friend_notices: true,
             render_height: None,
             metalfx: None,
             metal_hud: None,
@@ -217,40 +236,12 @@ pub fn default_online_name() -> String {
     format!("Player{:04}", random() % 10000)
 }
 
-/// A new private lobby's code: six letters and digits that do not look
-/// alike, as "K7Q-29F".
-pub fn new_lobby_code() -> String {
-    const SYMBOLS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let mut n = random();
-    let mut code = String::new();
-    for i in 0..6 {
-        if i == 3 {
-            code.push('-');
-        }
-        code.push(SYMBOLS[(n % SYMBOLS.len() as u64) as usize] as char);
-        n /= SYMBOLS.len() as u64;
-    }
-    code
-}
-
-/// A lobby's code as players compare it: its letters and digits, upper
-/// case ("k7q 29f" is "K7Q-29F").
-pub fn lobby_key(code: &str) -> String {
-    code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
-}
-
 fn random() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish()
 }
 
 impl Settings {
-    /// The lobby GTA Online plays in: a private one's key, or empty for
-    /// everyone's.
-    pub fn lobby(&self) -> String {
-        if self.online_private { lobby_key(&self.online_lobby) } else { String::new() }
-    }
-
     fn file(user_dir: &Path) -> PathBuf {
         user_dir.join("glue5.json")
     }
@@ -268,6 +259,9 @@ impl Settings {
         }
         if settings.metal_hud.take() == Some(true) {
             settings.overlay = PerfOverlay::MetalHud;
+        }
+        if TV {
+            settings.source = Source::Server;
         }
         settings
     }
@@ -316,18 +310,6 @@ pub fn render_size((w, h): (u32, u32), scale: f32, low_memory: bool) -> (u32, u3
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lobby_codes() {
-        let code = new_lobby_code();
-        assert_eq!(code.len(), 7, "{code}");
-        assert_eq!(lobby_key(&code).len(), 6);
-        assert_eq!(lobby_key(" k7q 29-f "), "K7Q29F");
-        let mut s = Settings { online_lobby: "k7q-29f".into(), ..Settings::default() };
-        assert_eq!(s.lobby(), "");
-        s.online_private = true;
-        assert_eq!(s.lobby(), "K7Q29F");
-    }
 
     #[test]
     fn render_sizes() {

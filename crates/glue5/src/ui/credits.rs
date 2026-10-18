@@ -16,12 +16,20 @@ const PROJECTS: &[(&str, &str, &str, &str)] = &[
     ("Barlow", "Typeface, by Jeremy Tribby", "SIL OFL 1.1", "https://github.com/jpt/barlow"),
     (
         "game-icons.net",
-        "Touch icons, by Lorc, Delapouite, John Colburn, Skoll, Guard13007 and DarkZaitzev",
+        "Touch icons, by Lorc, Delapouite, John Colburn and Guard13007",
         "CC BY 3.0",
         "https://game-icons.net",
     ),
+    ("Phosphor Icons", "Touch icons", "MIT", "https://phosphoricons.com"),
+    ("Font Awesome Free", "Touch icons", "CC BY 4.0", "https://fontawesome.com"),
+    ("Material Symbols", "Touch icons, by Google", "Apache-2.0", "https://fonts.google.com/icons"),
+    ("Lucide", "Touch icons", "ISC", "https://lucide.dev"),
+    ("Tabler Icons", "Touch icons", "MIT", "https://tabler.io/icons"),
+    ("MingCute", "Touch icons", "Apache-2.0", "https://www.mingcute.com"),
     ("etcpak", "Textures for GPUs without BC", "BSD-3-Clause", "https://github.com/wolfpld/etcpak"),
     ("bcdec_rs", "Texture decoding", "MIT", "https://github.com/ScanMountGoat/image_dds"),
+    ("snow", "The Noise protocol: friends' encrypted channel", "Apache-2.0 / MIT", "https://github.com/mcginty/snow"),
+    ("Zstandard", "The game's small files, packed to stream", "BSD-3-Clause", "https://facebook.github.io/zstd"),
     #[cfg(target_vendor = "apple")]
     ("objc2", "Apple's frameworks from Rust", "MIT", "https://github.com/madsmtm/objc2"),
     #[cfg(windows)]
@@ -72,8 +80,8 @@ pub(super) fn credits_page(ctx: &egui::Context) -> bool {
         text(
             ui,
             "With the libraries these use, each under its own license (MIT, Apache-2.0, BSD, Zlib, \
-             Unicode, …). GTA Online's players find each other through the BitTorrent DHT, kept by \
-             the people who run it.",
+             Unicode, …). GTA Online's players and friends find each other through the BitTorrent DHT, \
+             kept by the people who run it.",
         );
     })
 }

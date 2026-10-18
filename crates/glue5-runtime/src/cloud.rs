@@ -100,14 +100,17 @@ pub(crate) unsafe extern "C" fn cloud_available(_env: *mut Env, _gamer: u32) -> 
 }
 
 thread_local! {
-    /// In an online stats save or load.
-    static IN_STATS_OPERATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// In an operation that needs Rockstar's credentials but goes to the
+    /// disk or to friends: an online stats save or load, a presence event.
+    static CREDENTIALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn in_stats_operation<R>(f: impl FnOnce() -> R) -> R {
-    IN_STATS_OPERATION.set(true);
+/// Runs `f` with Rockstar's credentials counting as valid (see
+/// `ros_credentials_valid`).
+pub(crate) fn with_credentials<R>(f: impl FnOnce() -> R) -> R {
+    let outer = CREDENTIALS.replace(true);
     let r = f();
-    IN_STATS_OPERATION.set(false);
+    CREDENTIALS.set(outer);
     r
 }
 
@@ -115,18 +118,19 @@ fn in_stats_operation<R>(f: impl FnOnce() -> R) -> R {
 /// `..._Save::Update()`: they need Rockstar's credentials (see
 /// `ros_credentials_valid`).
 pub(crate) unsafe extern "C" fn mpstats_load_update(env: *mut Env, op: u64) -> u32 {
-    in_stats_operation(|| unsafe { orig::mpstats_load_update(env, op) })
+    with_credentials(|| unsafe { orig::mpstats_load_update(env, op) })
 }
 
 pub(crate) unsafe extern "C" fn mpstats_save_update(env: *mut Env, op: u64) -> u32 {
-    in_stats_operation(|| unsafe { orig::mpstats_save_update(env, op) })
+    with_credentials(|| unsafe { orig::mpstats_save_update(env, op) })
 }
 
 /// Hook for `rage::rlRosCredentials::IsValid() const`: valid in the stats'
-/// saves and loads, which go to the disk; elsewhere the engine would talk
-/// to Rockstar's services with them.
+/// saves and loads, which go to the disk, and for the presence events
+/// friends send each other (friends/game.rs); elsewhere the engine would
+/// talk to Rockstar's services with them.
 pub(crate) unsafe extern "C" fn ros_credentials_valid(env: *mut Env, credentials: u64) -> u32 {
-    if IN_STATS_OPERATION.get() {
+    if CREDENTIALS.get() {
         return 1;
     }
     unsafe { orig::ros_credentials_valid(env, credentials) }

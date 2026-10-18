@@ -7,6 +7,13 @@
     ("rl_pc_initialized", "rage::rlPc::IsInitialized()"),
     ("live_manager_init", "CLiveManager::Init(unsigned int)"),
     ("live_manager_update", "CLiveManager::Update(unsigned int)"),
+    // Sessions hosted (with their kind: public, invite only, friends, solo)
+    // and looked for: the lobby they are in.
+    ("session_host_config", "CNetworkSession::HostSession(NetworkGameConfig&, unsigned int)"),
+    ("freeroam_matchmaking", "CNetworkSession::DoFreeroamMatchmaking(int, int, unsigned int, unsigned int)"),
+    ("friend_matchmaking", "CNetworkSession::DoFriendMatchmaking(int, int, unsigned int, unsigned int)"),
+    // Called once: the network's settings from the tunables (their defaults).
+    ("network_tunables_read", "CNetworkTunablesListener::OnTunablesRead()"),
     ("presence_online", "rage::rlPresence::IsOnline(int)"),
     // The checks on the way into freemode that Rockstar's services would
     // pass: the hardware bail, privileges, the prologue, the store, the
@@ -33,6 +40,8 @@
     ("profanity_pending", "socialclub_commands::SetupScriptCommands()::scrWrapped_SC_PROFANITY_GET_CHECK_IS_PENDING::Call(rage::scrThread::Info&)"),
     ("profanity_status", "socialclub_commands::SetupScriptCommands()::scrWrapped_SC_PROFANITY_GET_STRING_STATUS::Call(rage::scrThread::Info&)"),
     ("social_club_account", "network_commands::SetupScriptCommands()::scrWrapped_NETWORK_HAS_SOCIAL_CLUB_ACCOUNT::Call(rage::scrThread::Info&)"),
+    ("online_policies_current", "hud_commands::SetupScriptCommands()::scrWrapped_ARE_ONLINE_POLICIES_UP_TO_DATE::Call(rage::scrThread::Info&)"),
+    ("match_history_id", "stats_commands::SetupScriptCommands()::scrWrapped_PLAYSTATS_CREATE_MATCH_HISTORY_ID_2::Call(rage::scrThread::Info&)"),
     ("savemigration_mp_enabled", "savemigration_commands::SetupScriptCommands()::scrWrapped_SAVEMIGRATION_IS_MP_ENABLED::Call(rage::scrThread::Info&)"),
     ("bad_pack_order", "dlc_commands::SetupScriptCommands()::scrWrapped_GET_EVER_HAD_BAD_PACK_ORDER::Call(rage::scrThread::Info&)"),
 ]

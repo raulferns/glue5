@@ -13,6 +13,7 @@ way the operating system starts a process:
 |---|---|---|
 | macOS, Linux, Windows | the `glue5` binary | `cargo build` |
 | iOS | `platform/ios/main.c` calls `glue5_main`, which hands the process to SDL (`SDL_RunApp`) | an Xcode project generated from `platform/ios/project.yml` by xcodegen links the crate as a static library (`mise run ios`) |
+| tvOS (Apple TV) | the same `main.c` and `glue5_main` | likewise, from `platform/tvos/project.yml`, the crate built for `aarch64-apple-tvos` (`mise run tvos`) |
 | Android (next) | SDL's Java activity loads the library and calls `SDL_main` | Gradle project with SDL's activity, the library built with the NDK |
 
 Platform-specific Rust code uses `cfg`s for details such as default folders
@@ -145,11 +146,225 @@ folder picker. Default places:
 | iOS | the app's `Documents/game` | Finder (device > Files) or the Files app; `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` make the folder visible |
 | Android | the app's external files directory, `Android/data/<app>/files/game` | USB file transfer; no storage permission needed |
 
-A future VFS backend could read files over HTTP and cache them locally,
-allowing a phone to start without copying all 20 GB first. The WASM build
-already has HTTP file imports (`wasm_httpfs_*`), currently stubbed here.
-This would be implemented in the VFS and is not required for the initial
-release.
+Or the files come from another device: see the next section.
+
+## Streaming the game's files
+
+Settings › Game › Game files › Server plays the game from a computer that
+has it: the app on a computer sharing its folder (Settings › Game › Share
+on the network), or `glue5-serve` (`mise run serve`, any desktop system, a
+NAS). A phone then needs no copy of its own, and an Apple TV, whose
+storage is only a cache the system empties when it needs room, fetches
+again what it lost. Both modes live side by side: with a folder, nothing
+below runs.
+
+**The engine already streams.** The browser build reads `/game` through
+an HTTP device of its own (`fiDeviceLocal` over `wasm_httpfs_*`): a
+manifest of the files, one read at a time per thread, and a ring in which
+the streamer announces the reads it has queued (`pgStreamer::Read`) and
+those it expects (`strStreamingLoader`). glue5 hands it the manifest
+(`wasm_httpfs_manifest_js`) and hooks its read (`wasm_httpfs_pread`,
+`glue5-runtime/src/stream.rs`): a read the device's copy holds is a
+positioned read from it in the calling thread, as fast as a local folder;
+a missing one asks the server and waits for its blocks only. The
+announcements become prefetch requests, and so does what follows a file
+played over time (music and radio, read in pieces 20 ms or more apart;
+not small pieces read back to back: read ahead, they fetched 520 MB in a
+cold run, 340 MB of it never read). Streaming in the VFS instead would
+get no announcements (they need the HTTP device) and one round trip per
+read of the streamer's single reader.
+
+**What it has to carry** (the benchmark's reads, traced in local mode):
+3.0 GB of distinct data in 189 s, 2.3 GB of it in the first 30 s (start
+and first world), then ~5 MB/s, 12 MB/s at most over 10 s, ~320 MB in
+5 s at a scene cut. The engine hardly reads anything twice (3.17 GB read
+for 3.03 GB distinct): within a session a cache gains nothing, across
+sessions everything. The archives (`.rpf`, 19.4 of 19.5 GB) are already
+compressed or encrypted: zstd takes 1 % off them. The small files are
+text: 3,700 of them (385 MB: shader effects, XML, metadata) make 8.6 MB
+as one zstd stream (level 19, alike files side by side, a 32 MB window),
+the 6,600 translated shaders 1.6 MB.
+
+**The protocol** (`glue5-stream`, `protocol.rs`) is one TCP connection with
+32-byte message headers, not HTTP: the server sends the next 64 KB chunk of
+the most urgent request first (an engine read waiting > a queued read
+announced > a guess or read-ahead > the boot set > a full download), keeps
+little unsent in the kernel (`TCP_NOTSENT_LOWAT`, 128 KB), and moves a
+request to a higher priority when the engine comes to wait for it.
+Requests are one chunk each, so that such a move takes one chunk: behind
+32 MB of prefetch on an 8 MB/s link, a read the engine waits for arrives
+in 10-14 ms (134 ms with 1 MB requests; seconds with the browser build's
+parallel HTTP requests, which share the link evenly). A cold disk on the
+server reads ahead of the queue (`F_RDADVISE`, `posix_fadvise`). Each chunk
+carries a CRC-32 (TCP's checksum is weak, and a bad block would stay in the
+copy): a damaged one is dropped and asked again, as is one whose header
+(which has none) puts it outside its request. Requests are pipelined
+without limit, so the link, not the round trip, sets the pace: through a
+link of 100 Mbit/s and 40 ms (simulated), the first start kept it 96 % busy
+and had the world on screen after 3 min 20 s (2.3 GB), the benchmark then
+running as long as from a folder; over the local loopback, after 36 s.
+TCP, not UDP: every byte must arrive, and a reliable, congestion-controlled
+transport over UDP is QUIC, a heavy dependency, worth it only if lossy
+links turn out to need it. The client drops a connection with requests in
+flight and no data for 20 s (counted from the request, after a quiet
+spell), or which takes no request for 20 s (a write timeout: a stalled
+server holds up neither the app nor stopping); the server lets go of a
+client gone without a word after a minute (TCP keepalive: no read
+timeout, as a client may ask nothing for long).
+
+**Reads announced late.** Traced through a proxy that delays each way by
+20 ms and sends 12.5 MB/s behind a 256 KB queue, a cold benchmark run
+waits for ~11,000 engine reads. Until the world shows, the link sets the
+pace. In the fly-through some read waits a third to half of the time, and
+a fifth of the time it is one of ~1,000 reads announced too late: blocks
+nobody had asked for (~40 a run), or asked for less than 10 ms before,
+mostly by guesses the engine announces as it makes the read. Such a read
+waits ~60 ms (the round trip and the queue), one announced in time ~20 ms.
+(The client's log once counted 6,000 of them, from a read's first block
+alone, often here already from the read before.) A table learned on the
+server across sessions (the blocks that come after a request), prefetched
+by the next session, would hide few: which reads come late depends on when
+the engine announces them, not on the blocks, and nine in ten of one run's
+late reads had been asked for in time in another run. Learned from one
+run, such a table foresaw a quarter to a third of the next run's late
+reads on the very same path, bringing 76-94 MB for 14 MB of them (from two
+runs, two fifths, with 155 MB); in play the paths differ, and only a
+device's first session would gain (its copy keeps the rest). Not done. Nor
+does the engine know of them much earlier: it makes its guesses at the
+start of `strStreamingLoader::LoadRequestedObjects`, for objects it has
+been asked to load (at most 32 a call, a cap rarely reached), and loads
+them in the same call. A probe of `strStreamingInfoManager::RequestObject`
+found that the game had asked for the late ones less than 10 ms before the
+read in half the cases, and less than 50 ms before in nine in ten:
+announcing them at the request would have saved a fifth of their waiting
+in the fly-through (8.6 s of 41), not worth a hook on the engine's request
+path.
+
+**Frames while streaming.** Every frame of cold benchmark runs, laid
+against every wait of the client: once the world shows, no read waits on
+the engine's main or render thread, only on the streamer's reader (a late
+read is an object that comes late, not a slow frame: 5-6 s of waiting in
+the fly-through over the loopback, 130 s through the simulated 100 Mbit/s
+link). The client's threads take 2-3 % of a core. The index saves are the
+one thing of the client's that shows in the frames (see the copy below).
+Slow frames came and went far more with the Mac's load from other work
+than with streaming: a run from a folder had more of them than streamed
+runs. (The simulated link, a Python proxy, also slows down under load:
+8.3 to 10.4 MB/s from run to run; a start needs 2.8 GB before the world
+either way.)
+
+**Before the game:** the catalog (every file, size and time, asked with
+the boot set's ranges), then the packs it does not have, ~10 MB, asked
+together (two round trips), which bring every small file and the
+shaders whole: the pipelines compile from them as from a folder (Play's
+preparation is unchanged). Then, at the lowest priority but one, the boot
+set (the whale5 build's `bootset.json`: the ~550 MB of archive headers and
+start-up data every start reads), while the start page shows and the
+shaders compile; a later start finds it there. If the game starts before
+it is all here (a quick Play over the Internet: 550 MB take 44 s at 100
+Mbit/s), the engine reads it in an order of its own, not the boot set's
+(file after file, by path): when it waits for a part still in the boot
+set's queue, the 8 MB of the boot set that follow come next, as
+read-ahead. Through the simulated link, three cold starts each way: the
+engine's waits for the boot set while the world loads went from 35 to 26
+s, and the world showed after 192 s instead of 195. Little more is to be
+had in order: the link is full from the start to the world, which needs
+~2.3 GB (the benchmark reads 2.2 GB before it shows, from a folder).
+
+**The copy** (`cache.rs`) mirrors the folder's layout, sparse, with a
+bitmap of the 4 KB blocks each file holds (640 KB for the whole game). Its
+index is saved after the data it describes is on disk (`fsync` per file,
+side by side, then `F_FULLFSYNC` on the index on Apple systems: a full
+flush per file made the text pack take 14 s to save): every 10 s while
+data comes, or once 256 MB came, and at once when it stops. A save slows
+the game's frames a little while it lasts (1.2 to 1.8 times as many
+frames over 50 ms fall within saves as within the same spans a second
+away; an I/O priority of background or `F_BARRIERFSYNC` made no
+difference that could be told from run to run), so fewer is better:
+saving every two seconds, a cold run through the simulated link saved 203
+times, now 47. At
+start, a block counts only if its file is still there with its full
+length: whatever the system deleted meanwhile (iOS and tvOS caches) is
+fetched again when needed. When the volume falls under 1 GB free, files
+read longest ago are emptied, 256 MB beyond that at a time: data files of
+earlier runs first, then this run's least recently used, the boot set's
+files after them (read first, they were the least recently used), the
+packs' files last (an iPhone with a gigabyte free gave away a gigabyte at
+a time, the start's own files and the packs among them). An index without
+their blocks is saved before their data is freed (a crash in between
+would otherwise trust zeros). Emptying that raises no free space
+(something else fills the volume) stops until the volume has room again:
+it would give away the whole copy for nothing. A copy whose packs are
+complete starts without the server (missing blocks wait for it); a lost
+connection is retried for ever (at once after one that served, then at
+growing intervals) and the requests in flight asked again, in the order
+they were asked. Stopping a client (another server chosen, the copy
+deleted) returns at once: it finishes in the background, its index saved
+last, and the next client, like moving or deleting a copy, waits for it.
+APFS, when it writes a file out, may fill the holes between its written
+parts with zeros (whether it does depends on its state, and changed within
+an hour on the same Mac: 5.7 GB taken for 3.7 GB of blocks); after each
+save, the holes of the files just synced are punched again
+(`F_PUNCHHOLE`): 3.74 GB for 3.67. Each hole holds off the file's writes
+while it is punched, not its reads. Other file systems never fill holes,
+and are left alone. At most 4,096 files stay open (the limit is 10,240 on
+Apple systems, often 1,024 on Linux); the others are opened for each use.
+
+**The whole game** (Download the whole game, on the Servers page) comes at the
+lowest priority, 32 MB on its way at a time, with what the game leaves of
+the link; a complete copy loses its marker and is a game folder like a
+copied one, which plays without the server and which the local mode finds.
+It goes where a copied game would (`Documents/game`, the external files'
+`game`, the user directory's `game` on desktop), not in the cache folder,
+and never over a game folder of the user's own. Complete, it stays there
+whatever the setting says later, used as it is and never emptied for room
+(moved back into the cache, an iPhone's system emptied 17 of its 21 GB),
+nor changed by a server whose files differ (played with its own catalog);
+only a partial copy moves when the setting changes, and one left in the
+cache beside the whole game is deleted. tvOS has no such option:
+it keeps nothing but caches.
+
+**Where:** the app's cache folder (`paths::cache_dir`): `Library/Caches`
+on iOS and tvOS (purged by the system when away, which suits it),
+`~/Library/Caches` on macOS, `XDG_CACHE_HOME` on Linux, `%LOCALAPPDATA%`
+on Windows (files marked sparse, which they are not by default there),
+the external files folder on Android. The copy carries a marker, so that
+it is never taken for a game folder.
+
+**Finding a server** (`discovery.rs`): Bonjour, `_glue5._tcp`. A server
+announces itself on every system with a responder of its own (port 5353,
+shared with the system's: mDNSResponder, Avahi, Windows', whose APIs differ
+on each): on each network with that network's address, answering by
+multicast, or by unicast to simple resolvers and unicast-response queries,
+saying that its host has no IPv6 address (NSEC: a resolver does not wait
+for one), and saying goodbye when it stops. Its host is
+`glue5-<computer>.local`, its name the computer's (with the port, if not
+47100: two servers on one computer); no probing for unique names. A Mac's
+own browser and an iPhone find it, as Avahi does on Linux (in a
+container); not tried on Windows. Apple systems browse through the
+system's responder (no multicast entitlement on iOS and tvOS; the service
+is in `NSBonjourServices`); elsewhere the app asks once, by mDNS from an
+ordinary port, and responders answer by unicast (no Android multicast
+lock). The Servers page
+searches every five seconds while it is open and asks each server found
+for its greeting (`check`): whether it serves this game build, how long
+connecting took, and what its name stands for, so that a server typed as
+its IP shows under the name it was found by. A Mac's `.local` name stands
+for its IPv6 link-local address too, where a server listening on IPv4
+refuses: the client tries each address, IPv4 first.
+
+Limits: there is no encryption and no access control (on the Internet,
+a private network such as Tailscale gives both); the server must have the
+app's game build; files changed on the server while the game runs need a
+restart. A partial copy without its server plays until the first block it
+lacks, and waits there (a radio station starts at a random place: the
+benchmark waited at its loading screen). Over the game a small round sign
+says so (a turning ring: waiting for the server; amber: the server does
+not answer), in words for three seconds after it changes; it sits left of
+the settings button or in the next free place, off the touch controls and
+the overlay, and a tap opens the Servers page.
+The reads the engine announces late (~1,000 in the benchmark) cost a
+round trip each: on a slow link, objects that show late, not stalls.
 
 ## Shaders: known pipelines before the game
 

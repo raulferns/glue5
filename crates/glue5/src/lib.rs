@@ -20,6 +20,7 @@ mod keymap;
 mod pads;
 mod paths;
 mod settings;
+mod sharing;
 mod touch;
 mod ui;
 
@@ -59,7 +60,7 @@ pub fn main() -> i32 {
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn glue5_main(argc: std::ffi::c_int, argv: *mut *mut std::ffi::c_char) -> std::ffi::c_int {
     // SDL's UIKit backend keeps the process running once its main returns

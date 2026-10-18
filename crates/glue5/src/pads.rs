@@ -6,6 +6,7 @@ use glue5_runtime::input::{self, Gamepad, MAX_PADS, button};
 use sdl3::gamepad::{Axis, Button};
 use sdl3::joystick::JoystickId;
 
+use crate::paths::TV;
 use crate::ui::Nav;
 
 /// SDL buttons to RAGE pad buttons (SDL names buttons by position, so the
@@ -44,6 +45,10 @@ const STICK_NAV: f32 = 0.6;
 pub struct Pads {
     subsystem: sdl3::GamepadSubsystem,
     slots: [Option<Slot>; MAX_PADS],
+    /// The Apple TV's remote: it moves around the pages and never plays
+    /// (else it takes pad 0 from a controller, and a brush on its touch
+    /// surface moves the player).
+    remotes: Vec<Slot>,
     /// Buttons down at the previous update, on any pad (for the pages).
     previous: u16,
     /// The direction held in a page, and when it repeats next.
@@ -55,6 +60,8 @@ pub struct Pads {
 pub struct Report {
     /// Back + Start held: open the settings.
     pub menu: bool,
+    /// Back + RB held, as it opened Social Club's overlay: the friends.
+    pub friends: bool,
     /// Navigation in the application's page (only while one is open).
     pub nav: Vec<Nav>,
 }
@@ -63,32 +70,42 @@ struct Slot {
     pad: sdl3::gamepad::Gamepad,
     id: JoystickId,
     rumble: (u16, u16),
-    /// Since when Back + Start are held, and whether that hold has fired.
+    /// Since when Back + Start (or Back + RB) are held, and whether that
+    /// hold has fired.
     combo: Option<(Instant, bool)>,
+    friends_combo: Option<(Instant, bool)>,
 }
 
 impl Pads {
     pub fn new(subsystem: sdl3::GamepadSubsystem) -> Self {
-        Pads { subsystem, slots: Default::default(), previous: 0, repeat: None }
+        Pads { subsystem, slots: Default::default(), remotes: Vec::new(), previous: 0, repeat: None }
     }
 
     pub fn added(&mut self, id: JoystickId) {
-        if self.slots.iter().flatten().any(|s| s.id == id) {
+        if self.slots.iter().flatten().chain(&self.remotes).any(|s| s.id == id) {
             return;
         }
         let Some(free) = self.slots.iter().position(Option::is_none) else {
             return;
         };
-        match self.subsystem.open(id) {
-            Ok(pad) => {
-                log::info!("gamepad {}: {}", free, pad.name().unwrap_or_default());
-                self.slots[free] = Some(Slot { pad, id, rumble: (0, 0), combo: None });
-            }
-            Err(e) => log::warn!("cannot open gamepad: {e}"),
+        let pad = match self.subsystem.open(id) {
+            Ok(pad) => pad,
+            Err(e) => return log::warn!("cannot open gamepad: {e}"),
+        };
+        let slot = Slot { pad, id, rumble: (0, 0), combo: None, friends_combo: None };
+        // SDL makes the Siri Remote a gamepad with one stick (its touch
+        // surface) and a few buttons; controllers have two sticks.
+        if TV && !slot.pad.has_axis(Axis::RightX) {
+            log::info!("remote: {}", slot.pad.name().unwrap_or_default());
+            self.remotes.push(slot);
+            return;
         }
+        log::info!("gamepad {}: {}", free, slot.pad.name().unwrap_or_default());
+        self.slots[free] = Some(slot);
     }
 
     pub fn removed(&mut self, id: JoystickId) {
+        self.remotes.retain(|s| s.id != id);
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(|s| s.id == id) {
                 log::info!("gamepad {i} removed");
@@ -106,41 +123,16 @@ impl Pads {
         let mut all = 0u16;
         // The left stick pushed far, as the D-pad (for the pages).
         let mut stick = 0u16;
+        for remote in &self.remotes {
+            let state = read(&remote.pad);
+            all |= state.buttons;
+            stick |= stick_nav(&state);
+        }
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let Some(slot) = slot else { continue };
-            let pad = &slot.pad;
-            let axis = |a| pad.axis(a) as f32 / 32767.0;
-            let mut state = Gamepad {
-                connected: true,
-                left: [axis(Axis::LeftX), axis(Axis::LeftY)],
-                right: [axis(Axis::RightX), axis(Axis::RightY)],
-                l2: axis(Axis::TriggerLeft).max(0.0),
-                r2: axis(Axis::TriggerRight).max(0.0),
-                buttons: 0,
-            };
-            for &(b, bit) in BUTTONS {
-                if pad.button(b) {
-                    state.buttons |= bit;
-                }
-            }
-            if state.l2 > TRIGGER_THRESHOLD {
-                state.buttons |= button::L2;
-            }
-            if state.r2 > TRIGGER_THRESHOLD {
-                state.buttons |= button::R2;
-            }
+            let state = read(&slot.pad);
             all |= state.buttons;
-            for (v, minus, plus) in
-                [(state.left[0], button::LEFT, button::RIGHT), (state.left[1], button::UP, button::DOWN)]
-            {
-                stick |= if v < -STICK_NAV {
-                    minus
-                } else if v > STICK_NAV {
-                    plus
-                } else {
-                    0
-                };
-            }
+            stick |= stick_nav(&state);
             if i == 0 && touch_is_pad0 {
                 // The touch controls have pad 0.
             } else if page_open {
@@ -149,15 +141,19 @@ impl Pads {
                 input::set_gamepad(i, state);
             }
 
-            let combo = button::SELECT | button::START;
-            if state.buttons & combo == combo {
-                let (since, fired) = slot.combo.get_or_insert_with(|| (Instant::now(), false));
-                if !*fired && since.elapsed() >= MENU_HOLD {
-                    *fired = true;
-                    report.menu = true;
+            for (combo, held, fire) in [
+                (button::SELECT | button::START, &mut slot.combo, &mut report.menu),
+                (button::SELECT | button::R1, &mut slot.friends_combo, &mut report.friends),
+            ] {
+                if state.buttons & combo == combo {
+                    let (since, fired) = held.get_or_insert_with(|| (Instant::now(), false));
+                    if !*fired && since.elapsed() >= MENU_HOLD {
+                        *fired = true;
+                        *fire = true;
+                    }
+                } else {
+                    *held = None;
                 }
-            } else {
-                slot.combo = None;
             }
 
             let rumble = input::rumble(i);
@@ -207,4 +203,44 @@ impl Pads {
         }
         nav
     }
+}
+
+/// A pad's state, as the engine reads pads.
+fn read(pad: &sdl3::gamepad::Gamepad) -> Gamepad {
+    let axis = |a| pad.axis(a) as f32 / 32767.0;
+    let mut state = Gamepad {
+        connected: true,
+        left: [axis(Axis::LeftX), axis(Axis::LeftY)],
+        right: [axis(Axis::RightX), axis(Axis::RightY)],
+        l2: axis(Axis::TriggerLeft).max(0.0),
+        r2: axis(Axis::TriggerRight).max(0.0),
+        buttons: 0,
+    };
+    for &(b, bit) in BUTTONS {
+        if pad.button(b) {
+            state.buttons |= bit;
+        }
+    }
+    if state.l2 > TRIGGER_THRESHOLD {
+        state.buttons |= button::L2;
+    }
+    if state.r2 > TRIGGER_THRESHOLD {
+        state.buttons |= button::R2;
+    }
+    state
+}
+
+/// The left stick pushed far, as the D-pad (for the pages).
+fn stick_nav(state: &Gamepad) -> u16 {
+    let mut stick = 0;
+    for (v, minus, plus) in [(state.left[0], button::LEFT, button::RIGHT), (state.left[1], button::UP, button::DOWN)] {
+        stick |= if v < -STICK_NAV {
+            minus
+        } else if v > STICK_NAV {
+            plus
+        } else {
+            0
+        };
+    }
+    stick
 }

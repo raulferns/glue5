@@ -108,6 +108,8 @@ unsafe impl Send for MetalFx {}
 impl MetalFx {
     pub fn new(device: &wgpu::Device) -> MetalFx {
         let raw = unsafe { device.as_hal::<Metal>() }.map(|d| d.raw_device().retain());
+        // tvOS has MetalFX from 27.1 (the framework is linked weakly there).
+        let raw = raw.filter(|_| objc2::available!(tvos = 27.1, ..));
         let device = raw.filter(|d| unsafe { MTLFXSpatialScalerDescriptor::supportsDevice(d) });
         let temporal = device.as_ref().is_some_and(|d| unsafe { MTLFXTemporalScalerDescriptor::supportsDevice(d) });
         // (The class is not there before macOS and iOS 26.)

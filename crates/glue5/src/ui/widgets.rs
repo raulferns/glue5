@@ -1,4 +1,5 @@
 //! Shared rows and controls, sized from the space available rather than the platform.
+use super::TextKind;
 use super::theme::{INK, MUTED, density};
 use egui::*;
 
@@ -33,6 +34,8 @@ pub(super) enum Control {
     Choice,
     Toggle,
     Action,
+    /// A few buttons side by side (`action_buttons`).
+    Actions,
 }
 
 pub(super) fn setting<R>(
@@ -56,6 +59,7 @@ pub(super) fn setting<R>(
                     Control::Choice => (available * 0.60).min(180.0 * scale),
                     Control::Toggle => 44.0 * scale,
                     Control::Action => (available * 0.55).min(180.0 * scale),
+                    Control::Actions => (available * 0.62).min(320.0 * scale),
                 };
                 let label_width = (available - width - ui.spacing().item_spacing.x).max(1.0);
                 ui.horizontal_top(|ui| {
@@ -101,17 +105,32 @@ fn paint_label(ui: &Ui, rect: Rect, text: &str, size: f32, offset: f32, color: C
     ui.painter().galley(pos, galley, color);
 }
 
-/// A line of text in a field of its own, its name on the left: the choice
-/// control's look. Anywhere on the field gives the text the focus.
-pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str, max: usize) -> Response {
+/// A line of text in a field of its own, its name on the left (if any): the
+/// choice control's look. Anywhere on the field gives the text the focus.
+/// `kind` picks the system keyboard on touch screens, where an empty code or
+/// address field also offers to paste (their keyboard has no way to).
+pub(super) fn text_field(ui: &mut Ui, label: &str, kind: TextKind, text: &mut String, hint: &str, max: usize) -> Response {
     let scale = density(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0 * scale), Sense::hover());
     let radius = 12.0 * scale;
     ui.painter().rect_filled(rect, radius, Color32::from_gray(36));
     let field = ui.interact(rect, ui.id().with(label), Sense::click());
-    let inner = rect.shrink2(vec2(14.0 * scale, 0.0));
-    let label_width = 52.0 * scale;
+    let mut inner = rect.shrink2(vec2(14.0 * scale, 0.0));
+    let label_width = if label.is_empty() { 0.0 } else { 52.0 * scale };
     ui.painter().text(inner.left_center(), Align2::LEFT_CENTER, label, FontId::proportional(13.0 * scale), MUTED);
+    if crate::paths::TOUCH && matches!(kind, TextKind::Code | TextKind::Address) && text.is_empty() {
+        let paste = Rect::from_min_max(pos2(inner.right() - 56.0 * scale, rect.top()), pos2(rect.right(), rect.bottom()));
+        let response = ui.interact(paste, ui.id().with((label, "paste")), Sense::click());
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), "Paste"));
+        let color = if response.hovered() || response.has_focus() { Color32::WHITE } else { MUTED };
+        ui.painter().text(paste.center(), Align2::CENTER_CENTER, "Paste", FontId::proportional(13.0 * scale), color);
+        if response.clicked()
+            && let Some(pasted) = super::clipboard_text()
+        {
+            *text = pasted.trim().chars().take(max).collect();
+        }
+        inner.max.x = paste.left();
+    }
     let edit_rect = Rect::from_min_max(pos2(inner.left() + label_width, inner.top()), inner.max);
     let edit = ui
         .scope_builder(UiBuilder::new().max_rect(edit_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
@@ -131,6 +150,7 @@ pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str
     }
     if edit.has_focus() {
         ui.painter().rect_stroke(rect, radius, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+        ui.ctx().data_mut(|d| d.insert_temp(Id::new(super::TEXT_KIND), kind));
     }
     focus(edit)
 }
@@ -176,17 +196,31 @@ pub(super) fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options
 }
 
 pub(super) fn action_button(ui: &mut Ui, text: &str) -> Response {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| button(ui, text)).inner
+}
+
+/// Buttons side by side at the end of a row, in the order of `texts`:
+/// their responses in that order. (`action_button` twice would draw the
+/// second over the first.)
+pub(super) fn action_buttons(ui: &mut Ui, texts: &[&str]) -> Vec<Response> {
+    let mut responses = ui
+        .with_layout(Layout::right_to_left(Align::Center), |ui| {
+            texts.iter().rev().map(|text| button(ui, text)).collect::<Vec<_>>()
+        })
+        .inner;
+    responses.reverse();
+    responses
+}
+
+fn button(ui: &mut Ui, text: &str) -> Response {
     let scale = density(ui);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        focus(
-            ui.add(
-                Button::new(RichText::new(text).size(13.0 * scale))
-                    .corner_radius((10.0 * scale) as u8)
-                    .min_size(vec2(0.0, 40.0 * scale)),
-            ),
-        )
-    })
-    .inner
+    focus(
+        ui.add(
+            Button::new(RichText::new(text).size(13.0 * scale))
+                .corner_radius((10.0 * scale) as u8)
+                .min_size(vec2(0.0, 40.0 * scale)),
+        ),
+    )
 }
 
 pub(super) fn choice<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> Response {

@@ -18,6 +18,7 @@ glue5-game = { path = "crates/glue5-game" }
 glue5-runtime = { path = "crates/glue5-runtime" }
 glue5-gpu = { path = "crates/glue5-gpu" }
 glue5 = { path = "crates/glue5" }
+glue5-stream = { path = "crates/glue5-stream" }
 
 anyhow = "1"
 log = "0.4"

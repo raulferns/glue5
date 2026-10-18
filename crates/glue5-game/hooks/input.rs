@@ -3,10 +3,6 @@
     // Once per frame for each of the 4 pads: feeds native gamepads (this build
     // has no XInput and never fills the DirectInput stick table).
     ("pad_update", "rage::ioPad::Update(bool)"),
-    // The radio wheel's axes, which this game data maps to no device: it
-    // reads the selection wheel's instead (and calls them here).
-    ("radio_wheel_axes", "CRadioWheel::GetInputAxis(rage::ioValue const*&, rage::ioValue const*&) const"),
-    ("selection_wheel_axes", "CSelectionWheel::GetInputAxis(rage::ioValue const*&, rage::ioValue const*&) const"),
     // A Scaleform method the scripts call, with its float arguments: the
     // phone's web browser gets mouse clicks it understands.
     ("scaleform_begin_method", "CScaleformMgr::BeginMethod(int, eSCALEFORM_BASE_CLASS, char const*, int)"),
@@ -25,10 +21,6 @@
     // The vehicle the player would get into: called to show the touch
     // controls' Enter button.
     ("scan_for_vehicle_to_enter", "CPlayerInfo::ScanForVehicleToEnter(CPed*, rage::Vector3 const&, bool)"),
-    // The scripts take the phone out and put it away: touch play shows the
-    // pad (its D-pad moves in the phone) meanwhile.
-    ("phone_create", "gta_commands::SetupScriptCommands()::scrWrapped_CREATE_MOBILE_PHONE::Call(rage::scrThread::Info&)"),
-    ("phone_destroy", "gta_commands::SetupScriptCommands()::scrWrapped_DESTROY_MOBILE_PHONE::Call(rage::scrThread::Info&)"),
     // The player driving, once a frame, one for each kind of vehicle: touch
     // play shows controls for it.
     ("drive_automobile", "CTaskVehiclePlayerDriveAutomobile::ProcessDriverInputsForPlayerOnUpdate(CPed*, CControl*, CVehicle*)"),
@@ -42,9 +34,22 @@
     ("player_in_vehicle", "CTaskPlayerDrive::ProcessPreFSM()"),
     // Any ped's parachute (skydiving too), once a frame.
     ("parachute_update", "CTaskParachute::UpdateFSM(int, rage::aiTask::FSM_Event)"),
-    // A cutscene's skip, checked once a frame while one plays.
+    // A cutscene's skip, checked once a frame while one plays (after its
+    // first 2 s, until it fades out).
     ("cutscene_update_skip", "CutSceneManager::UpdateSkip()"),
     // Whether the pause menu (the map, the store, ...) is open: called once
     // a frame for the touch controls, which then act as a mouse.
     ("pause_menu_is_active", "CPauseMenu::IsActive(PM_ActiveFlags)"),
+    // The pause menu goes a level deeper or back (a column, a list): a
+    // direct touch tap that only went in clicks again.
+    ("menu_shift_depth", "CPauseMenu::MENU_SHIFT_DEPTH(eMenuceptionDir, bool, bool)"),
+    // Called: the pause menu shows its map (direct touch drags it).
+    ("pause_menu_in_map", "CPauseMenu::IsInMapScreen()"),
+    // Called: the screen is black, or a loading screen shows (nothing to
+    // play: the touch controls leave).
+    ("screen_faded_out", "camInterface::IsFadedOut()"),
+    ("loading_screens_active", "CLoadingScreens::AreActive()"),
+    // A script's menu shows the mouse's cursor this frame (it does for
+    // keyboard and mouse only): direct touch clicks in it.
+    ("set_mouse_cursor_this_frame", "hud_commands::SetupScriptCommands()::scrWrapped_SET_MOUSE_CURSOR_THIS_FRAME::Call(rage::scrThread::Info&)"),
 ]

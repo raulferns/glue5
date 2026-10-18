@@ -26,6 +26,7 @@ info-plist-path = "../../platform/macos/Info.plist"
 
 [dependencies]
 glue5-runtime.workspace = true
+glue5-stream.workspace = true
 glue5-gpu.workspace = true
 anyhow.workspace = true
 log.workspace = true

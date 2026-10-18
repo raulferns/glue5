@@ -136,6 +136,12 @@ impl Mem {
         Mem { base: unsafe { (*(*env).memory).data } }
     }
 
+    /// A view of `buf` as if it were wasm memory (tests).
+    #[cfg(test)]
+    pub(crate) fn over(buf: &mut [u8]) -> Mem {
+        Mem { base: buf.as_mut_ptr() }
+    }
+
     pub fn ptr(self, addr: u64) -> *mut u8 {
         unsafe { self.base.add(addr as usize) }
     }
@@ -224,7 +230,7 @@ impl Mem {
     }
 }
 
-/// The process's memory footprint (what iOS limits) and, on iOS, how much
+/// The process's memory footprint (what iOS limits) and, on iOS and tvOS, how much
 /// more it may take before the system terminates it, in bytes.
 pub fn footprint() -> (Option<u64>, Option<u64>) {
     #[cfg(target_vendor = "apple")]
@@ -239,14 +245,14 @@ pub fn footprint() -> (Option<u64>, Option<u64>) {
     };
     #[cfg(not(target_vendor = "apple"))]
     let used = None;
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "tvos"))]
     let available = {
         unsafe extern "C" {
             fn os_proc_available_memory() -> usize;
         }
         Some(unsafe { os_proc_available_memory() } as u64)
     };
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
     let available = None;
     (used, available)
 }

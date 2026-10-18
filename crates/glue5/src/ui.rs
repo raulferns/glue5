@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align2, Color32, FontId, Id, LayerId, Order, Pos2, Rect, SafeAreaInsets, Stroke, Vec2, ViewportId, pos2, vec2,
+    Align2, Color32, FontId, Id, LayerId, Order, Pos2, Rect, SafeAreaInsets, Vec2, ViewportId, pos2, vec2,
 };
 use sdl3::event::Event;
 use sdl3::keyboard::Scancode;
@@ -21,13 +21,18 @@ use sdl3::video::Window;
 
 use crate::settings::{PerfOverlay, Settings};
 
+mod chip;
 mod credits;
+mod friends;
 mod pages;
 mod perf;
+mod servers;
 mod theme;
 mod widgets;
 use credits::credits_page;
+use friends::{FriendsPage, friends_page};
 use pages::{settings_page, start_page};
+use servers::{ServersPage, servers_page};
 
 use crate::touch::Touch;
 
@@ -39,6 +44,11 @@ pub enum Page {
     Settings,
     /// Who made what the application is built on, and their licenses.
     Credits,
+    /// The player's friend code, requests, friends.
+    Friends,
+    /// Where the game's files stream from: the server in use, the ones on
+    /// the network, one by its address, this device's copy.
+    Servers,
 }
 
 /// How the game starts.
@@ -63,7 +73,60 @@ pub enum Action {
     FindGame,
     /// The game's graphics settings back to the engine's defaults.
     ResetGraphics,
+    /// Join a friend (by its key) playing GTA Online in `lobby`, from the
+    /// start page.
+    JoinFriend { key: String, lobby: String },
+    /// Back to the game from the friends (a join asked for).
+    CloseFriends,
+    /// Delete the stream's copy of the game.
+    ClearCopy,
+    /// Look for servers on the network.
+    FindServers,
+    /// Stream from this server (an address found or typed).
+    UseServer(String),
 }
+
+/// What a text field of the app's takes: the system keyboard follows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextKind {
+    #[default]
+    Text,
+    /// A friend code: letters and digits, in capitals.
+    Code,
+    /// A server's address or name.
+    Address,
+    /// The player's name.
+    Name,
+}
+
+/// Where the focused text field keeps its [`TextKind`] (egui's memory).
+const TEXT_KIND: &str = "text kind";
+
+/// The system clipboard's text (a paste asked for by a tap).
+fn clipboard_text() -> Option<String> {
+    unsafe {
+        let text = sdl3::sys::clipboard::SDL_GetClipboardText();
+        if text.is_null() {
+            return None;
+        }
+        let owned = std::ffi::CStr::from_ptr(text).to_string_lossy().into_owned();
+        sdl3::sys::stdinc::SDL_free(text.cast());
+        Some(owned).filter(|t| !t.is_empty())
+    }
+}
+
+/// What the stream says over the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamAlert {
+    /// The engine's reads have waited for the server for a moment.
+    Waiting,
+    /// The server does not answer (the game plays on from the copy).
+    Offline,
+}
+
+/// A server found on the network, and what it answered when asked whether
+/// it serves this game (nothing yet while it is asked).
+pub type FoundServer = (glue5_stream::discovery::Found, Option<glue5_stream::Check>);
 
 /// Navigation from a controller.
 #[derive(Clone, Copy, Debug)]
@@ -80,9 +143,9 @@ pub enum Nav {
 /// starts again.
 pub struct Started {
     pub game_dir: PathBuf,
+    pub source: crate::settings::Source,
     pub max_fps: u32,
     pub low_memory: bool,
-    pub render_scale: f32,
 }
 
 /// What the pages show about the application.
@@ -116,13 +179,32 @@ pub struct Status<'a> {
     pub mode: Mode,
     /// The last benchmark's results.
     pub benchmark: Option<&'a crate::benchmark::Results>,
+    /// The game running is GTA Online.
+    pub online: bool,
+    /// Friend requests and game invites waiting for an answer.
+    pub friend_requests: usize,
+    /// Where the game's files come from (the setting).
+    pub source: crate::settings::Source,
+    /// The stream from a server, if one is set: its address and state.
+    pub stream: Option<(&'a str, &'a glue5_stream::Status)>,
+    /// This computer sharing its game folder (desktop).
+    pub sharing: Option<crate::sharing::State>,
+    /// Servers found on the network, and whether a search runs.
+    pub servers: &'a [FoundServer],
+    pub searching: bool,
+    /// A sign over the game: it waits for the server, or the server is away.
+    pub stream_alert: Option<StreamAlert>,
 }
 
-/// The settings button over the game: from the safe area's top right
-/// corner, in points, sized like the touch controls (next to their Start
-/// and Back buttons).
-const GEAR_AT: Vec2 = vec2(-156.0, 40.0);
-const GEAR_RADIUS: f32 = 20.0;
+/// The settings button over the game, sized like the touch controls: at the
+/// top's middle, beside their camera view and pause buttons.
+pub const GEAR_RADIUS: f32 = 20.0;
+
+/// Where the settings button is, in the safe area `safe`, at the touch
+/// controls' scale.
+pub fn gear_center(safe: Rect, scale: f32) -> Pos2 {
+    pos2(safe.center().x + 54.0 * scale, safe.min.y + 30.0 * scale)
+}
 
 const WARN: Color32 = Color32::from_rgb(240, 180, 100);
 
@@ -145,8 +227,11 @@ pub struct Ui {
     page: Option<Page>,
     /// Where the settings go back to: the start page before the game.
     home: Option<Page>,
-    /// Where the credits go back to: the page they were opened from.
+    /// Where the credits, the friends and the servers go back to: the page
+    /// they were opened from.
     behind: Option<Page>,
+    friends: FriendsPage,
+    servers: ServersPage,
     /// The last submission drew something (an empty one clears it).
     drawn: bool,
     note: Option<String>,
@@ -162,13 +247,45 @@ pub struct Ui {
     /// only for input or for this).
     repaint_at: Option<Instant>,
     perf: perf::PerfHud,
+    /// Notifications over everything (Social Club's overlay showed them),
+    /// the oldest first, and where they were last drawn (to tap them).
+    toasts: std::collections::VecDeque<Toast>,
+    toast_area: Option<Rect>,
+    /// The touch controls as last drawn: their taps are the game's, even
+    /// under a notification.
+    controls: Vec<Rect>,
+    /// The stream's sign over the game.
+    chip: chip::Chip,
+    /// Where the focused text field was last drawn (the system keyboard
+    /// keeps it in view).
+    text_rect: Option<Rect>,
+    /// The settings button's icon.
+    gear_icon: Option<egui::TextureHandle>,
 }
+
+/// A notification: as Social Club's, a title, a name and a line; the
+/// friends' tab it opens; until when it shows.
+struct Toast {
+    toast: friends::Toast,
+    since: Instant,
+    until: Instant,
+}
+
+/// How long a notification shows (each one more after the ones before),
+/// how many at most, how wide and high, how long it fades.
+const TOAST_FOR: Duration = Duration::from_millis(3500);
+const TOASTS: usize = 3;
+const TOAST_WIDTH: f32 = 300.0;
+/// A notification's height at most (title, name, line; avatar beside).
+const TOAST_HEIGHT: f32 = 72.0;
+const TOAST_FADE: f32 = 0.35;
 
 impl Ui {
     pub fn new(overlay: glue5_gpu::Overlay) -> Self {
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let background = theme::background(&ctx);
+        let gear_icon = crate::touch::load_icon(&ctx, "settings");
         Ui {
             ctx,
             background,
@@ -180,6 +297,8 @@ impl Ui {
             page: Some(Page::Start),
             home: Some(Page::Start),
             behind: Some(Page::Start),
+            friends: FriendsPage::default(),
+            servers: ServersPage::default(),
             drawn: false,
             note: None,
             scale_edit: None,
@@ -188,6 +307,12 @@ impl Ui {
             gear: None,
             repaint_at: Some(Instant::now()),
             perf: Default::default(),
+            toasts: Default::default(),
+            toast_area: None,
+            controls: Vec::new(),
+            chip: Default::default(),
+            text_rect: None,
+            gear_icon,
         }
     }
 
@@ -204,6 +329,45 @@ impl Ui {
         self.home = None;
         self.starting = None;
         self.show(None);
+    }
+
+    /// A friends' notification, over the game or the pages.
+    pub fn notify(&mut self, notice: &glue5_runtime::friends::Notice) {
+        let now = Instant::now();
+        while self.toasts.len() >= TOASTS {
+            self.toasts.pop_front();
+        }
+        // Each leaves its time after the one before it: they go one at a time.
+        let after = self.toasts.back().map_or(now, |t| t.until.max(now));
+        let toast = friends::toast(notice);
+        self.toasts.push_back(Toast { toast, since: now, until: after + TOAST_FOR });
+        self.repaint();
+    }
+
+    /// The friends (the Home key, Back + RB); again, back.
+    pub fn toggle_friends(&mut self) {
+        if self.page == Some(Page::Friends) {
+            self.back();
+        } else {
+            self.show(Some(Page::Friends));
+        }
+    }
+
+    /// The friends at the tab of the newest notification (one was tapped).
+    pub fn open_toast(&mut self) {
+        if let Some(t) = self.toasts.back() {
+            self.friends.tab = t.toast.tab;
+        }
+        self.toasts.clear();
+        self.show(Some(Page::Friends));
+    }
+
+    /// Whether a finger at `x`, `y` (0..1, as SDL gives them) is on a
+    /// notification.
+    pub fn toast_hit(&self, x: f32, y: f32, window: &Window) -> bool {
+        let size = screen_size(window);
+        let p = pos2(x * size.x, y * size.y);
+        self.toast_area.is_some_and(|r| r.contains(p)) && !self.controls.iter().any(|r| r.contains(p))
     }
 
     /// The settings (from the game or the start page); again, back.
@@ -225,14 +389,17 @@ impl Ui {
                 self.repaint();
             }
             Some(Page::Settings) => self.show(self.home),
-            Some(Page::Credits) => self.show(self.behind),
+            Some(Page::Credits | Page::Friends | Page::Servers) => self.show(self.behind),
             _ => {}
         }
     }
 
     fn show(&mut self, page: Option<Page>) {
-        if page == Some(Page::Credits) && self.page != page {
+        if matches!(page, Some(Page::Credits | Page::Friends | Page::Servers)) && self.page != page {
             self.behind = self.page;
+            if page == Some(Page::Servers) {
+                self.servers.opened();
+            }
         }
         self.page = page;
         self.note = None;
@@ -273,6 +440,12 @@ impl Ui {
         self.page.is_some() && self.ctx.egui_wants_keyboard_input()
     }
 
+    /// What the focused text field takes, and where it is (in points).
+    pub fn text_field(&self) -> Option<(TextKind, Rect)> {
+        let kind = self.ctx.data(|d| d.get_temp::<TextKind>(Id::new(TEXT_KIND))).unwrap_or_default();
+        self.text_rect.filter(|_| self.wants_text()).map(|rect| (kind, rect))
+    }
+
     pub fn idle_for(&self) -> Duration {
         let most = Duration::from_millis(250);
         self.repaint_at.map_or(most, |t| t.saturating_duration_since(Instant::now()).min(most))
@@ -283,6 +456,17 @@ impl Ui {
     pub fn gear_hit(&self, x: f32, y: f32, window: &Window) -> bool {
         let size = screen_size(window);
         self.gear.is_some_and(|(c, r)| c.distance(pos2(x * size.x, y * size.y)) <= r * 1.4)
+    }
+
+    /// Whether a finger at `x`, `y` (0..1) is on the stream's sign.
+    pub fn chip_hit(&self, x: f32, y: f32, window: &Window) -> bool {
+        let size = screen_size(window);
+        self.chip.hit(pos2(x * size.x, y * size.y))
+    }
+
+    /// The Servers page (from the stream's sign over the game).
+    pub fn show_servers(&mut self) {
+        self.show(Some(Page::Servers));
     }
 
     /// Input for a page while one is open.
@@ -412,7 +596,18 @@ impl Ui {
         if !hud {
             self.perf.hide();
         }
-        if self.page.is_none() && touch.is_none() && gear.is_none() && (!hud || !self.perf.due(settings.overlay_detail))
+        let alert = status.stream_alert.filter(|_| self.page.is_none());
+        let now = Instant::now();
+        self.toasts.retain(|t| now < t.until);
+        if self.toasts.is_empty() {
+            self.toast_area = None;
+        }
+        if self.page.is_none()
+            && touch.is_none()
+            && gear.is_none()
+            && alert.is_none()
+            && self.toasts.is_empty()
+            && (!hud || !self.perf.due(settings.overlay_detail))
         {
             if self.drawn && !hud {
                 self.overlay.submit(Vec::new(), Default::default(), 1.0);
@@ -420,6 +615,7 @@ impl Ui {
             }
             self.events.clear();
             self.gear = None;
+            self.chip = Default::default();
             return actions;
         }
         // Play was chosen at the last frame: this one shows that the game
@@ -451,10 +647,27 @@ impl Ui {
         if let Some(touch) = touch {
             touch.draw(&ctx.layer_painter(LayerId::background()), settings.touch_opacity);
         }
-        self.gear = gear.map(|alpha| draw_gear(&ctx, safe, settings.touch_size, alpha));
-        if hud {
-            self.perf.draw(&ctx, safe, settings, status);
+        let scale = crate::touch::control_scale(screen.size(), settings.touch_size);
+        self.gear = gear.map(|alpha| draw_gear(&ctx, safe, scale, alpha, self.gear_icon.as_ref()));
+        let overlay = hud.then(|| self.perf.draw(&ctx, safe, settings, status));
+        // The notifications and the stream's sign keep off everything else
+        // drawn over the game.
+        self.controls = touch.map_or_else(Vec::new, Touch::occupied);
+        let mut taken = self.controls.clone();
+        taken.extend(self.gear.map(|(c, r)| Rect::from_center_size(c, Vec2::splat(2.0 * r))));
+        taken.extend(overlay);
+        // Under the settings button when it shows.
+        // Under the top's buttons (the touch controls' camera view and
+        // pause, the settings), where they show.
+        let below = if self.gear.is_some() { (30.0 + GEAR_RADIUS) * scale + 8.0 } else { 12.0 };
+        self.toast_area = draw_toasts(&ctx, safe, below, &taken, &self.toasts, now);
+        if !self.toasts.is_empty() {
+            self.repaint_in(Duration::from_millis(33));
         }
+        // The sign, legible whatever the touch controls' opacity.
+        taken.extend(self.toast_area);
+        let alpha = gear.unwrap_or(1.0).max(0.75);
+        self.chip.draw(&ctx, safe, alert, self.gear, &taken, scale, alpha);
         if self.page.is_some() && status.started.is_none() {
             theme::backdrop(&ctx, self.background.as_ref());
         }
@@ -469,9 +682,15 @@ impl Ui {
                 back = settings_page(&ctx, settings, status, note, tab, scale_edit, &mut actions, &mut go);
             }
             Some(Page::Credits) => back = credits_page(&ctx),
+            Some(Page::Friends) => {
+                let game = friends::Context { started: status.started.is_some(), online: status.online };
+                back = friends_page(&ctx, &mut self.friends, game, &mut actions);
+            }
+            Some(Page::Servers) => back = servers_page(&ctx, &mut self.servers, settings, status, &mut actions),
             None => {}
         }
         let mut output = ctx.end_pass();
+        self.text_rect = output.platform_output.ime.as_ref().map(|ime| ime.rect);
         for command in std::mem::take(&mut output.platform_output.commands) {
             match command {
                 egui::OutputCommand::OpenUrl(open) => {
@@ -507,6 +726,69 @@ impl Ui {
     }
 }
 
+/// The notifications, at the safe area's top right (`below` its top), the
+/// newest at the bottom, fading in and out: where they are, if any.
+fn draw_toasts(
+    ctx: &egui::Context,
+    safe: Rect,
+    below: f32,
+    taken: &[Rect],
+    toasts: &std::collections::VecDeque<Toast>,
+    now: Instant,
+) -> Option<Rect> {
+    if toasts.is_empty() {
+        return None;
+    }
+    let scale = theme::layout_scale(safe);
+    let width = (TOAST_WIDTH * scale).min(safe.width() - 32.0);
+    // All of them where they fit, else the newest alone; nowhere free (the
+    // touch controls fill the top): none over the game, the page has them.
+    let (at, shown) = [toasts.len(), 1].into_iter().find_map(|n| {
+        let height = n as f32 * TOAST_HEIGHT * scale + (n - 1) as f32 * 8.0 * scale;
+        toast_place(safe, below, vec2(width, height), taken).map(|at| (at, n))
+    })?;
+    let response = egui::Area::new(Id::new("toasts"))
+        .order(Order::Tooltip)
+        .fixed_pos(at)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 8.0 * scale;
+            for t in toasts.iter().skip(toasts.len() - shown) {
+                let shown = now.duration_since(t.since).as_secs_f32();
+                let left = t.until.saturating_duration_since(now).as_secs_f32();
+                ui.scope(|ui| {
+                    ui.multiply_opacity((shown.min(left) / TOAST_FADE).clamp(0.0, 1.0));
+                    friends::draw_toast(ui, &t.toast, width);
+                });
+            }
+        });
+    Some(response.response.rect)
+}
+
+/// Where the notifications go (their top left), the first place where they
+/// cover nothing else on screen (`taken`): in the top's middle under its
+/// buttons (the touch controls' camera view and pause, the settings; the
+/// game shows nothing there), in the top right or left corner, else lower
+/// in those three places, down to the middle of the screen at most.
+fn toast_place(safe: Rect, below: f32, size: Vec2, taken: &[Rect]) -> Option<Pos2> {
+    let starts = [
+        pos2(safe.center().x - size.x / 2.0, safe.top() + below),
+        pos2(safe.right() - size.x - 16.0, safe.top() + 12.0),
+        pos2(safe.left() + 16.0, safe.top() + 12.0),
+    ];
+    let lowest = safe.center().y - size.y / 2.0;
+    let free = |at: Pos2| {
+        let rect = Rect::from_min_size(at, size);
+        safe.contains_rect(rect) && !taken.iter().any(|t| t.intersects(rect.expand(4.0)))
+    };
+    (0..)
+        .map(|step| step as f32 * 8.0)
+        .take_while(|down| starts.iter().any(|s| s.y + down <= lowest))
+        .flat_map(|down| starts.map(|s| s + vec2(0.0, down)))
+        .find(|&at| at.y <= lowest && free(at))
+}
+
 // Points: the UI's unit, the same physical size everywhere. As SDL's
 // README-highdpi describes, a point is the window's display scale in pixels;
 // SDL's window coordinates are points on Apple platforms but pixels on
@@ -529,6 +811,12 @@ pub fn screen_size(window: &Window) -> Vec2 {
     vec2(w as f32, h as f32) / pixels_per_point(window)
 }
 
+/// A rectangle in points, in SDL's window coordinates.
+pub fn window_rect(window: &Window, r: Rect) -> sdl3::rect::Rect {
+    let r = Rect::from_min_max(r.min / points_per_window_unit(window), r.max / points_per_window_unit(window));
+    sdl3::rect::Rect::new(r.min.x as i32, r.min.y as i32, r.width().max(1.0) as u32, r.height().max(1.0) as u32)
+}
+
 /// The part of the window clear of notches and rounded corners, in points.
 pub fn safe_rect(window: &Window) -> Rect {
     match window.safe_area() {
@@ -544,13 +832,21 @@ pub fn safe_rect(window: &Window) -> Rect {
 }
 
 /// The settings button: the touch controls' look, at their size.
-fn draw_gear(ctx: &egui::Context, safe: Rect, scale: f32, alpha: f32) -> (Pos2, f32) {
-    let c = pos2(safe.max.x + GEAR_AT.x * scale, safe.min.y + GEAR_AT.y * scale);
+fn draw_gear(ctx: &egui::Context, safe: Rect, scale: f32, alpha: f32, icon: Option<&egui::TextureHandle>) -> (Pos2, f32) {
+    let c = gear_center(safe, scale);
     let r = GEAR_RADIUS * scale;
-    let white = |a: f32| Color32::from_white_alpha((a * alpha * 255.0) as u8);
+    let look = crate::touch::Look::new(alpha, scale, glue5_runtime::input::Character::Other);
     let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("gear")));
-    painter.circle(c, r, white(0.18), Stroke::new(1.5 * scale, white(0.6)));
-    painter.text(c, Align2::CENTER_CENTER, "⚙", FontId::proportional(r * 0.95), white(0.9));
+    painter.circle(c, r, look.fill(false), look.stroke(false));
+    match icon {
+        Some(icon) => {
+            let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+            painter.image(icon.id(), Rect::from_center_size(c, Vec2::splat(r * 1.15)), uv, look.icon);
+        }
+        None => {
+            painter.text(c, Align2::CENTER_CENTER, "⚙", FontId::proportional(r * 0.95), look.icon);
+        }
+    }
     (c, r)
 }
 
@@ -570,3 +866,77 @@ fn key(sc: Scancode) -> Option<egui::Key> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::touch::Touch;
+    use glue5_runtime::input::{Activity, Character, Driving, PlayerContext};
+
+    /// Every touch layout, at every controls' size, on phones and a tablet:
+    /// the notifications, where they show, cover no control and are inside
+    /// the safe area.
+    #[test]
+    fn notifications_cover_no_control() {
+        let activities = [
+            Activity::OnFoot,
+            Activity::Driving(Driving::Car),
+            Activity::Driving(Driving::Heli),
+            Activity::Driving(Driving::Plane),
+            Activity::Passenger,
+            Activity::Parachute,
+        ];
+        let screens = [
+            (vec2(874.0, 402.0), [62.0, 0.0, 62.0, 21.0]),
+            (vec2(844.0, 390.0), [47.0, 0.0, 47.0, 21.0]),
+            (vec2(1194.0, 834.0), [0.0, 24.0, 0.0, 20.0]),
+        ];
+        let (mut placed, mut tried) = (0, 0);
+        for (screen, [l, t, r, b]) in screens {
+            let safe = Rect::from_min_max(pos2(l, t), pos2(screen.x - r, screen.y - b));
+            for scale in [0.7, 1.0, 1.5] {
+                let controls = crate::touch::control_scale(screen, scale);
+                let gear = Rect::from_center_size(gear_center(safe, controls), Vec2::splat(2.0 * GEAR_RADIUS * controls));
+                let below = (30.0 + GEAR_RADIUS) * controls + 8.0;
+                for activity in activities {
+                    for (vehicle_near, phone) in [(false, false), (true, false), (false, true)] {
+                        let context = PlayerContext {
+                            activity,
+                            vehicle_near,
+                            phone,
+                            menu: false,
+                            cutscene: false,
+                            bar: false,
+                            scripted: false,
+                            character: Character::Other,
+                            gun: false,
+                            cursor: false,
+                            map: false,
+                            pointer: false,
+                            alert: false,
+                            hidden: false,
+                        };
+                        let mut touch = Touch::new();
+                        touch.layout(screen, safe, scale);
+                        touch.set_context(context);
+                        let mut taken = touch.occupied();
+                        taken.push(gear);
+                        let width = (TOAST_WIDTH * theme::layout_scale(safe)).min(safe.width() - 32.0);
+                        let size = vec2(width, TOAST_HEIGHT * theme::layout_scale(safe));
+                        tried += 1;
+                        let Some(at) = toast_place(safe, below, size, &taken) else { continue };
+                        placed += 1;
+                        let rect = Rect::from_min_size(at, size);
+                        assert!(safe.contains_rect(rect), "{screen:?} {scale} {context:?}: {rect:?}");
+                        for t in &taken {
+                            assert!(!t.intersects(rect), "{screen:?} {scale} {context:?}: {rect:?} on {t:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // They show almost always.
+        assert!(placed * 10 >= tried * 9, "shown {placed} of {tried} times");
+    }
+}
+

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Build the iOS app as an unsigned IPA, for a sideloading tool to sign"
+#MISE depends=["ios:build"]
+# The tool signs it with the user's own team. The entitlements go along in
+# an ad-hoc signature, for the tools that carry them over.
+. "$(dirname "$0")/lib.sh"
+
+ipa=$PWD/target/ios/Glue5.ipa
+payload=$PWD/target/ios/Payload
+rm -rf "$payload" "$ipa"
+mkdir -p "$payload"
+cp -R "$app" "$payload/"
+codesign --force --sign - --entitlements platform/ios/Glue5.entitlements "$payload/${app##*/}"
+(cd "${payload%/*}" && zip -qry "$ipa" Payload)
+rm -rf "$payload"
+echo "built $ipa (unsigned)"

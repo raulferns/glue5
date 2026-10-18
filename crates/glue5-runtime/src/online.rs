@@ -29,11 +29,20 @@ const PROFILE_MANAGER: u64 = 96;
 const METHODS: u64 = 64;
 
 /// The engine's switches for GTA Online without Rockstar's services: LAN
-/// sessions (the lobby is the LAN, vnet.rs), straight into freemode, and no
-/// cloud files, catalog, shop transactions or online policies to wait for.
+/// sessions (the lobby is the LAN, vnet.rs), straight into freemode, no
+/// cloud files, catalog, shop transactions or online policies to wait for,
+/// sessions for everyone whatever their aim (the game keeps players aiming
+/// freely, with a mouse, apart from assisted ones, as touch play on a phone
+/// is: they never met), and the story's prologue taken as played (joining a
+/// friend's session asks for it: "GTA Online will be available once you
+/// have completed the prologue", and the game answered the friend's
+/// session every frame).
 pub(crate) const ENGINE_ARGS: &[&str] = &[
     "-lan",
     "-StraightIntoFreemode",
+    "-netSessionIgnoreAim",
+    "-netSpPrologueComplete",
+    "-mpavailable",
     "-netMpSkipCloudFileRequirements",
     "-sc_noOnlinePolicy",
     "-netshoptransactionnull",
@@ -44,10 +53,14 @@ pub(crate) const ENGINE_ARGS: &[&str] = &[
 
 /// The local gamer's id (as Rockstar's ids): made up once per user
 /// directory, kept in it.
-fn gamer_id() -> u64 {
+pub(crate) fn gamer_id() -> u64 {
+    gamer_id_in(&crate::rt().config.user_dir)
+}
+
+pub(crate) fn gamer_id_in(user_dir: &std::path::Path) -> u64 {
     static ID: OnceLock<u64> = OnceLock::new();
     *ID.get_or_init(|| {
-        let path = crate::rt().config.user_dir.join("online-id");
+        let path = user_dir.join("online-id");
         if let Some(id) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()) {
             return id;
         }
@@ -73,6 +86,7 @@ pub(crate) fn start(online: &crate::Online, hooks: &mut glue5_game::Hooks) {
     crate::vnet::hooks(hooks);
     crate::cloud::hooks(hooks);
     crate::jobs::hooks(hooks);
+    crate::friends::game::hooks(hooks);
     crate::texts::hooks(hooks);
     crate::stats::hooks(hooks);
     // The stand-ins' methods, host functions the game calls through their
@@ -88,8 +102,9 @@ pub(crate) fn start(online: &crate::Online, hooks: &mut glue5_game::Hooks) {
             sign_in_info as *const () as usize,
         ]
     }));
-    if let Err(e) = crate::p2p::start(&online.lobby, crate::vnet::deliver) {
-        log::error!("p2p: {e}");
+    match crate::p2p::start() {
+        Ok(p2p) => p2p.join_lobby(&online.lobby),
+        Err(e) => log::error!("p2p: {e}"),
     }
 }
 
@@ -158,11 +173,97 @@ pub(crate) unsafe extern "C" fn live_manager_init(env: *mut Env, mode: u32) {
 }
 
 /// Hook for `CLiveManager::Update(unsigned int)`: the device's network
-/// stays up (see `vnet::network_up`).
+/// stays up (see `vnet::network_up`), the tunables' request is over;
+/// friends (friends/game.rs).
 pub(crate) unsafe extern "C" fn live_manager_update(env: *mut Env, mode: u32) {
+    unsafe { crate::friends::game::update(env) };
     crate::vnet::network_up(unsafe { Mem::of(env) });
+    unsafe { tunables_requested(env) };
     unsafe { orig::live_manager_update(env, mode) };
     crate::vnet::network_up(unsafe { Mem::of(env) });
+}
+
+/// Rockstar's cloud tunables never come: their request counts as over
+/// (`CTunables`' flag, set at the end of `OnCloudEvent` either way), as
+/// what waits for it (invites, CanEnterMultiplayer) asks, and the network's
+/// settings are read from them as they would be then: their defaults (an
+/// invite's lifetime among them, else 0: gone as it comes). The scripts
+/// keep their defaults too.
+unsafe fn tunables_requested(env: *mut Env) {
+    const TUNABLES: u64 = 19275808;
+    const CLOUD_REQUEST_DONE: u64 = 464;
+    let m = unsafe { Mem::of(env) };
+    let tunables = m.u64(TUNABLES);
+    if tunables != 0 && m.u8(tunables + CLOUD_REQUEST_DONE) == 0 {
+        // Read before the flag is set: once set, the reader would also ask
+        // Rockstar for its content's URLs.
+        unsafe { orig::network_tunables_read(env, 0) };
+        m.set_u8(tunables + CLOUD_REQUEST_DONE, 1);
+        log::info!("online: the network's tunables, their defaults");
+    }
+}
+
+/// `CNetworkSession`'s host flags (its `LogHostFlags`).
+const HF_IS_PRIVATE: u32 = 1;
+const HF_SINGLEPLAYER_ONLY: u32 = 4;
+const HF_CLOSED: u32 = 8;
+const HF_CLOSED_FRIENDS: u32 = 16;
+const HF_CLOSED_CREW: u32 = 32;
+
+/// Hook for `CNetworkSession::HostSession(NetworkGameConfig&, unsigned
+/// int)`, which every session the game hosts goes through (a job's
+/// excepted): the lobby it is in follows its kind, as the pause menu's
+/// sessions are. A public one in everyone's; the others (invite only,
+/// crew, closed friends, solo) in a new private lobby, whose key is the
+/// only way in: friends get it with an invite, or from the presence for a
+/// friends' session; nobody for a solo one.
+pub(crate) unsafe extern "C" fn session_host_config(env: *mut Env, session: u64, config: u64, flags: u32) -> u32 {
+    use crate::friends::SessionKind;
+    let kind = if flags & HF_SINGLEPLAYER_ONLY != 0 {
+        SessionKind::Solo
+    } else if flags & HF_CLOSED_FRIENDS != 0 {
+        SessionKind::Friends
+    } else if flags & (HF_IS_PRIVATE | HF_CLOSED | HF_CLOSED_CREW) != 0 {
+        SessionKind::Closed
+    } else {
+        SessionKind::Public
+    };
+    in_lobby_for(kind);
+    unsafe { orig::session_host_config(env, session, config, flags) }
+}
+
+/// Hook for `CNetworkSession::DoFreeroamMatchmaking(int, int, unsigned int,
+/// unsigned int)`: looking for a public session, in everyone's lobby.
+pub(crate) unsafe extern "C" fn freeroam_matchmaking(env: *mut Env, session: u64, mode: u32, max: u32, flags: u32) -> u32 {
+    in_lobby_for(crate::friends::SessionKind::Public);
+    unsafe { orig::freeroam_matchmaking(env, session, mode, max, flags) }
+}
+
+/// Hook for `CNetworkSession::DoFriendMatchmaking(int, int, unsigned int,
+/// unsigned int)`: "Join Friends", into a friend's session, found in the
+/// friends' presence (friends/game.rs): the friend's lobby is the
+/// friend's to share.
+pub(crate) unsafe extern "C" fn friend_matchmaking(env: *mut Env, session: u64, mode: u32, max: u32, flags: u32) -> u32 {
+    crate::friends::find_friends();
+    unsafe { orig::friend_matchmaking(env, session, mode, max, flags) }
+}
+
+/// Moves the player to the lobby for a session of `kind`: everyone's (the
+/// friend's, while one is followed there), or a new private one.
+fn in_lobby_for(kind: crate::friends::SessionKind) {
+    crate::friends::set_session_kind(kind);
+    let Some(p2p) = crate::p2p::get() else { return };
+    if kind == crate::friends::SessionKind::Public {
+        if crate::friends::following().is_none() {
+            p2p.switch_lobby("");
+        }
+    } else {
+        // Its key, the way in: 128 bits from the system (as long a name as
+        // friends take).
+        let mut key = [0u8; 16];
+        getrandom::fill(&mut key).expect("the system's random numbers");
+        p2p.switch_lobby(&key.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
 }
 
 /// Hook for `CLiveManager::BailOnMultiplayer(eBailReason, int)`: the
@@ -248,6 +349,22 @@ native_results! {
     /// `NETWORK_HAS_SOCIAL_CLUB_ACCOUNT`: the player has one (the pause
     /// menu's Creator needs it).
     social_club_account = 1;
+    /// `ARE_ONLINE_POLICIES_UP_TO_DATE`: there are no Rockstar policies to
+    /// accept (`-sc_noOnlinePolicy`); an invite is dropped otherwise.
+    online_policies_current = 1;
+}
+
+/// Hook for `PLAYSTATS_CREATE_MATCH_HISTORY_ID_2(int&, int&)`: a match's id,
+/// the Rockstar account's and the time, or the network card's address
+/// (which the engine cannot read here); the minigames' host (golf) waits
+/// for one. The player's id and the time.
+pub(crate) unsafe extern "C" fn match_history_id(env: *mut Env, info: u64) {
+    let m = unsafe { Mem::of(env) };
+    let params = m.u64(info + 16);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    m.set_u32(m.u64(params), gamer_id() as u32);
+    m.set_u32(m.u64(params + 8), now as u32);
+    m.set_u32(m.u64(info), 1);
 }
 
 /// Hook for `CNetwork::CanAccessNetworkFeatures(eNetworkAccessArea,
@@ -324,6 +441,12 @@ pub(crate) unsafe extern "C" fn can_enter_multiplayer(env: *mut Env, session: u6
 /// (script, code offset, the bytes there, the bytes put instead). A patch
 /// whose bytes differ is left out and logged.
 const SCRIPT_PATCHES: &[(&str, u32, &[u8], &[u8])] = &[
+    // g_bFM_Rank_Unlocks_ON = FALSE: GTA Online's activities (golf, tennis,
+    // darts, arm wrestling, the flight school, survivals...) are open from
+    // the start instead of at a rank and after a contact's call, as the
+    // game's own scripts allow; with Rockstar's jobs gone, ranks come
+    // slowly here.
+    ("MP_FM_registration", 194, &[OP_PUSH_1, 99, 72, 7, 28], &[OP_PUSH_0, 99, 72, 7, 28]),
     // CAN_ENTER_MP_AFTER_VALID_CHARACTER_CREATOR_FLOW: with no character yet,
     // the straight-into-freemode start (LOBBY_AUTO_MULTIPLAYER_FREEMODE)
     // must not keep the player from the character creator.
@@ -341,6 +464,7 @@ const SCRIPT_PATCHES: &[(&str, u32, &[u8], &[u8])] = &[
 ];
 const OP_NOP: u8 = 0;
 const OP_PUSH_0: u8 = 113;
+const OP_PUSH_1: u8 = 114;
 /// Script code is kept in pages of this size.
 const SCRIPT_PAGE: u32 = 0x4000;
 
@@ -517,6 +641,9 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.rl_offline_name = Some(offline_name);
     hooks.live_manager_init = Some(live_manager_init);
     hooks.live_manager_update = Some(live_manager_update);
+    hooks.session_host_config = Some(session_host_config);
+    hooks.freeroam_matchmaking = Some(freeroam_matchmaking);
+    hooks.friend_matchmaking = Some(friend_matchmaking);
     hooks.bail_on_multiplayer = Some(bail_on_multiplayer);
     hooks.rl_pc_initialized = Some(rl_pc_initialized);
     hooks.ros_privilege = Some(ros_privilege);
@@ -528,6 +655,8 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.profanity_pending = Some(profanity_pending);
     hooks.profanity_valid = Some(profanity_valid);
     hooks.social_club_account = Some(social_club_account);
+    hooks.online_policies_current = Some(online_policies_current);
+    hooks.match_history_id = Some(match_history_id);
     hooks.script_program_loaded = Some(script_program_loaded);
     hooks.presence_online = Some(presence_online);
     hooks.can_enter_multiplayer = Some(can_enter_multiplayer);

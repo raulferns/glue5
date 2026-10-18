@@ -2,6 +2,8 @@
 set -euo pipefail
 
 bundle_id=local.glue5
+# The kind of device the tasks look for (the tvOS tasks set tvOS).
+platform=${platform:-iOS}
 
 die() {
     echo "$*" >&2
@@ -28,10 +30,11 @@ xcodebuild_app() {
         -derivedDataPath target/ios/derived "$@" build
 }
 
-# Connected devices matching a devicectl filter: "identifier udid" per line.
+# Connected devices of $platform matching a devicectl filter: "identifier
+# udid" per line.
 devices() {
-    xcrun devicectl list devices --hide-default-columns --hide-headers \
-        --columns Identifier --columns udid --filter "$1" | awk 'length($1) >= 25 { print $1, $2 }'
+    xcrun devicectl list devices --hide-default-columns --hide-headers --columns Identifier --columns udid \
+        --filter "hardwareProperties.platform == '$platform' AND ($1)" | awk 'length($1) >= 25 { print $1, $2 }'
 }
 
 # A reachable device, connected or just paired (identifier, UDID or name; default the only one
@@ -45,7 +48,7 @@ pick_device() {
     fi
     case $(grep -c . <<<"$found" || true) in
     1) read -r device udid <<<"$found" ;;
-    0) die "no such connected iOS device" ;;
+    0) die "no such connected $platform device" ;;
     *) die "several devices connected: pass one ($(awk '{ print $1 }' <<<"$found" | paste -sd, - | sed 's/,/, /g'))" ;;
     esac
 }

@@ -72,13 +72,23 @@ pub unsafe extern "C" fn wgpu_start_worker(env: *mut Env, ring: u64, size: u64, 
     }
 }
 
-/// -1: no HTTP file system; the engine reads /game through the syscalls.
-pub unsafe extern "C" fn wasm_httpfs_manifest_js(_: *mut Env, _buf: u64, _cap: u32) -> u32 {
-    u32::MAX
+/// The engine's HTTP file system: when the game streams, its manifest of the
+/// `/game` files (copied when `cap` holds it and a NUL, the length always);
+/// otherwise -1, and the engine reads /game through the syscalls.
+pub unsafe extern "C" fn wasm_httpfs_manifest_js(env: *mut Env, buf: u64, cap: u32) -> u32 {
+    let Some(manifest) = crate::stream::manifest() else { return u32::MAX };
+    if cap as usize > manifest.len() {
+        let m = mem(env);
+        m.bytes_mut(buf, manifest.len()).copy_from_slice(manifest);
+        m.set_u8(buf + manifest.len() as u64, 0);
+    }
+    manifest.len() as u32
 }
 
-pub unsafe extern "C" fn wasm_httpfs_io_start_js(_: *mut Env, _table: u64) {
-    unsupported("wasm_httpfs_io_start_js");
+pub unsafe extern "C" fn wasm_httpfs_io_start_js(_: *mut Env, table: u64) {
+    if !crate::stream::start_announcements(table) {
+        unsupported("wasm_httpfs_io_start_js");
+    }
 }
 
 /// 0: saves are real files under /userdata, no mirroring needed.
@@ -115,10 +125,10 @@ pub unsafe extern "C" fn wasm_module_int_js(env: *mut Env, name: u64, default: u
         }
         None => default,
     };
-    // Phones, and low memory anywhere: the resource heap's budget is its
+    // Phones and the Apple TV, and low memory anywhere: the resource heap's budget is its
     // starting size. Unbudgeted, the streaming engine keeps it full and it
     // grows by 256 MiB each time: past 2.5 GiB in the game's benchmark.
-    let phone = cfg!(any(target_os = "ios", target_os = "android"));
+    let phone = cfg!(any(target_os = "ios", target_os = "android", target_os = "tvos"));
     if name == "gameResourceMB" && (low || phone) {
         crate::memory::budget_resource_heap(value);
     }

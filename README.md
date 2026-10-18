@@ -11,9 +11,9 @@ controls. The game runs locally on iOS and macOS. Phones, tablets and
 computers share the same code base; more platforms are planned.
 
 The game's code is compiled for the target device when you build the app.
-It runs without just-in-time (JIT) compilation or streaming from another
-computer. Improvements to the shared runtime benefit both mobile and
-desktop builds.
+It runs without just-in-time (JIT) compilation. Its files are read from a
+folder on the device, or streamed from a computer that has them.
+Improvements to the shared runtime benefit both mobile and desktop builds.
 
 **This project provides only the recompilation tools and compatibility
 layer. It does not include or distribute ANY GTA V assets or game binaries.**
@@ -49,8 +49,10 @@ See [design.md](docs/design.md) for architecture, tradeoffs and known limits.
 | `crates/glue5-game` | The game module. Its build script verifies `game.wasm`, runs wasm2c, applies hooks and compiles the C. |
 | `crates/glue5-runtime` | Host runtime: Emscripten/WASI imports, threads, VFS, input, audio output, the GPU command ring (and a null backend). |
 | `crates/glue5-gpu` | The renderer: executes the engine's D3D11-style command ring with wgpu (Metal on Apple platforms, Vulkan elsewhere). |
+| `crates/glue5-stream` | The game's files over the network: `glue5-serve` (a game folder to other devices), the client and its local copy, Bonjour discovery. |
 | `crates/glue5` | The application (SDL3), the same on every platform: window, input, audio, settings and touch controls (egui overlay). Its `headless` example runs the game without a window. |
 | `platform/ios` | What iOS needs around it: `main.c`, entitlements, the xcodegen spec. |
+| `platform/tvos` | The same for the Apple TV (so far run in the simulator only). |
 | `platform/android` | The Gradle project around it: manifest, the activity (SDL's, subclassed), the adaptive icon. |
 | `platform/macos` | Extra bundle metadata; cargo-packager configuration lives in `crates/glue5/Cargo.toml`. |
 | `platform/linux` | The container the AppImage is built in (`Dockerfile`). |
@@ -75,6 +77,10 @@ NDK: versions in `platform/android/gradle.properties`) with sdkmanager.
 ```sh
 mise run play          # the first build compiles ~1 GB of generated C
 ```
+
+Without a computer set up for it, GitHub Actions can build the app in
+your fork from your own `game.wasm`, which stays private:
+[docs/github-build.md](docs/github-build.md).
 
 Every task first runs `mise run setup`, which prepares wgpu-core, wgpu-hal
 and wasm2c with our patches (only when they change). Run cargo by hand
@@ -131,6 +137,7 @@ The game is looked for in `game/` beside the AppImage, as beside the Mac app.
 | What | Command |
 |---|---|
 | Play (desktop) | `mise run play` |
+| Serve the game folder to the app on other devices (streaming) | `mise run serve [folder]` (`-- --help` lists the options) |
 | macOS: build and open the app bundle | `mise run macos` |
 | macOS: build only the app bundle | `mise run macos:build` |
 | macOS: open the built app again | `mise run macos:run` |
@@ -143,8 +150,13 @@ The game is looked for in `game/` beside the AppImage, as beside the Mac app.
 | Record pipelines on automated runs (benchmark, map tours, graphics settings) into the seed | `mise run shaders:collect [default low min mid high max]` |
 | iOS: build, sign, install, launch on the connected device | `mise run ios [device]` |
 | iOS: only check that the app builds | `mise run ios:build` |
+| iOS: an unsigned IPA, for a sideloading tool to sign | `mise run ios:ipa` |
 | iOS: launch the installed app again, with its console | `mise run ios:run [device]` |
 | iOS: copy the game into the app's Documents/game | `mise run ios:game [device]` |
+| Apple TV: build, sign, install, launch on the paired Apple TV | `mise run tvos [device]` |
+| Apple TV: only check that the app builds | `mise run tvos:build` |
+| Apple TV: launch the installed app again, with its console | `mise run tvos:run [device]` |
+| Apple TV simulator: build, install, launch with its console | `mise run tvos:sim [simulator]` |
 | Android: build, install, launch on the connected device with its log | `mise run android [device]` |
 | Android: only build the APK | `mise run android:build` |
 | Android: launch the installed app again, with its log | `mise run android:run [device]` |
@@ -153,7 +165,10 @@ The game is looked for in `game/` beside the AppImage, as beside the Mac app.
 `mise tasks` lists them all. iOS signing uses the team in `GLUE5_TEAM`:
 put it in `.mise/config.local.toml` (ignored by git) under `[env]`. With several
 phones connected, pass the device (name, identifier or UDID); for Android,
-its serial number (`adb devices`).
+its serial number (`adb devices`). The Apple TV tasks sign the same way; they
+need Xcode's tvOS platform (Xcode › Settings › Components) and an Apple TV
+paired with Xcode (on the TV: Settings › Remotes and Devices › Remote App and
+Devices).
 
 ### macOS packaging
 
@@ -186,8 +201,8 @@ activate it; the plist alone does not guarantee activation. See Apple's
 ### Runtime options
 
 The app and headless runner accept these environment variables.
-`mise run ios` and `ios:run` forward `RUST_LOG` and `GLUE5_*` variables
-to the device; so do `mise run android` and `android:run` (as the launch
+`mise run ios` and `ios:run` (and the `tvos` ones) forward `RUST_LOG` and
+`GLUE5_*` variables to the device; so do `mise run android` and `android:run` (as the launch
 intent's extras).
 
 | Variable | Effect |
@@ -215,10 +230,10 @@ up the system keyboard on touch devices.
 The start page shows the game files, Story mode, GTA Online, Sandbox (the
 whole map, free roam, no missions) and Settings; the last mode played comes
 first. App settings cover resolution, upscaling, VSync, frame rate, touch
-controls, low memory, the game folder and GTA Online's name and private
-lobby. During play, open them with F1, the ⚙ button on
-touch screens, or by holding Back + Start on a controller. Use the D-pad or arrow keys to
-navigate, A or Enter to select, and B or Esc to go back.
+controls, low memory and where the game files come from. During play,
+open them with F1, the ⚙ button on touch screens, or by holding Back +
+Start on a controller. Use the D-pad or arrow keys to navigate, A or Enter
+to select, and B or Esc to go back.
 
 Esc / Start opens the game's own menu. Graphics quality is configured in
 Settings › Graphics and saved in `settings.xml`. Confirming a change that
@@ -230,8 +245,11 @@ the app restarts directly into the game. On a phone, reopen the app.
 GTA Online's freemode runs without Rockstar's services and without a
 server of ours. GTA ONLINE on the start page puts the player in the lobby
 of everyone playing, where the game's own matchmaking finds or hosts a
-session; Settings › Game › Private lobby takes a code instead, to play with
-whoever enters the same one. The name other players see is in the same tab.
+public session. The pause menu's other sessions (invite only, crew,
+closed friends, solo) are hosted in a lobby of their own, new each time,
+reached only through an invite or, for a closed friends session, by
+friends. The name other players see is set on the start page, in the GTA
+ONLINE card.
 
 - The lobby is a virtual LAN the engine plays on as on a real one
   (`vnet.rs`): its sockets carry their datagrams over one UDP socket per
@@ -243,6 +261,46 @@ whoever enters the same one. The name other players see is in the same tab.
   can.
 - Characters are kept in the user directory, `cloud/` (`cloud.rs`, with the
   stats the game's data lacks: `stats.rs`); the gamer id in `online-id`.
+
+### Friends
+
+Friends see when the other plays, join each other in GTA Online and
+invite each other, from the game's own menus too, still with no server of
+ours (`friends/`). As Social Club's overlay did, the app's Friends page
+(♡ on the start page, Home, or Back + RB on a controller) has the
+friends, the friend requests, the game invites and the players to ask,
+and notifications come up at the top right: a friend online or offline,
+a request, a request accepted, an invite (Settings › Game turns them
+off).
+
+- Each player has a key pair made on the device and a friend code
+  (16 characters: 75 bits of a hash of its key and a random salt, and a
+  check character) to give out. Asking with a code reaches its owner, who
+  says yes or no: the owner answers with the salt, and the asker checks
+  that the code comes from the key that answered, so knowing a code is
+  not enough to answer for it. A new code (a new salt) retires the old
+  one. A player met online can be asked without one,
+  from the page's players met or the pause menu's "Send Friend Request"
+  on a player of the session: the players of a lobby tell each other
+  their key, and a request without a code is answered only while its
+  sender is in the same lobby. The key, the code, the friends and the
+  players met are in `friends.json` in the user directory (readable by the
+  player only).
+- Friends meet on the DHT and the local network under a key only the two
+  of them can compute (from their keys' Diffie-Hellman secret, changing
+  every 6 hours), then talk over a Noise channel (`IK`, or `XXpsk0` with a
+  code; ChaCha20-Poly1305, BLAKE2s, X25519, by `snow`): a player answers
+  no one else, and what friends say to each other cannot be read or forged
+  by anyone else. A friend sees the player's Internet address, as a player
+  of the same lobby does.
+- In the game, the friends are the pause menu's; their invites (to a
+  session, to a job) and answers travel over the channel, accepted only
+  from that friend. The game knows a friend by its gamer id, which each
+  player says itself: one that another friend has is not taken. A friend tells the others its session only when they
+  may join it (public, or closed friends); an invite carries a private
+  one. "Join" on a friend's card or on the app's page, accepting an
+  invite, and the pause menu's "Join Friends" take the player into the
+  friend's lobby (introduced by it) and session.
 
 ## Renderer
 
@@ -296,7 +354,21 @@ On desktop, the default is `game` next to the executable or in the
 repository. On iOS, it is `Documents/game`, populated with
 `mise run ios:game`, Finder > device > Files, or the Files app. On Android,
 it is `Android/data/local.glue5/files/game`, populated with
-`mise run android:game`.
+`mise run android:game`. The Apple TV has no game folder: it keeps only
+caches the system may empty, so the game always streams there; its
+settings, saves and friends are in that cache folder too.
+
+The files can also stream from another computer instead (Settings › Game
+› Game files › Server, or Stream from a server on the start page): the app
+on a computer with the game, with Settings › Game › Share on the network
+on, or `glue5-serve` on any desktop system. The Servers page (the start
+page's Server button, or Settings › Game › Server) lists the computers on
+the same network that share the game, whether each serves this game and
+how far it is; elsewhere an address is typed, `host` or `host:port` (port
+47100). The app keeps what it received in its cache folder for the next
+starts; Download the whole game, on the same page, makes it a copy of the
+game of its own, which plays without the server. See
+[design.md](docs/design.md#streaming-the-games-files).
 
 If the files are missing, the start page explains where to put them.
 Desktop users can choose a folder; on iOS, the app checks again when it

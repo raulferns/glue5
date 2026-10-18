@@ -2,7 +2,7 @@
 //!
 //! | engine path | host |
 //! |---|---|
-//! | `/game/…` | the game's `data/` directory, read-only, case-insensitive |
+//! | `/game/…` | the game's `data/` directory, read-only, case-insensitive (none when the game streams: the engine's HTTP device serves it) |
 //! | `/userdata/…` | the per-user directory (saves, settings) |
 //! | `/dev/null`, `/dev/urandom`, `/dev/random` | none: emulated (Windows has no `/dev`; the engine's network crypto reads `/dev/urandom`) |
 //! | anything else | a scratch tree under the user directory |
@@ -106,7 +106,7 @@ struct DirStream {
 }
 
 pub struct Vfs {
-    game: PathBuf,
+    game: Option<PathBuf>,
     /// Lowercase path under `game` -> real path, for case-insensitive lookups.
     game_index: HashMap<String, String>,
     user: PathBuf,
@@ -120,18 +120,18 @@ pub struct Host {
 }
 
 impl Vfs {
-    pub fn new(game_data: PathBuf, user: PathBuf) -> io::Result<Self> {
+    pub fn new(game_data: Option<PathBuf>, user: PathBuf) -> io::Result<Self> {
         raise_open_file_limit();
         let scratch = user.join("fsroot");
         fs::create_dir_all(&scratch)?;
         let mut game_index = HashMap::new();
-        index(&game_data, "", &mut game_index)?;
-        log::info!(
-            "vfs: /game -> {} ({} entries), /userdata -> {}",
-            game_data.display(),
-            game_index.len(),
-            user.display()
-        );
+        match &game_data {
+            Some(game) => {
+                index(game, "", &mut game_index)?;
+                log::info!("vfs: /game -> {} ({} entries), /userdata -> {}", game.display(), game_index.len(), user.display());
+            }
+            None => log::info!("vfs: /game streamed, /userdata -> {}", user.display()),
+        }
         let std_fd = |node| {
             Some(Arc::new(Open { node, path: String::new(), flags: 0, dir: Mutex::default(), pos: Mutex::default() }))
         };
@@ -148,12 +148,17 @@ impl Vfs {
     pub fn resolve(&self, path: &str) -> Result<Host, Errno> {
         let path = normalize(path);
         if path == "/game" || path.starts_with("/game/") {
+            let Some(game) = &self.game else {
+                // The engine's own device serves /game; the browser build had nothing here either.
+                log::warn!("vfs: {path} asked of the file system while the game streams");
+                return Err(errno::NOENT);
+            };
             let rel = path.trim_start_matches("/game").trim_start_matches('/');
             if rel.is_empty() {
-                return Ok(Host { path: self.game.clone(), read_only: true });
+                return Ok(Host { path: game.clone(), read_only: true });
             }
             let real = self.game_index.get(&rel.to_ascii_lowercase()).map_or(rel, String::as_str);
-            let real = self.game.join(real);
+            let real = game.join(real);
             let path = crate::overlay::game_file(rel, &real, &self.scratch).unwrap_or(real);
             return Ok(Host { path, read_only: true });
         }
@@ -549,7 +554,7 @@ fn normalizes() {
 fn devices() {
     let dir = std::env::temp_dir().join(format!("glue5-vfs-devices-{}", std::process::id()));
     fs::create_dir_all(dir.join("game")).unwrap();
-    let vfs = Vfs::new(dir.join("game"), dir.join("user")).unwrap();
+    let vfs = Vfs::new(Some(dir.join("game")), dir.join("user")).unwrap();
     let mut buf = [0u8; 64];
     let fd = vfs.open("/dev/urandom", 0).unwrap();
     assert_eq!(vfs.read(fd, &mut buf, None), Ok(64));

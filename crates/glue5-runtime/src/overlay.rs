@@ -8,11 +8,22 @@ type Patch = fn(String) -> Option<String>;
 
 /// The files (under the game's `data/`), whether this run changes them, and
 /// how.
-const OVERLAYS: [(&str, fn() -> bool, Patch); 3] = [
+const OVERLAYS: [(&str, fn() -> bool, Patch); 8] = [
     ("common/data/gameconfig.xml", online, crate::online::more_broadcast_data),
     ("common/data/ui/pausemenu.xml", always, autosave_first),
     ("common/data/ui/frontend.xml", always, feed_width),
+    // The pads' layouts, then the mouse's mappings.
+    ("common/data/control/standard.meta", always, radio_wheel_axes),
+    ("common/data/control/southpaw.meta", always, radio_wheel_axes),
+    ("common/data/control/trigger_swap.meta", always, radio_wheel_axes),
+    ("common/data/control/southpaw_trigger_swap.meta", always, radio_wheel_axes),
+    ("x64/data/control/fixed.meta", always, radio_wheel_axes),
 ];
+
+/// The changed files' paths under `data/`.
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    OVERLAYS.iter().map(|(name, _, _)| *name)
+}
 
 fn online() -> bool {
     crate::rt().config.online.is_some()
@@ -74,6 +85,43 @@ fn feed_width(text: String) -> Option<String> {
     block.contains(old).then(|| format!("{}{}{}", &text[..start], block.replace(old, new), &text[end..]))
 }
 
+/// The control files: the radio wheel picks with axes of its own
+/// (`INPUT_RADIO_WHEEL_LR`/`UD`), which later data maps as the weapon
+/// wheel's (the right stick, the mouse). This data maps them to nothing, so
+/// the selection never moved; and the wheel makes them exclusive while open,
+/// which disabled nothing then (the camera turned with the stick). Each
+/// weapon wheel axis' mapping gets a copy for the radio wheel's. Same length:
+/// the lines' indentation, from the end, makes room for the copies.
+fn radio_wheel_axes(text: String) -> Option<String> {
+    let mut out = text.clone();
+    for (weapon, radio) in [("WEAPON_WHEEL_LR", "RADIO_WHEEL_LR"), ("WEAPON_WHEEL_UD", "RADIO_WHEEL_UD")] {
+        let input = format!("<Input>INPUT_{weapon}</Input>");
+        let at = out.find(&input)?;
+        // The mapping, from its line's start to the end of the line closing
+        // it, after its parameters (themselves items).
+        let start = out[..out[..at].rfind("<Item>")?].rfind('\n').map_or(0, |n| n + 1);
+        let params = at + out[at..].find("</Parameters>")?;
+        let end = params + out[params..].find("</Item>")?;
+        let end = out[end..].find('\n').map_or(out.len(), |n| end + n + 1);
+        let copy = out[start..end].replace(&input, &format!("<Input>INPUT_{radio}</Input>"));
+        out.insert_str(end, &copy);
+    }
+    dedent_to(out, text.len())
+}
+
+/// `text` cut to `len` bytes from its lines' indentation, the last lines
+/// first; `None` if it has not that much.
+fn dedent_to(text: String, len: usize) -> Option<String> {
+    let mut excess = text.len().checked_sub(len)?;
+    let mut lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for line in lines.iter_mut().rev() {
+        let cut = (line.len() - line.trim_start_matches([' ', '\t']).len()).min(excess);
+        *line = &line[cut..];
+        excess -= cut;
+    }
+    (excess == 0).then(|| lines.concat())
+}
+
 #[test]
 fn feed_is_the_minimap_width() {
     let text = "<GameStream>\r\n\t<position posX=\"0.0\" sizeX=\"0.19890859375\" />\r\n\t<posloading sizeX=\"0.19890859375\" />\r\n</GameStream>\r\n";
@@ -86,4 +134,24 @@ fn autosave_goes_first() {
     let text = "<a>\r\n\t<Item> <MenuPref>PREF_STARTUP_FLOW</MenuPref> </Item>\r\n\t<Item> <MenuPref>PREF_AUTOSAVE</MenuPref> </Item>\r\n</a>\r\n";
     let want = "<a>\r\n\t<Item> <MenuPref>PREF_AUTOSAVE</MenuPref> </Item>\r\n\t<Item> <MenuPref>PREF_STARTUP_FLOW</MenuPref> </Item>\r\n</a>\r\n";
     assert_eq!(autosave_first(text.into()).as_deref(), Some(want));
+}
+
+#[test]
+fn radio_wheel_mapped_as_weapon_wheel() {
+    let item = |input: &str, axis: &str| {
+        format!(
+            "\t\t<Item>\r\n\t\t\t<Input>INPUT_{input}</Input>\r\n\t\t\t<Source>IOMS_PAD_AXIS</Source>\r\n\t\t\t<Parameters>\r\n\t\t\t\t<Item>IOM_AXIS_{axis}</Item>\r\n\t\t\t</Parameters>\r\n\t\t</Item>\r\n"
+        )
+    };
+    let (lr, ud) = (item("WEAPON_WHEEL_LR", "RX"), item("WEAPON_WHEEL_UD", "RY"));
+    let tail = "\t\t<Item>\r\n\t\t\t<Input>INPUT_JUMP</Input>\r\n\t\t</Item>\r\n".repeat(60);
+    let text = format!("<a>\r\n\t<Mappings>\r\n{lr}{ud}{tail}\t</Mappings>\r\n</a>\r\n");
+    let out = radio_wheel_axes(text.clone()).unwrap();
+    assert_eq!(out.len(), text.len());
+    let flat = |s: &str| s.split_whitespace().collect::<String>();
+    let (radio_lr, radio_ud) = (item("RADIO_WHEEL_LR", "RX"), item("RADIO_WHEEL_UD", "RY"));
+    assert_eq!(flat(&out), flat(&format!("<a><Mappings>{lr}{radio_lr}{ud}{radio_ud}{tail}</Mappings></a>")));
+    assert!(out.starts_with(&format!("<a>\r\n\t<Mappings>\r\n{lr}{radio_lr}{ud}{radio_ud}")));
+    // Without room for the copies, the file stays as it is.
+    assert_eq!(radio_wheel_axes(format!("<a>{}{}</a>", flat(&lr), flat(&ud))), None);
 }

@@ -153,6 +153,10 @@ fn run() -> Result<()> {
     if env::var("TARGET")? == "aarch64-apple-ios" {
         build.flag("-mcpu=apple-a11");
     }
+    // Apple TV: the A12 and later (the earlier ones lack the memory).
+    if env::var("TARGET")? == "aarch64-apple-tvos" {
+        build.flag("-mcpu=apple-a12");
+    }
     // Android likewise defaults to ARMv8.0, with atomics as calls that pick
     // LSE at run time. Phones that can run the game have ARMv8.2 cores
     // (Cortex-A55/A75 and later), none of them a Cortex-A53.
