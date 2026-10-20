@@ -137,6 +137,9 @@ pub(super) fn start_page(
                 if icon_button(ui, "★", "Credits", labels).clicked() {
                     *go = Some(Some(Page::Credits));
                 }
+                if icon_button(ui, "🛠", "Mods", labels).clicked() {
+                    *go = Some(Some(Page::Mods));
+                }
                 // Asked to be friends: how many, on the button.
                 let friends = match status.friend_requests {
                     0 => "Friends".to_owned(),
@@ -964,6 +967,14 @@ fn settings_items(
             setting(ui, "Friends' notifications", Control::Toggle, Some("Online, requests, invites"), |ui| {
                 toggle(ui, &mut settings.friend_notices);
             });
+            let mods = super::mods::summary(settings, status);
+            setting(ui, "Mods", Control::Action, Some(&mods), |ui| {
+                let open = action_button(ui, "Open");
+                if open.clicked() {
+                    *go = Some(Some(Page::Mods));
+                }
+                open
+            });
             let version = concat!("Glue 5 ", env!("CARGO_PKG_VERSION"), " and the projects it builds on");
             setting(ui, "Credits", Control::Action, Some(version), |ui| {
                 if action_button(ui, "View").clicked() {
@@ -1033,6 +1044,9 @@ mod tests {
             source: crate::settings::Source::Folder,
             stream: None,
             sharing: None,
+            mods: false,
+            mod_menus: false,
+            studio: None,
             servers: &[],
             searching: false,
             stream_alert: None,
@@ -1045,7 +1059,7 @@ mod tests {
         theme::install(&ctx);
         ctx.begin_pass(Default::default());
         ctx.end_pass().textures_delta.clear();
-        assert!(ctx.fonts_mut(|f| f.has_glyphs(&egui::FontId::proportional(14.0), "⚙🗁🖧🗙★♡›")));
+        assert!(ctx.fonts_mut(|f| f.has_glyphs(&egui::FontId::proportional(14.0), "⚙🗁🖧🗙★♡🛠›")));
     }
 
     #[test]

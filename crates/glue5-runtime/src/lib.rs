@@ -12,6 +12,7 @@ mod boot_screen;
 mod cloud;
 pub mod cpu;
 mod device_reset;
+mod draw_lists;
 mod dht;
 pub mod exit;
 mod files;
@@ -26,7 +27,7 @@ mod jobs;
 pub mod input;
 pub mod memory;
 mod online;
-mod overlay;
+pub mod overlay;
 mod p2p;
 pub mod prompts;
 pub mod qos;
@@ -212,6 +213,15 @@ pub(crate) struct Runtime {
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// Hooks of crates outside the runtime (glue5-mods), set after the
+/// runtime's own modules have set theirs.
+static EXTRA_HOOKS: Mutex<Vec<fn(&mut glue5_game::Hooks)>> = Mutex::new(Vec::new());
+
+/// Has `set` set its hooks when the game starts. Call before [`start`].
+pub fn add_hooks(set: fn(&mut glue5_game::Hooks)) {
+    EXTRA_HOOKS.lock().unwrap().push(set);
+}
+
 pub(crate) fn rt() -> &'static Runtime {
     RUNTIME.get().expect("runtime not started")
 }
@@ -297,6 +307,10 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     boot_screen::hooks(&mut hooks);
     stream::hooks(&mut hooks);
     prompts::hooks(&mut hooks);
+    draw_lists::hooks(&mut hooks);
+    for set in EXTRA_HOOKS.lock().unwrap().iter() {
+        set(&mut hooks);
+    }
     if let Some(online) = &rt().config.online {
         online::start(online, &mut hooks);
     }

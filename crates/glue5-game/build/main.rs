@@ -10,6 +10,7 @@ mod compile;
 mod formats;
 mod mangle;
 mod module;
+mod natives;
 mod ordering;
 mod page_map;
 
@@ -124,6 +125,10 @@ fn run() -> Result<()> {
     }
     write_if_changed(&gen_dir.join("glue.c"), &codegen::glue_c(&module, &hooks)?)?;
     fs::write(out.join("bindings.rs"), codegen::bindings_rs(&module, &hooks))?;
+    // The natives, for the crates that call them (DEP_GLUE5_GAME_NATIVES).
+    let natives = out.join("natives.tsv");
+    write_if_changed(&natives, &natives::table(&wasm)?)?;
+    println!("cargo:natives={}", natives.display());
 
     // 4. Compile.
     let wabt = tools.join("wabt-src");

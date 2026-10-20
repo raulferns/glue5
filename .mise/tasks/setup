@@ -2,9 +2,10 @@
 #MISE description="Prepare the third-party code with our patches (again only when patches/ change)"
 # wgpu, wgpu-core, wgpu-hal and sp-fidelity from crates.io in
 # third_party/<name> (ignored by git), where the workspace's [patch.crates-io]
-# takes them, and wasm2c built from third_party/wabt for the game's build
-# script. A stamp of the upstream version and the patches skips what is
-# already prepared.
+# takes them, wasm2c built from third_party/wabt for the game's build
+# script, the natives' database, Luau's sources and the Studio editor's
+# JavaScript for glue5-mods. A stamp of the
+# upstream version and the patches skips what is already prepared.
 set -euo pipefail
 
 # The crates.io releases the patches in patches/<name> apply to: name,
@@ -65,6 +66,70 @@ for crate in "${crates[@]}"; do
     rm -rf "$dest" && mv "$tmp/$name-$version" "$dest" && rm -rf "$tmp"
     echo "prepared $dest"
 done
+
+# The community's database of the natives (names of parameters, types,
+# documentation; it has no license, so it stays out of git): glue5-mods'
+# build script joins it with what game.wasm says about each native.
+nativedb_commit=424fb51b089049a9fbcebcc641500b1d44d255b4
+nativedb_sha=d13c7e8d627dfe4eab11ba1c25b3621562ceebfe68b0fb5cfc0644d47469b441
+nativedb=third_party/nativedb/natives.json
+if [ ! -f "$nativedb" ] || [ "$(sha256 "$nativedb")" != "$nativedb_sha" ]; then
+    mkdir -p "${nativedb%/*}"
+    curl -fsSL -o "$nativedb.tmp" \
+        "https://raw.githubusercontent.com/alloc8or/gta5-nativedb-data/$nativedb_commit/natives.json"
+    [ "$(sha256 "$nativedb.tmp")" = "$nativedb_sha" ] || { echo "$nativedb does not match its checksum" >&2; exit 1; }
+    mv "$nativedb.tmp" "$nativedb"
+    echo "downloaded $nativedb"
+else
+    echo "nativedb is up to date ($nativedb)"
+fi
+
+# Luau's sources, for the type checker glue5-mods builds into the game
+# (Luau.Analysis; mlua builds the rest from the same release).
+luau_version=0.740
+luau_sha=419f96e4ecf5a0dd415a2625ea7ea9dc8a407e86d64b25e00936302b25a7afbd
+if [ "$(cat third_party/luau/.glue5-stamp 2>/dev/null)" != "$luau_version $luau_sha" ]; then
+    archive=$tools/luau-$luau_version.tar.gz
+    if [ ! -f "$archive" ] || [ "$(sha256 "$archive")" != "$luau_sha" ]; then
+        curl -fsSL -o "$archive" "https://github.com/luau-lang/luau/archive/refs/tags/$luau_version.tar.gz"
+        [ "$(sha256 "$archive")" = "$luau_sha" ] || { echo "$archive does not match its checksum" >&2; exit 1; }
+    fi
+    rm -rf third_party/luau.tmp && mkdir -p third_party/luau.tmp
+    tar -xzf "$archive" -C third_party/luau.tmp
+    printf '%s' "$luau_version $luau_sha" >"third_party/luau.tmp/luau-$luau_version/.glue5-stamp"
+    rm -rf third_party/luau && mv "third_party/luau.tmp/luau-$luau_version" third_party/luau && rm -rf third_party/luau.tmp
+    echo "prepared third_party/luau"
+else
+    echo "luau is up to date (third_party/luau)"
+fi
+
+# The Studio editor's JavaScript (crates/glue5-studio/packages.txt): npm
+# packages by their pinned integrity, without node; only each package's
+# entry module is kept.
+cm=third_party/codemirror
+cm_key="$(git hash-object crates/glue5-studio/packages.txt)"
+if [ "$(cat "$cm/.glue5-stamp" 2>/dev/null)" != "$cm_key" ]; then
+    rm -rf "$cm.tmp" && mkdir -p "$cm.tmp"
+    grep -v '^#' crates/glue5-studio/packages.txt | while read -r name version integrity entry; do
+        [ -n "$name" ] || continue
+        archive=$tools/npm/${name//\//_}-$version.tgz
+        mkdir -p "$tools/npm"
+        want=${integrity#sha512-}
+        sum() { openssl dgst -sha512 -binary "$1" | openssl base64 -A; }
+        if [ ! -f "$archive" ] || [ "$(sum "$archive")" != "$want" ]; then
+            curl -fsSL -o "$archive" "https://registry.npmjs.org/$name/-/${name##*/}-$version.tgz"
+            [ "$(sum "$archive")" = "$want" ] || { echo "$archive does not match its integrity" >&2; exit 1; }
+        fi
+        mkdir -p "$cm.tmp/$name"
+        tar -xzf "$archive" -C "$cm.tmp/$name" --strip-components=1 "package/$entry" "package/LICENSE" 2>/dev/null ||
+            tar -xzf "$archive" -C "$cm.tmp/$name" --strip-components=1 "package/$entry"
+    done
+    printf '%s' "$cm_key" >"$cm.tmp/.glue5-stamp"
+    rm -rf "$cm" && mv "$cm.tmp" "$cm"
+    echo "prepared $cm"
+else
+    echo "codemirror is up to date ($cm)"
+fi
 
 # wasm2c: only the nested submodules it needs (wabt also pulls large test suites).
 wabt=third_party/wabt

@@ -151,6 +151,30 @@ uint32_t glue5_call_ptr_ptr(struct w2c_env* env, uint64_t index, uint64_t arg, u
   GLUE5_TRY(*out = ((u64(*)(void*, u64))f->func)(env->instance, arg));
 }
 
+/* Calls table function `index` as a script command's handler,
+ * `void f(rage::scrThread::Info&)`. A trap inside returns its code, with
+ * the wasm stack pointer put back: the frames it skipped never popped
+ * theirs. */
+uint32_t glue5_call_native(struct w2c_env* env, uint64_t index, uint64_t info) {
+  wasm_rt_funcref_table_t* table = w2c_game_0x5F_indirect_function_table(env->instance);
+  if (index >= table->size || !table->data[index].func) {
+    return WASM_RT_TRAP_CALL_INDIRECT;
+  }
+  const wasm_rt_funcref_t* f = &table->data[index];
+  u64 sp = env->instance->w2c_0x5F_stack_pointer;
+  void* longjmp_target = env->longjmp_target;
+  wasm_rt_jmp_buf saved = g_wasm_rt_jmp_buf;
+  wasm_rt_trap_t trap = wasm_rt_impl_try();
+  if (trap == WASM_RT_TRAP_NONE) {
+    ((void (*)(void*, u64))f->func)(env->instance, info);
+  } else {
+    env->instance->w2c_0x5F_stack_pointer = sp;
+    env->longjmp_target = longjmp_target;
+  }
+  g_wasm_rt_jmp_buf = saved;
+  return (uint32_t)trap;
+}
+
 /* Emscripten's longjmp: back to the innermost invoke_* frame. */
 _Noreturn void glue5_longjmp(struct w2c_env* env) {
   if (!env->longjmp_target) {

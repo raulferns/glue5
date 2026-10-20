@@ -46,8 +46,10 @@ android_libs() {
         rustc --release -p glue5 --lib --crate-type cdylib
     rm -rf "$out/jniLibs" "$out/res"
     mkdir -p "$out/jniLibs/$abi" "$out/res/drawable-nodpi"
-    # sdl3-sys puts libSDL3.so next to the crate's library.
+    # sdl3-sys puts libSDL3.so next to the crate's library; Luau (the mods'
+    # language) is C++, built against the NDK's shared libc++.
     ln -f "target/$target/release/libglue5.so" "target/$target/release/libSDL3.so" "$out/jniLibs/$abi/"
+    cp "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/"$target"/libc++_shared.so "$out/jniLibs/$abi/"
     cp platform/shared/Glue5.icon/Assets/01-background.png "$out/res/drawable-nodpi/glue5_background.png"
     cp platform/shared/Glue5.icon/Assets/02-five.png "$out/res/drawable-nodpi/glue5_five.png"
 }

@@ -6,7 +6,7 @@
 # by git) under [env].
 
 [tools]
-rust = { version = "stable", targets = "aarch64-apple-ios,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-linux-android" }
+rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-linux-android" }
 cmake = "4.4.4"
 xcodegen = { version = "2.46.0", os = ["macos"] }
 "cargo:cargo-packager" = { version = "0.11.8", os = ["macos", "linux"] }

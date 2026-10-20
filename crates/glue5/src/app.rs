@@ -177,6 +177,7 @@ pub fn run() -> Result<()> {
         source: Source::Folder,
         stream_for: None,
         sharing: None,
+        studio: None,
         servers: Arc::default(),
         stream_waiting: None,
         last_failure: None,
@@ -328,6 +329,9 @@ struct App {
     stream_for: Option<(String, bool)>,
     /// This computer sharing its game folder (desktop).
     sharing: Option<crate::sharing::Sharing>,
+    /// GLUE 5 Studio, served while the game runs with mods and the setting
+    /// is on, and what the mods page shows of it.
+    studio: Option<(glue5_mods::studio::Studio, ui::StudioInfo)>,
     /// Servers found on the network by the last search, and whether one runs.
     servers: Arc<Mutex<(bool, Vec<ui::FoundServer>)>>,
     /// Engine reads have waited for the server since then.
@@ -457,6 +461,11 @@ impl App {
                 self.ui.toggle_settings();
                 return false;
             }
+            // Its neighbour while mods have menus: those menus.
+            if !self.ui.is_open() && self.ui.menus_hit(x, y, &self.window) {
+                self.ui.toggle_mod_menus();
+                return false;
+            }
             // A notification tapped: the friends, at its tab.
             if self.ui.toast_hit(x, y, &self.window) {
                 self.ui.open_toast();
@@ -477,6 +486,14 @@ impl App {
         }
         if let Event::KeyDown { scancode: Some(Scancode::F1), repeat: false, .. } = event {
             self.ui.toggle_settings();
+            return false;
+        }
+        // F7: the mods' menus (with mods running).
+        if let Event::KeyDown { scancode: Some(Scancode::F7), repeat: false, .. } = event
+            && glue5_mods::installed()
+            && !self.ui.wants_text()
+        {
+            self.ui.toggle_mod_menus();
             return false;
         }
         // Home, as it opened Social Club's overlay: the friends.
@@ -513,6 +530,7 @@ impl App {
     /// it asks for. True to quit.
     fn update(&mut self, page_before: Option<Page>) -> Result<bool> {
         self.keep_sources();
+        self.update_studio();
         let in_game = self.game.is_some();
         // Touch controls: a virtual pad in slot 0 unless a controller has it.
         let show = in_game
@@ -639,6 +657,9 @@ impl App {
                 source: self.settings.source,
                 stream: stream.as_ref().map(|(server, status)| (*server, status)),
                 sharing: self.sharing.as_ref().map(crate::sharing::Sharing::state),
+                mods: glue5_mods::installed(),
+                mod_menus: glue5_mods::has_menus(),
+                studio: self.studio.as_ref().map(|(_, info)| info),
                 servers: &servers.1,
                 searching: servers.0,
                 stream_alert,
@@ -718,6 +739,10 @@ impl App {
             if self.settings.friend_notices {
                 self.ui.notify(&notice);
             }
+        }
+        // What mods notify (`ui.notify`).
+        for (module, text) in glue5_mods::take_notices() {
+            self.ui.notify_mod(&module, &text);
         }
         // The name friends see follows the player's.
         if self.friend_name != self.settings.online_name {
@@ -858,6 +883,9 @@ impl App {
         log::info!("game: {}, user data: {}", game_dir.display(), self.user_dir.display());
         let s = &self.settings;
         let back_buffer = settings::render_size(self.window.size_in_pixels(), s.render_scale(), s.low_memory);
+        if s.mods {
+            glue5_mods::install(&self.user_dir.join("mods"));
+        }
         let game = glue5_runtime::start(
             glue5_runtime::Config {
                 game_dir: game_dir.clone(),
@@ -885,7 +913,8 @@ impl App {
                 None
             }
         };
-        let started = Started { game_dir, source: self.source, max_fps: s.max_fps, low_memory: s.low_memory };
+        let started =
+            Started { game_dir, source: self.source, max_fps: s.max_fps, low_memory: s.low_memory, mods: s.mods };
         self.game = Some(Running { game, input: None, started, back_buffer, _audio: audio });
         self.ui.game_started();
         Ok(())
@@ -917,6 +946,11 @@ impl App {
     /// start page, which offers the way out of a graphics setting the engine
     /// cannot run with; on desktop it opens again on that page.
     fn stopped(&mut self, why: &str) {
+        let why = match glue5_mods::note_failure() {
+            Some(note) => format!("{why} {note}"),
+            None => why.to_string(),
+        };
+        let why = why.as_str();
         if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {
             log::warn!("cannot record the failure: {e}");
         }
@@ -1073,6 +1107,44 @@ impl App {
                 self.ui.repaint_in(Duration::from_millis(500));
             }
         }
+    }
+
+    /// GLUE 5 Studio follows its settings: served while the game runs
+    /// with mods and the setting is on, for this device or the network.
+    /// The mods folder opens when mods are on (before the game too: the
+    /// Mods page lists them, the Studio edits them); the Studio serves
+    /// while it is on.
+    fn update_studio(&mut self) {
+        if self.settings.mods && glue5_mods::dir().is_none() {
+            glue5_mods::open(&self.user_dir.join("mods"));
+        }
+        let wanted = (self.settings.mods && glue5_mods::dir().is_some() && self.settings.studio).then_some(self.settings.studio_lan);
+        if self.studio.as_ref().map(|(s, _)| s.lan()) == wanted {
+            return;
+        }
+        self.studio = None;
+        if let Some(lan) = wanted {
+            // The usual port, else any (another app has it).
+            let started = glue5_mods::studio::Studio::start(glue5_mods::studio::PORT, lan)
+                .or_else(|_| glue5_mods::studio::Studio::start(0, lan));
+            match started {
+                Ok(studio) => {
+                    let host = if lan {
+                        glue5_stream::lan_addresses().first().map_or("127.0.0.1".into(), |ip| ip.to_string())
+                    } else {
+                        "127.0.0.1".into()
+                    };
+                    let info = ui::StudioInfo {
+                        url: studio.url(&host),
+                        code: studio.pairing_code(),
+                        lan,
+                    };
+                    self.studio = Some((studio, info));
+                }
+                Err(e) => log::warn!("studio: {e}"),
+            }
+        }
+        self.ui.repaint();
     }
 
     /// (Re)starts the stream from `server` (none: stops it), its copy where

@@ -58,6 +58,7 @@ typedef uint32_t (*glue5_notify_fn)(void* memory, uint64_t addr, uint32_t count)
 /* Implemented in glue5.c. */
 void glue5_set_atomics(glue5_wait32_fn wait32, glue5_wait64_fn wait64, glue5_notify_fn notify);
 uint32_t glue5_call_ptr_ptr(struct w2c_env* env, uint64_t index, uint64_t arg, uint64_t* out);
+uint32_t glue5_call_native(struct w2c_env* env, uint64_t index, uint64_t info);
 void glue5_init(void);
 void glue5_memory_init(wasm_rt_shared_memory_t* memory,
                        uint8_t* data,

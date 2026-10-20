@@ -24,6 +24,7 @@ use crate::settings::{PerfOverlay, Settings};
 mod chip;
 mod credits;
 mod friends;
+mod mods;
 mod pages;
 mod perf;
 mod servers;
@@ -31,6 +32,8 @@ mod theme;
 mod widgets;
 use credits::credits_page;
 use friends::{FriendsPage, friends_page};
+use mods::{ModsPage, mods_page};
+pub use mods::StudioInfo;
 use pages::{settings_page, start_page};
 use servers::{ServersPage, servers_page};
 
@@ -49,6 +52,8 @@ pub enum Page {
     /// Where the game's files stream from: the server in use, the ones on
     /// the network, one by its address, this device's copy.
     Servers,
+    /// The mods, GLUE 5 Studio, the mods' log.
+    Mods,
 }
 
 /// How the game starts.
@@ -146,6 +151,7 @@ pub struct Started {
     pub source: crate::settings::Source,
     pub max_fps: u32,
     pub low_memory: bool,
+    pub mods: bool,
 }
 
 /// What the pages show about the application.
@@ -189,6 +195,12 @@ pub struct Status<'a> {
     pub stream: Option<(&'a str, &'a glue5_stream::Status)>,
     /// This computer sharing its game folder (desktop).
     pub sharing: Option<crate::sharing::State>,
+    /// The game runs with mods.
+    pub mods: bool,
+    /// A mod has a menu (a button for them beside the settings button).
+    pub mod_menus: bool,
+    /// GLUE 5 Studio, serving.
+    pub studio: Option<&'a StudioInfo>,
     /// Servers found on the network, and whether a search runs.
     pub servers: &'a [FoundServer],
     pub searching: bool,
@@ -232,6 +244,7 @@ pub struct Ui {
     behind: Option<Page>,
     friends: FriendsPage,
     servers: ServersPage,
+    mods: ModsPage,
     /// The last submission drew something (an empty one clears it).
     drawn: bool,
     note: Option<String>,
@@ -243,6 +256,8 @@ pub struct Ui {
     online_open: bool,
     /// The settings button as last drawn (centre, radius), in points.
     gear: Option<(Pos2, f32)>,
+    /// The mods' menus button, likewise.
+    menus_button: Option<(Pos2, f32)>,
     /// When egui wants to draw again (before the game, frames are drawn
     /// only for input or for this).
     repaint_at: Option<Instant>,
@@ -267,6 +282,8 @@ pub struct Ui {
 /// friends' tab it opens; until when it shows.
 struct Toast {
     toast: friends::Toast,
+    /// A mod's: tapped, it opens the mods' menus (else the friends).
+    from_mod: bool,
     since: Instant,
     until: Instant,
 }
@@ -299,6 +316,7 @@ impl Ui {
             behind: Some(Page::Start),
             friends: FriendsPage::default(),
             servers: ServersPage::default(),
+            mods: ModsPage::default(),
             drawn: false,
             note: None,
             scale_edit: None,
@@ -311,6 +329,7 @@ impl Ui {
             toast_area: None,
             controls: Vec::new(),
             chip: Default::default(),
+            menus_button: None,
             text_rect: None,
             gear_icon,
         }
@@ -340,8 +359,30 @@ impl Ui {
         // Each leaves its time after the one before it: they go one at a time.
         let after = self.toasts.back().map_or(now, |t| t.until.max(now));
         let toast = friends::toast(notice);
-        self.toasts.push_back(Toast { toast, since: now, until: after + TOAST_FOR });
+        self.toasts.push_back(Toast { toast, from_mod: false, since: now, until: after + TOAST_FOR });
         self.repaint();
+    }
+
+    /// A mod's notification (`ui.notify`).
+    pub fn notify_mod(&mut self, module: &str, text: &str) {
+        let now = Instant::now();
+        while self.toasts.len() >= TOASTS {
+            self.toasts.pop_front();
+        }
+        let after = self.toasts.back().map_or(now, |t| t.until.max(now));
+        let toast = friends::Toast { title: "Mod", name: module.to_owned(), text: text.to_owned(), tab: Default::default() };
+        self.toasts.push_back(Toast { toast, from_mod: true, since: now, until: after + TOAST_FOR });
+        self.repaint();
+    }
+
+    /// The mods' menus (F7); again, back.
+    pub fn toggle_mod_menus(&mut self) {
+        if self.page == Some(Page::Mods) {
+            self.back();
+        } else {
+            self.mods.show_menus();
+            self.show(Some(Page::Mods));
+        }
     }
 
     /// The friends (the Home key, Back + RB); again, back.
@@ -355,11 +396,17 @@ impl Ui {
 
     /// The friends at the tab of the newest notification (one was tapped).
     pub fn open_toast(&mut self) {
+        let from_mod = self.toasts.back().is_some_and(|t| t.from_mod);
         if let Some(t) = self.toasts.back() {
             self.friends.tab = t.toast.tab;
         }
         self.toasts.clear();
-        self.show(Some(Page::Friends));
+        if from_mod {
+            self.mods.show_menus();
+            self.show(Some(Page::Mods));
+        } else {
+            self.show(Some(Page::Friends));
+        }
     }
 
     /// Whether a finger at `x`, `y` (0..1, as SDL gives them) is on a
@@ -389,13 +436,13 @@ impl Ui {
                 self.repaint();
             }
             Some(Page::Settings) => self.show(self.home),
-            Some(Page::Credits | Page::Friends | Page::Servers) => self.show(self.behind),
+            Some(Page::Credits | Page::Friends | Page::Servers | Page::Mods) => self.show(self.behind),
             _ => {}
         }
     }
 
     fn show(&mut self, page: Option<Page>) {
-        if matches!(page, Some(Page::Credits | Page::Friends | Page::Servers)) && self.page != page {
+        if matches!(page, Some(Page::Credits | Page::Friends | Page::Servers | Page::Mods)) && self.page != page {
             self.behind = self.page;
             if page == Some(Page::Servers) {
                 self.servers.opened();
@@ -456,6 +503,12 @@ impl Ui {
     pub fn gear_hit(&self, x: f32, y: f32, window: &Window) -> bool {
         let size = screen_size(window);
         self.gear.is_some_and(|(c, r)| c.distance(pos2(x * size.x, y * size.y)) <= r * 1.4)
+    }
+
+    /// Whether a finger at `x`, `y` (0..1) is on the mods' menus button.
+    pub fn menus_hit(&self, x: f32, y: f32, window: &Window) -> bool {
+        let size = screen_size(window);
+        self.menus_button.is_some_and(|(c, r)| c.distance(pos2(x * size.x, y * size.y)) <= r * 1.4)
     }
 
     /// Whether a finger at `x`, `y` (0..1) is on the stream's sign.
@@ -615,6 +668,7 @@ impl Ui {
             }
             self.events.clear();
             self.gear = None;
+            self.menus_button = None;
             self.chip = Default::default();
             return actions;
         }
@@ -649,12 +703,13 @@ impl Ui {
         }
         let scale = crate::touch::control_scale(screen.size(), settings.touch_size);
         self.gear = gear.map(|alpha| draw_gear(&ctx, safe, scale, alpha, self.gear_icon.as_ref()));
+        self.menus_button = gear.filter(|_| status.mod_menus).map(|alpha| draw_menus_button(&ctx, safe, scale, alpha));
         let overlay = hud.then(|| self.perf.draw(&ctx, safe, settings, status));
         // The notifications and the stream's sign keep off everything else
         // drawn over the game.
         self.controls = touch.map_or_else(Vec::new, Touch::occupied);
         let mut taken = self.controls.clone();
-        taken.extend(self.gear.map(|(c, r)| Rect::from_center_size(c, Vec2::splat(2.0 * r))));
+        taken.extend(self.gear.into_iter().chain(self.menus_button).map(|(c, r)| Rect::from_center_size(c, Vec2::splat(2.0 * r))));
         taken.extend(overlay);
         // Under the settings button when it shows.
         // Under the top's buttons (the touch controls' camera view and
@@ -687,6 +742,7 @@ impl Ui {
                 back = friends_page(&ctx, &mut self.friends, game, &mut actions);
             }
             Some(Page::Servers) => back = servers_page(&ctx, &mut self.servers, settings, status, &mut actions),
+            Some(Page::Mods) => back = mods_page(&ctx, &mut self.mods, settings, status),
             None => {}
         }
         let mut output = ctx.end_pass();
@@ -846,6 +902,22 @@ fn draw_gear(ctx: &egui::Context, safe: Rect, scale: f32, alpha: f32, icon: Opti
         None => {
             painter.text(c, Align2::CENTER_CENTER, "⚙", FontId::proportional(r * 0.95), look.icon);
         }
+    }
+    (c, r)
+}
+
+/// The mods' menus button, the settings button's right neighbour: sliders.
+fn draw_menus_button(ctx: &egui::Context, safe: Rect, scale: f32, alpha: f32) -> (Pos2, f32) {
+    let c = gear_center(safe, scale) + vec2(54.0 * scale, 0.0);
+    let r = GEAR_RADIUS * scale;
+    let look = crate::touch::Look::new(alpha, scale, glue5_runtime::input::Character::Other);
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("gear")));
+    painter.circle(c, r, look.fill(false), look.stroke(false));
+    let stroke = egui::Stroke::new(r * 0.1, look.icon);
+    for (dy, knob) in [(-0.24, 0.18), (0.24, -0.2)] {
+        let y = c.y + dy * r;
+        painter.line_segment([pos2(c.x - 0.48 * r, y), pos2(c.x + 0.48 * r, y)], stroke);
+        painter.circle_filled(pos2(c.x + knob * r, y), r * 0.15, look.icon);
     }
     (c, r)
 }

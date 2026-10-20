@@ -10,7 +10,8 @@
 // This file is included by the build script.
 //
 // The hooks are grouped by the runtime module that implements them
-// (`crates/glue5-runtime/src/<group>.rs`, whose `hooks()` sets them).
+// (`crates/glue5-runtime/src/<group>.rs`, whose `hooks()` sets them; the
+// `mods` group is glue5-mods').
 
 pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/input.rs"),
@@ -41,4 +42,6 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/boot_screen.rs"),
     include!("hooks/stream.rs"),
     include!("hooks/prompts.rs"),
+    include!("hooks/draw_lists.rs"),
+    include!("hooks/mods.rs"),
 ];

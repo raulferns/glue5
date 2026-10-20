@@ -199,6 +199,11 @@ pub(super) fn action_button(ui: &mut Ui, text: &str) -> Response {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| button(ui, text)).inner
 }
 
+/// The same button where the layout puts it (in a card's text, not a row's end).
+pub(super) fn inline_button(ui: &mut Ui, text: &str) -> Response {
+    button(ui, text)
+}
+
 /// Buttons side by side at the end of a row, in the order of `texts`:
 /// their responses in that order. (`action_button` twice would draw the
 /// second over the first.)

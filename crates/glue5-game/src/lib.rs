@@ -166,6 +166,14 @@ pub unsafe fn call_ptr_ptr(env: *mut Env, index: u64, arg: u64) -> Result<u64, T
     Trap::check(unsafe { glue5_call_ptr_ptr(env, index, arg, &mut out) }).map(|()| out)
 }
 
+/// Calls table function `index` as a script command's handler
+/// (`void (*)(rage::scrThread::Info&)`) with the `Info` at wasm address
+/// `info`. A trap inside the command comes back as an error, with the wasm
+/// stack pointer restored; what the command left half done stays so.
+pub unsafe fn call_native(env: *mut Env, index: u64, info: u64) -> Result<(), Trap> {
+    Trap::check(unsafe { glue5_call_native(env, index, info) })
+}
+
 /// Frees `env`'s instance.
 pub unsafe fn free_instance(env: *mut Env) {
     unsafe { glue5_instance_free(env) }
@@ -179,6 +187,7 @@ unsafe extern "C" {
         notify: unsafe extern "C" fn(*mut Memory, u64, u32) -> u32,
     );
     fn glue5_call_ptr_ptr(env: *mut Env, index: u64, arg: u64, out: *mut u64) -> u32;
+    fn glue5_call_native(env: *mut Env, index: u64, info: u64) -> u32;
     fn glue5_memory_struct_size() -> usize;
     fn glue5_memory_init(memory: *mut Memory, data: *mut u8, pages: u64, max_pages: u64);
     fn glue5_instance_new(env: *mut Env) -> u32;

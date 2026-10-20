@@ -70,6 +70,12 @@ pub struct Settings {
     pub online_name: String,
     /// Friends' notifications show (Social Club's "Hide Notifications").
     pub friend_notices: bool,
+    /// The mods in the user directory's `mods` folder can run (glue5-mods).
+    pub mods: bool,
+    /// With mods, the game serves GLUE 5 Studio.
+    pub studio: bool,
+    /// Other devices on the network may open the Studio (with its code).
+    pub studio_lan: bool,
     /// Settings saved before the render scale: the back buffer's height.
     #[serde(skip_serializing)]
     render_height: Option<u32>,
@@ -224,6 +230,10 @@ impl Default for Settings {
             online: false,
             online_name: String::new(),
             friend_notices: true,
+            mods: false,
+            studio: true,
+            // A phone's own browser is no place to write mods.
+            studio_lan: crate::paths::MOBILE,
             render_height: None,
             metalfx: None,
             metal_hud: None,

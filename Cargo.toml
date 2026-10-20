@@ -3,7 +3,8 @@ resolver = "3"
 members = ["crates/*"]
 # third_party/wgpu, wgpu-core, wgpu-hal and sp-fidelity are prepared by
 # `mise run setup`; this workspace needs them before it can load.
-exclude = ["third_party"]
+# glue5-studio is its own workspace (wasm only, built by glue5-mods).
+exclude = ["third_party", "crates/glue5-studio"]
 default-members = ["crates/glue5"]
 
 [workspace.package]
@@ -19,6 +20,7 @@ glue5-runtime = { path = "crates/glue5-runtime" }
 glue5-gpu = { path = "crates/glue5-gpu" }
 glue5 = { path = "crates/glue5" }
 glue5-stream = { path = "crates/glue5-stream" }
+glue5-mods = { path = "crates/glue5-mods" }
 
 anyhow = "1"
 log = "0.4"

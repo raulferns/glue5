@@ -712,6 +712,215 @@ prompts, aim assist and menu behaviour:
   input methods: outside the box their accent menu (a held key on macOS),
   dead keys and IME windows would get in the way of play.
 
+## Mods
+
+Mods are Luau scripts (`crates/glue5-mods`) that call the game's script
+commands (natives). Each mod is a folder in the user directory's `mods`
+with a `main.luau` and an optional `mod.json` (`{"autostart": true}`).
+
+The Mods page holds them: the start page's Mods button, Settings › Game ›
+Mods, F7 in the game, and on touch screens a button beside the settings
+button while a mod has a menu. Its switch turns mods on; the folder opens
+at once (the page lists the mods, the Studio edits them before the game),
+and they run with the game started next, which installs their hooks
+(`open` and `install` in glue5-mods).
+
+**Luau** is a typed Lua (gradual and `--!strict`), embedded with `mlua`. It
+was chosen because:
+
+- its interpreter is the fastest of the typed options without a JIT,
+  which iOS forbids. A call from Luau into Rust costs about 40 ns, against
+  about 76 ns for QuickJS;
+- it has a 3-component `vector` type, which matches the game's `Vector3`;
+- it has a sandbox, memory limits, and an interrupt that can suspend a
+  running script.
+
+**The natives come from the game module.** glue5-game's build script reads
+every `rage::scrThread::RegisterCommand(hash, handler, name, file,
+signature)` call in game.wasm: 8,561 natives with their name, group, hash
+and handler (a function table index). The hashes are this build's own, so
+everything is keyed by name. Where the handler calls a typed
+`<group>_commands::Command<Name>(...)`, the C++ parameter types come from
+its demangled name; vectors returned through a pointer show in its wasm
+signature.
+
+glue5-mods' build script joins that table with the community's natives
+database (`third_party/nativedb`, downloaded by `mise run setup`, pinned,
+not in git because it has no license). The database adds:
+
+- parameter names;
+- documentation;
+- handle types (`Ped`, `Vehicle`, ...);
+- which pointers are outputs.
+
+The binary keeps the final say on calling conventions. For example, the
+database's `x, y, z` floats become one `vector` where the C++ command takes
+an `rage::scrVector`.
+
+The build generates two things:
+
+- a compact table sorted by namespace and name;
+- `natives.d.luau`, the Luau definitions, named the Luau way:
+  `vehicle.createVehicle(model, coords, ...)`, with handle types.
+
+Output parameters come back as extra return values, and a handle of 0 comes
+back as `nil`.
+
+**Each mod runs in a script thread of its own**, as the game's scripts do.
+Its program is built in wasm memory: a copy of a loaded `scrProgram` with
+its own name, id and code (`ENTER; loop: PUSH_0; NATIVE WAIT; J loop`),
+registered with `scrProgramRegistry::Insert`. The thread is started with
+`CTheScripts::GtaStartNewThreadWithProgramId`.
+
+The engine calls WAIT every frame for every waiting thread, and a hook on
+`rage::scrThread::Wait` resumes the mod's Luau coroutine when the mod's
+thread is about to wait. Luau's `wait(ms)` becomes WAIT's argument. This
+gives every native a real script context, the same as a vanilla script's
+natives:
+
+- the active thread is the mod's;
+- entities the mod creates belong to its handler;
+- `scrThread::KillThread` cleans them up when the mod stops.
+
+Starting and stopping happen in the same hook, from whichever thread waits
+next, so all of it stays on the engine's script update. A mod's code starts
+once the player is in the game: no loading screen, screen faded in, player
+playing.
+
+**A mod must not take the game down.**
+
+- Errors stay in the mod's VM: the mod stops with the message and its
+  traceback.
+- Arguments are checked before the native runs. For an entity handle the
+  check is what `fwScriptGuid::GetBaseFromGuid` does, without its
+  `unreachable` for an index past the pool: a stale or made-up handle is an
+  error in the mod, not a trap.
+- Every native is called through `glue5_call_native`, which catches a trap
+  (`GLUE5_TRY`) and restores the wasm stack pointer. The trap becomes an
+  error in the mod, and the runtime is marked as possibly damaged.
+- A mod runs at most 2 ms before the interrupt suspends it until the next
+  frame. One that runs 2 s without calling `wait` is stopped.
+
+### Menus, tasks, the world, data
+
+- **Menus**: `ui.menu(title)` with toggles, sliders, choices, buttons and
+  labels. The application draws them with its own widgets (touch and
+  controllers too): the Mods page's MENUS (see above for how it opens).
+  - What the player does reaches the mod at its next turn: the item's
+    `value` changes and its callback runs as a task.
+  - `ui.notify` shows a notification over the game.
+  - A mod with a menu stays running after its main code returns.
+- **Tasks**: a mod's coroutines are scheduled by game time
+  (`GET_GAME_TIMER`, so they stop while the game is paused):
+  - the main chunk;
+  - `task.spawn` and `task.delay`;
+  - menu callbacks.
+
+  The mod's script thread waits as long as the earliest of them, or one
+  frame while it has menus. The `task` table is the TASK_ natives' one too.
+- **World**: `world.vehicles()`, `peds()`, `objects()` walk the engine's
+  pools and give script handles (`fwScriptGuid::CreateGuid`), while the
+  handles' pool keeps room.
+- **Names from the installed game**: the engine keeps the strings it
+  hashed (`atHashStringNamespaceSupport`). Once the game has loaded, the
+  catalog is read:
+  - vehicle and ped models from the archetype store;
+  - weapons from `CWeaponInfoManager`.
+
+  It becomes `world.d.luau`, string unions (`VehicleModel`, `PedModel`,
+  `WeaponName`), saved for the next start. Natives take them where a
+  parameter is a vehicle's or ped's model or a weapon, so a misspelt name
+  is a type error ("did you mean ...?"). The names come from the assets
+  the game loaded, whatever their version; none is in the build.
+- **Data**: `json.encode`/`json.decode` (json.rs: arrays are tables with
+  keys 1..n or none, null is nil, functions and cycles are errors) and
+  `storage` (storage.rs): a mod's values by key, JSON, 1 MB, written
+  within two seconds and when it stops, in the mods folder's
+  `.glue5/storage/<mod>.json`, so a mod handed on carries no player's
+  data. Luau's `buffer` is there too; files and the network are not
+  (HTTP, with sites a mod declares and the player approves, is planned).
+- **Stability**:
+  - an entity of the wrong kind (`CEntity` +40: 3 vehicle, 4 ped, 5
+    object) is an error before the native runs;
+  - natives that create entities are refused when the pool is nearly
+    full;
+  - a frame draws skeletons within fixed budgets (400 matrix sets in the
+    command buffer, 512 dependencies in the draw list manager); past them
+    the engine stopped (some 114 peds in view). Peds and vehicles that
+    would not fit are now skipped for that frame through the engine's own
+    `CEntityDrawHandler::ShouldSkipEntity` (runtime `draw_lists.rs`), for
+    the game's crowds as well as mods';
+  - mods' script threads get stacks of their own (gameconfig.xml's MICRO
+    stacks, 20 → 52);
+  - when the game stops working, the failure names the mod and the native
+    that ran, and that mod does not start by itself next time.
+
+### GLUE 5 Studio
+
+The app serves an IDE for mods while mods are on and the Mods page's
+STUDIO switch says so, before the game too. By default only a browser on the same device can
+use it; "Other devices" opens it to the network (the default on phones,
+whose own browser is no place to write mods).
+
+- **Server** (`glue5-mods/src/studio`): plain `std::net`, a thread per
+  connection; HTTP/1.1 for the page, WebSockets (`tungstenite`, no async)
+  for the Studio and the type checker.
+- **Pairing code**: 8 characters of Crockford base32 (40 bits), new each
+  time the Studio starts. The page carries it in its address (the QR code
+  of the Mods page), or asks for it. Every route but the page needs it.
+  After 10 wrong ones in a minute no code is taken for that minute.
+  WebSockets must come from the page's own origin, since a page elsewhere
+  in the same browser could otherwise drive the game through localhost.
+- **Type checker in the game**: Luau.Analysis is compiled from Luau's
+  sources (`third_party/luau`, the release mlua builds the rest from) with
+  a small C API (`csrc/checker.cpp`). It loads the natives' definitions in
+  about 80 ms; checking a file takes under a millisecond. It exists only
+  while an editor is connected (some 30 MB, which the log reports) and
+  speaks LSP over a WebSocket (`/lsp`): diagnostics, completions, hovers
+  and signature help (the call's parameters, the current one marked).
+  Completions are filtered by what
+  is typed before they are sent, so lists stay short on phones. Types are
+  printed in full and the host writes the catalog's unions as their
+  names (`VehicleModel`...), so a signature stays one line. On an iPhone
+  16 Pro it loads in 1.5 s and takes 76 MiB. A mod's `mod.json` is
+  checked by the host (JSON, an object, `autostart` true or false).
+- **The page** (`crates/glue5-studio`) is Leptos compiled to wasm, around
+  CodeMirror 6 with `@codemirror/lsp-client`. No node: the crate is its
+  own workspace, built for `wasm32-unknown-unknown` by glue5-mods' build
+  script (a cargo of its own, `wasm-bindgen` as a library). CodeMirror's
+  modules come from npm by `mise run setup` (pinned by their integrity
+  hashes) and load through an import map, without a bundler. Everything
+  is embedded in the app, gzipped; ETags make the browser revalidate.
+- **MCP** (`POST /mcp`, JSON-RPC without streams) gives coding agents the
+  same functions as the Studio:
+  - write a file and get its type errors back;
+  - start or restart a mod and get its first log lines back;
+  - read logs;
+  - evaluate Luau in the game;
+  - search the natives;
+  - use a mod's menus (`menus`, `menu_input`) as a player would.
+
+  `claude mcp add --transport http glue5 http://<address>:47110/mcp
+  --header "Authorization: Bearer <code>"`; the Studio's welcome page
+  shows it.
+- **Eval** runs in a mod of its own (`~eval`): a script thread whose Luau
+  takes snippets from a queue. The console's input is a one-line
+  CodeMirror with the same language server (a document of its own,
+  `~console/input.luau`): highlighting and completions as in a file.
+- Files written by any client reach open editors (a WebSocket message),
+  changing only what differs (the cursor stays); a tab with unsaved
+  changes keeps them and says so. Saving can restart the mod.
+- When the game starts again its code changes: the page asks for the new
+  one and keeps its editor, tabs and history; nothing retries the old
+  code meanwhile (the server takes no code for a minute after ten wrong
+  ones).
+- Luau's indentation in the editor: a line leaving blocks or brackets
+  open adds a level, however many (`f(x, function()` ... `end)`), and
+  if-expressions open none.
+- The mods' menus show in the Studio too (the MENUS panel, a screen of
+  their own on phones): the same items the game draws, sent again when
+  they change; what is done there reaches the mod as from the game.
+
 ## Known limits
 
 - The renderer handles missing mobile GPU features as follows:

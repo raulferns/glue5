@@ -18,8 +18,9 @@ settings:
     DEVELOPMENT_TEAM: ${GLUE5_TEAM}
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_ENTITLEMENTS: Glue5.entitlements
-    # The library built by cargo.
-    OTHER_LDFLAGS: $(PROJECT_DIR)/../../target/aarch64-apple-ios/release/libglue5.a -liconv
+    # The library built by cargo, and what it needs from the system (libc++
+    # for Luau, the mods' language).
+    OTHER_LDFLAGS: $(PROJECT_DIR)/../../target/aarch64-apple-ios/release/libglue5.a -liconv -lc++
 targets:
   Glue5:
     type: application
@@ -74,7 +75,7 @@ targets:
         GCSupportsControllerUserInteraction: true
         # GTA Online: players on the same network find each other there; the
         # game's files stream from a computer sharing them, found by Bonjour.
-        NSLocalNetworkUsageDescription: Glue 5 finds GTA Online players and computers sharing the game on your network.
+        NSLocalNetworkUsageDescription: Glue 5 finds GTA Online players and computers sharing the game on your network, and lets browsers there open GLUE 5 Studio.
         NSBonjourServices: [_glue5._tcp]
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

@@ -13,7 +13,7 @@
     <!-- GTA Online: players on the same network find each other there; the
          game's files stream from (or are shared with) other devices, found by Bonjour. -->
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Glue 5 finds GTA Online players and devices sharing the game on your network.</string>
+    <string>Glue 5 finds GTA Online players and devices sharing the game on your network, and lets browsers there open GLUE 5 Studio.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_glue5._tcp</string>

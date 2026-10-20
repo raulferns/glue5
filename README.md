@@ -50,6 +50,8 @@ See [design.md](docs/design.md) for architecture, tradeoffs and known limits.
 | `crates/glue5-runtime` | Host runtime: Emscripten/WASI imports, threads, VFS, input, audio output, the GPU command ring (and a null backend). |
 | `crates/glue5-gpu` | The renderer: executes the engine's D3D11-style command ring with wgpu (Metal on Apple platforms, Vulkan elsewhere). |
 | `crates/glue5-stream` | The game's files over the network: `glue5-serve` (a game folder to other devices), the client and its local copy, Bonjour discovery. |
+| `crates/glue5-mods` | Mods: Luau scripts in the game's own script threads, calling its natives; the natives' table and Luau definitions are generated from game.wasm and the natives database. |
+| `crates/glue5-studio` | GLUE 5 Studio, the mods' web IDE the game serves: Leptos (wasm) around CodeMirror, built by glue5-mods. |
 | `crates/glue5` | The application (SDL3), the same on every platform: window, input, audio, settings and touch controls (egui overlay). Its `headless` example runs the game without a window. |
 | `platform/ios` | What iOS needs around it: `main.c`, entitlements, the xcodegen spec. |
 | `platform/tvos` | The same for the Apple TV (so far run in the simulator only). |

@@ -9,7 +9,7 @@ type Patch = fn(String) -> Option<String>;
 /// The files (under the game's `data/`), whether this run changes them, and
 /// how.
 const OVERLAYS: [(&str, fn() -> bool, Patch); 8] = [
-    ("common/data/gameconfig.xml", online, crate::online::more_broadcast_data),
+    ("common/data/gameconfig.xml", game_config_changed, game_config),
     ("common/data/ui/pausemenu.xml", always, autosave_first),
     ("common/data/ui/frontend.xml", always, feed_width),
     // The pads' layouts, then the mouse's mappings.
@@ -27,6 +27,42 @@ pub(crate) fn names() -> impl Iterator<Item = &'static str> {
 
 fn online() -> bool {
     crate::rt().config.online.is_some()
+}
+
+/// Script stacks added to the MICRO ones (20), for mods' script threads.
+static MORE_SCRIPT_STACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Has gameconfig.xml offer `n` more of the smallest script stacks (0..=79),
+/// for threads of the host's (glue5-mods). Before the game starts.
+pub fn more_script_stacks(n: u32) {
+    MORE_SCRIPT_STACKS.store(n.min(79), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn game_config_changed() -> bool {
+    online() || MORE_SCRIPT_STACKS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// gameconfig.xml: GTA Online's broadcast data; more MICRO script stacks.
+fn game_config(text: String) -> Option<String> {
+    let text = if online() { crate::online::more_broadcast_data(text)? } else { text };
+    match MORE_SCRIPT_STACKS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Some(text),
+        n => micro_stacks(text, 20 + n),
+    }
+}
+
+/// The MICRO stacks' count, two digits for two (the same length).
+fn micro_stacks(text: String, count: u32) -> Option<String> {
+    const COUNT: &str = "<NumberOfStacksOfThisSize value=\"20\"/>";
+    let at = text.find("<StackName>MICRO</StackName>")?;
+    let field = at + text[at..].find(COUNT)?;
+    // Within MICRO's item.
+    if text[at..field].contains("</Item>") || !(20..=99).contains(&count) {
+        return None;
+    }
+    let mut text = text;
+    text.replace_range(field..field + COUNT.len(), &format!("<NumberOfStacksOfThisSize value=\"{count}\"/>"));
+    Some(text)
 }
 
 fn always() -> bool {
