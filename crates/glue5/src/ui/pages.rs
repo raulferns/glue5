@@ -421,6 +421,9 @@ fn info(
     go: &mut Option<Option<Page>>,
 ) {
     card(ui, |ui| game_files(ui, settings, status, go));
+    if settings.mods {
+        card(ui, |ui| super::mods::home_card(ui, settings, status, go));
+    }
     if let Some(sharing) = &status.sharing {
         card(ui, |ui| sharing_card(ui, sharing));
     }

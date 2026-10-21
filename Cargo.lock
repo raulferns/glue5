@@ -1036,6 +1036,7 @@ dependencies = [
  "sha2",
  "snow",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]

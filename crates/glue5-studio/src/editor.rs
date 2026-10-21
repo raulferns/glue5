@@ -2,6 +2,14 @@
 
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen(module = "/js/files.js")]
+extern "C" {
+    /// Asks for a .zip and sends it to the game's `/import` (`url`, with the
+    /// token): the imported mod's name, or null.
+    #[wasm_bindgen(js_name = importMod)]
+    pub fn import_mod(url: &str) -> js_sys::Promise;
+}
+
 #[wasm_bindgen(module = "/js/editor.js")]
 extern "C" {
     pub type StudioEditor;

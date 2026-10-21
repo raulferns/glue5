@@ -135,6 +135,17 @@ impl Storage {
     }
 }
 
+impl Storage {
+    /// Empties it, on disk too.
+    pub fn clear_now(&self) {
+        self.data.borrow_mut().clear();
+        self.sizes.borrow_mut().clear();
+        self.total.set(0);
+        self.dirty.set(true);
+        self.flush(true);
+    }
+}
+
 /// A key and its value's size as JSON text.
 fn size(key: &str, value: &Json) -> usize {
     key.len() + serde_json::to_string(value).map_or(0, |t| t.len()) + 4

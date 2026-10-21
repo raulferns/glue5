@@ -261,7 +261,11 @@ fn in_lobby_for(kind: crate::friends::SessionKind) {
         // Its key, the way in: 128 bits from the system (as long a name as
         // friends take).
         let mut key = [0u8; 16];
-        getrandom::fill(&mut key).expect("the system's random numbers");
+        if let Err(e) = getrandom::fill(&mut key) {
+            // (In a hook: no panic. The lobby stays as it is.)
+            log::error!("online: no random numbers for a private lobby: {e}");
+            return;
+        }
         p2p.switch_lobby(&key.iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
 }
@@ -422,8 +426,8 @@ pub(crate) unsafe extern "C" fn photo_to_jpeg(
 /// Hook for `CNetworkSession::CanEnterMultiplayer()`: with `-lan` the
 /// engine counts the ROS credentials as valid and then waits for Rockstar's
 /// cloud tunables, which never come. The other conditions stand: the network
-/// memory free (the store's data, see `populate_store_data`; no story save
-/// queued) and the session idle. Then the lobby's players are waited for
+/// memory free (the store's data, see `populate_store_data`; no save
+/// queued, which the engine asks only of story saves) and the session idle. Then the lobby's players are waited for
 /// (`P2p::may_enter`).
 pub(crate) unsafe extern "C" fn can_enter_multiplayer(env: *mut Env, session: u64) -> u32 {
     const STATE: u64 = 99916;
@@ -526,9 +530,10 @@ pub(crate) fn more_broadcast_data(text: String) -> Option<String> {
 /// service = 3, u8 local index }.
 pub(crate) unsafe extern "C" fn gamer_handle(env: *mut Env, handle: u64) -> u32 {
     let m = unsafe { Mem::of(env) };
+    // All 16 bytes, as the engine's: invites send them whole to friends.
+    m.bytes_mut(handle, 16).fill(0);
     m.set_u64(handle, gamer_id());
     m.set_u8(handle + 8, 3);
-    m.set_u8(handle + 9, 0);
     1
 }
 

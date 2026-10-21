@@ -62,7 +62,7 @@ android_logger = { version = "0.15", default-features = false }
 # The Taptic Engine, for the touch controls' haptics (UIKit and CoreHaptics
 # are linked already).
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSProcessInfo", "NSString", "NSURL", "NSValue"] }
 objc2-core-haptics = { version = "0.3", default-features = false, features = [
     "std",
     "CHHapticDeviceCapability",

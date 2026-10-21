@@ -51,7 +51,27 @@ pub fn notify<T>(word: &T, count: u32) -> u32 {
     result.unparked_threads as u32
 }
 
-fn park(key: usize, validate: impl FnOnce() -> bool, timeout: Option<Duration>) -> Wait {
+fn park(key: usize, validate: impl Fn() -> bool, timeout: Option<Duration>) -> Wait {
+    // Windows waits in whole milliseconds (WaitOnAddress rounds up, then
+    // the timer's tick): the engine's 20 µs pauses (`sysIpcYield`, as the
+    // main thread waits for its jobs, many times a frame) took 1-2 ms
+    // each. Those few yield to other threads instead, until the deadline
+    // or a change (a notify that changes nothing just ends them later).
+    #[cfg(windows)]
+    if let Some(t) = timeout.filter(|t| *t < Duration::from_micros(100)) {
+        // (The value first, as wasm's wait: a changed word is not-equal
+        // even with no time to wait.)
+        let deadline = Instant::now() + t;
+        loop {
+            if !validate() {
+                return Wait::NotEqual;
+            }
+            if Instant::now() >= deadline {
+                return Wait::TimedOut;
+            }
+            std::thread::yield_now();
+        }
+    }
     let deadline = timeout.map(|t| Instant::now() + t);
     match unsafe { parking_lot_core::park(key, validate, || {}, |_, _| {}, DEFAULT_PARK_TOKEN, deadline) } {
         ParkResult::Unparked(_) => Wait::Woken,

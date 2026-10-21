@@ -21,6 +21,8 @@ snow = { version = "0.10", default-features = false, features = ["use-chacha20po
 getrandom = "0.4"
 # The system's time zone, the same way on every platform.
 jiff = "0.2"
+# The engine's inflate, natively (clib.rs).
+zlib-rs = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

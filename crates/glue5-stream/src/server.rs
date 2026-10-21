@@ -162,6 +162,11 @@ impl Server {
                             continue;
                         }
                     };
+                    // Two threads each: a few dozen at most (a device's
+                    // stream and its Servers page take one or two).
+                    if clients.lock().unwrap().len() >= MAX_CLIENTS {
+                        continue;
+                    }
                     if let Ok(clone) = stream.try_clone() {
                         clients.lock().unwrap().insert(id, clone);
                     }
@@ -234,6 +239,13 @@ enum Source {
     File(u32),
     Blob(usize),
 }
+
+/// Requests one connection may have waiting: far more than a client asks
+/// (its boot set is about 9,000), far less than what would run the server
+/// out of memory.
+const MAX_QUEUED: usize = 1 << 18;
+/// Connections served at once.
+const MAX_CLIENTS: usize = 64;
 
 #[derive(Default)]
 struct Queue {
@@ -329,10 +341,18 @@ fn serve(shared: Arc<Shared>, stream: TcpStream) {
                 asking = true;
                 log::info!("serve: {peer} connected");
             }
-            let queue_job = |job: Job| {
+            let queue_job = |job: Job| -> io::Result<()> {
                 let mut q = conn.queue.lock().unwrap();
+                // Asked twice: answered once.
+                if q.jobs.contains_key(&h.req) {
+                    return Ok(());
+                }
+                if q.jobs.len() >= MAX_QUEUED {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "too many requests"));
+                }
                 q.push(h.req, job);
                 conn.ready.notify_one();
+                Ok(())
             };
             let prio = h.prio.min(LEVELS as u8 - 1);
             match h.kind {
@@ -340,7 +360,7 @@ fn serve(shared: Arc<Shared>, stream: TcpStream) {
                     reads += 1;
                     asked += h.len as u64;
                     let Some(entry) = shared.catalog.entries.get(h.file as usize).filter(|_| h.len <= MAX_READ) else {
-                        queue_job(Job { prio, source: Source::File(0), next: 0, end: 0, status: UNKNOWN });
+                        queue_job(Job { prio, source: Source::File(0), next: 0, end: 0, status: UNKNOWN })?;
                         continue;
                     };
                     let want = h.off.saturating_add(h.len as u64);
@@ -352,7 +372,7 @@ fn serve(shared: Arc<Shared>, stream: TcpStream) {
                     {
                         sys::advise(f, start, end - start);
                     }
-                    queue_job(Job { prio, source: Source::File(h.file), next: start, end, status });
+                    queue_job(Job { prio, source: Source::File(h.file), next: start, end, status })?;
                 }
                 BLOB => {
                     let name = payload(&mut reader, h.len, MAX_MESSAGE)?;
@@ -360,15 +380,17 @@ fn serve(shared: Arc<Shared>, stream: TcpStream) {
                     match shared.blobs.iter().position(|(n, _)| *n == name) {
                         Some(i) => {
                             let end = shared.blobs[i].1.len();
-                            queue_job(Job { prio, source: Source::Blob(i), next: 0, end, status: DONE })
+                            queue_job(Job { prio, source: Source::Blob(i), next: 0, end, status: DONE })?
                         }
-                        None => queue_job(Job { prio, source: Source::Blob(0), next: 0, end: 0, status: UNKNOWN }),
+                        None => queue_job(Job { prio, source: Source::Blob(0), next: 0, end: 0, status: UNKNOWN })?,
                     }
                 }
                 PRIORITY => {
                     let mut q = conn.queue.lock().unwrap();
+                    // Only a raise (all a client sends): a job moves to
+                    // another level a few times at most.
                     if let Some(job) = q.jobs.get_mut(&h.req)
-                        && job.prio != prio
+                        && prio < job.prio
                     {
                         job.prio = prio;
                         q.levels[prio as usize].push_back(h.req);
@@ -401,7 +423,9 @@ fn serve(shared: Arc<Shared>, stream: TcpStream) {
 }
 
 fn send(shared: &Shared, conn: &Conn, mut w: TcpStream) {
-    let mut buf = vec![0u8; HEADER + CHUNK as usize];
+    // A chunk with its header, and the request's end when it is the last
+    // (one write, one segment for both).
+    let mut buf = vec![0u8; HEADER + CHUNK as usize + HEADER];
     loop {
         let chunk = {
             let mut q = conn.queue.lock().unwrap();
@@ -439,6 +463,8 @@ fn send(shared: &Shared, conn: &Conn, mut w: TcpStream) {
                 }
             }
         }
+        // The data (with its header in front), then the end header after it.
+        let (start, mut len) = if n > 0 { (0, HEADER + n) } else { (HEADER, HEADER) };
         if n > 0 {
             if let Some(rate) = &shared.rate {
                 Bucket::take(rate, n as u64);
@@ -450,17 +476,20 @@ fn send(shared: &Shared, conn: &Conn, mut w: TcpStream) {
             let crc = crc(&buf[HEADER..HEADER + n]);
             let header = Header { kind: DATA, req: chunk.req, off: chunk.off, len: n as u32, file, prio: 0, crc };
             buf[..HEADER].copy_from_slice(&header.encode());
-            sys::wait_writable(&w);
-            if io::Write::write_all(&mut w, &buf[..HEADER + n]).is_err() {
-                return;
-            }
-            shared.sent.fetch_add(n as u64, Ordering::Relaxed);
         }
         if let Some(status) = status {
             let end = Header { kind: END, req: chunk.req, off: chunk.off + n as u64, len: status, ..Default::default() };
-            if io::Write::write_all(&mut w, &end.encode()).is_err() {
+            buf[len..len + HEADER].copy_from_slice(&end.encode());
+            len += HEADER;
+        }
+        if len > start {
+            if n > 0 {
+                sys::wait_writable(&w);
+            }
+            if io::Write::write_all(&mut w, &buf[start..len]).is_err() {
                 return;
             }
+            shared.sent.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 }

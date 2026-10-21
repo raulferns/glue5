@@ -203,7 +203,8 @@ impl MetalFx {
                         fx.setMotionVectorScaleX(1.0);
                         fx.setMotionVectorScaleY(1.0);
                         fx.setDepthReversed(scene.camera.reversed);
-                        fx.setReset(scene.reset);
+                        // A scaler just made has no history yet either.
+                        fx.setReset(scene.reset || s.frames == 0);
                         fx.encodeToCommandBuffer(commands);
                     }
                     Effect::Interpolator(_) => return false,
@@ -247,6 +248,9 @@ impl MetalFx {
         };
         let mtl = self.device.clone()?;
         let made = self.slots[Kind::Interpolator as usize].get(&mtl, device, key, false, commands)?;
+        // A new interpolator starts without history, as after a cut (until
+        // a frame of it is encoded).
+        let fresh = made.frames == 0;
         let Effect::Interpolator(fx) = &made.fx else { return None };
         let (depth, motion) = (raw(&scene.depth)?, raw(&scene.motion)?);
         let output = &made.targets[0];
@@ -271,7 +275,7 @@ impl MetalFx {
                 fx.setJitterOffsetX(0.0);
                 fx.setJitterOffsetY(0.0);
                 fx.setDepthReversed(camera.reversed);
-                fx.setShouldResetHistory(scene.reset);
+                fx.setShouldResetHistory(scene.reset || fresh);
                 fx.encodeToCommandBuffer(raw_commands);
                 true
             })
@@ -280,7 +284,9 @@ impl MetalFx {
             return None;
         }
         commands.push(encoder.finish());
-        Some(output.view.clone())
+        let view = output.view.clone();
+        made.frames = 1;
+        Some(view)
     }
 }
 

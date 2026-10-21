@@ -8,6 +8,7 @@ mod chrome;
 mod editor;
 mod icons;
 mod menus;
+mod modpage;
 mod net;
 mod panel;
 mod sidebar;
@@ -42,6 +43,7 @@ fn App() -> impl IntoView {
         connected: RwSignal::new(false),
         hello: RwSignal::new(Value::Null),
         mods: RwSignal::new(Vec::new()),
+        listed: RwSignal::new(false),
         menus: RwSignal::new(Vec::new()),
         rows: RwSignal::new(Vec::new()),
         tabs: RwSignal::new(Vec::new()),
@@ -53,12 +55,12 @@ fn App() -> impl IntoView {
         drawer: RwSignal::new(false),
         diags: RwSignal::new(HashMap::new()),
         cursor: RwSignal::new((1, 1)),
-        restart_on_save: RwSignal::new(storage().and_then(|s| s.get_item("glue5-restart").ok().flatten()).as_deref() != Some("0")),
         filter: RwSignal::new(Filter::All),
         query: RwSignal::new(String::new()),
         found: RwSignal::new(Vec::new()),
         palette: RwSignal::new(false),
         notice: RwSignal::new(None),
+        pair_failed: RwSignal::new(false),
     };
     // The code: from the address (the game's QR code), else remembered.
     let page = web_sys::window().map(|w| w.location());
@@ -76,16 +78,21 @@ fn App() -> impl IntoView {
         }
     }
     connect(s);
+    // A notice shows 5 s from when it came (an older one's timer does not
+    // take a newer one).
+    let shown_at = StoredValue::new(0u32);
     Effect::new(move |_| {
-        let on = s.restart_on_save.get();
-        if let Some(st) = storage() {
-            let _ = st.set_item("glue5-restart", if on { "1" } else { "0" });
-        }
-    });
-    Effect::new(move |_| {
-        if let Some(n) = s.notice.get() {
-            let _ = n;
-            set_timeout(move || s.notice.set(None), std::time::Duration::from_secs(5));
+        if s.notice.get().is_some() {
+            let mine = shown_at.get_value().wrapping_add(1);
+            shown_at.set_value(mine);
+            set_timeout(
+                move || {
+                    if shown_at.get_value() == mine {
+                        s.notice.set(None);
+                    }
+                },
+                std::time::Duration::from_secs(5),
+            );
         }
     });
 
@@ -116,6 +123,9 @@ fn Pair(s: S) -> impl IntoView {
             <div class="pair-card">
                 <div class="brand big"><img src="/logo.png" alt=""/><b>"GLUE 5"</b><span>"STUDIO"</span></div>
                 <p>"Enter the code shown in the game, under Mods › Studio."</p>
+                <Show when=move || s.pair_failed.get()>
+                    <p class="pair-error">"That code did not work: check it in the game (it changes when someone presses New)."</p>
+                </Show>
                 <input class="code-input" placeholder="ABCD-1234" autocomplete="off" autocapitalize="characters" spellcheck="false"
                     prop:value=move || code.get()
                     on:input=move |ev| code.set(event_target_value(&ev))
@@ -142,6 +152,10 @@ fn Shell(s: S) -> impl IntoView {
         }
         let editor = StudioEditor::new(&el, &lsp);
         let on_change = Closure::<dyn FnMut(String, bool)>::new(move |path: String, dirty: bool| {
+            // Only when it changes: not the whole tab strip at each key.
+            if s.tabs.with_untracked(|t| t.iter().any(|t| t.path == path && t.dirty == dirty)) {
+                return;
+            }
             s.tabs.update(|t| {
                 if let Some(t) = t.iter_mut().find(|t| t.path == path) {
                     t.dirty = dirty;
@@ -187,21 +201,23 @@ fn Shell(s: S) -> impl IntoView {
                         Side::Natives => view! { <NativesView s=s/> }.into_any(),
                     }}
                 </aside>
-                <section class="work">
+                <section class=move || if s.tabs.with(|t| t.is_empty()) { "work empty" } else { "work" }>
                     <Tabs s=s/>
                     <Toolbar s=s/>
-                    <div class="code">
+                    <div class=move || if s.active.get().is_some_and(|p| mod_page(&p).is_some()) { "code page" } else { "code" }>
                         <div class="editor-host" node_ref=host_ref></div>
                         <Show when=move || s.tabs.with(|t| t.is_empty())>
                             <Welcome s=s/>
                         </Show>
+                        // A mod's page, over the editor.
+                        {move || s.active.get().and_then(|p| mod_page(&p).map(str::to_string)).map(|name| view! { <modpage::ModPage s=s name=name/> })}
                     </div>
                     <BottomPanel s=s/>
                 </section>
             </div>
             <StatusBar s=s/>
             <PhoneNav s=s/>
-            {move || s.notice.get().map(|n| view! { <div class="toast">{n}</div> })}
+            {move || s.notice.get().map(|n| view! { <div class="toast" title="Close" on:click=move |_| s.notice.set(None)>{n}</div> })}
         </div>
     }
 }

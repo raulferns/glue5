@@ -3,6 +3,7 @@
 use leptos::prelude::*;
 use serde_json::{Value, json};
 
+use crate::actions::insert_code;
 use crate::icons;
 use crate::net::request;
 use crate::state::*;
@@ -19,8 +20,13 @@ pub(crate) fn TitleBar(s: S) -> impl IntoView {
             s.found.set(Vec::new());
             return;
         }
+        let asked = q.clone();
         request("natives.search", json!({ "query": q, "limit": 12 }), move |r| {
-            if let Ok(Value::Array(list)) = r {
+            // Only for the query still typed (one shortened or cleared since
+            // would show what it no longer asks for).
+            if let Ok(Value::Array(list)) = r
+                && s.query.get_untracked() == asked
+            {
                 s.found.set(list);
             }
         });
@@ -36,8 +42,7 @@ pub(crate) fn TitleBar(s: S) -> impl IntoView {
     let insert = move |n: &Value| {
         let call = format!("{}(", n["name"].as_str().unwrap_or(""));
         close();
-        with_editor(|e| e.insert(&call));
-        s.screen.set(Screen::Editor);
+        insert_code(s, &call);
     };
     // Ctrl/Cmd+K from anywhere.
     let shortcut = window_event_listener(leptos::ev::keydown, move |ev| {
@@ -143,8 +148,18 @@ pub(crate) fn StatusBar(s: S) -> impl IntoView {
                 <span class="it errn">"A native failed: restart the game soon"</span>
             </Show>
             <span class="grow"></span>
-            <span class="it">{move || { let (l, c) = s.cursor.get(); format!("Ln {l}, Col {c}") }}</span>
-            <span class="it hide-t">"Luau"</span>
+            // The editor's, while it shows a file.
+            {move || s.active.get().filter(|p| mod_page(p).is_none()).map(|p| {
+                let language = match p.rsplit_once('.').map(|(_, e)| e) {
+                    Some("luau") => "Luau",
+                    Some("json") => "JSON",
+                    _ => "Plain Text",
+                };
+                view! {
+                    <span class="it">{move || { let (l, c) = s.cursor.get(); format!("Ln {l}, Col {c}") }}</span>
+                    <span class="it hide-t">{language}</span>
+                }
+            })}
             <span class="it">{move || {
                 let mods = s.mods.get();
                 let running: Vec<_> = mods.iter().filter(|m| m.state == "running").collect();

@@ -32,7 +32,7 @@ pub fn start(subsystem: &sdl3::AudioSubsystem, out: AudioOut) -> Result<Audio> {
     // with SDL's default (about 1024 frames) light scenes such as the pause
     // menu wait in bursts: frames alternate between 4 and 30 ms.
     sdl3::hint::set("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "256");
-    let pull = Pull { out, buf: Vec::new(), frames: 0, mixed: 0, calls: 0, peak: 0.0, last_log: Instant::now() };
+    let pull = Pull { out, buf: Vec::new(), frames: 0, calls: 0, peak: 0.0, last_log: Instant::now() };
     let stream = subsystem.open_playback_stream(&spec, pull).map_err(|e| anyhow!("SDL audio: {e}"))?;
     stream.resume().map_err(|e| anyhow!("SDL audio: {e}"))?;
     log::info!("audio: {SAMPLE_RATE} Hz stereo ({})", subsystem.current_audio_driver());
@@ -44,7 +44,6 @@ struct Pull {
     out: AudioOut,
     buf: Vec<f32>,
     frames: u64,
-    mixed: u64,
     calls: u64,
     peak: f32,
     last_log: Instant,
@@ -54,7 +53,8 @@ impl AudioCallback<f32> for Pull {
     fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
         let samples = (requested.max(0) as usize).next_multiple_of(CHANNELS);
         self.buf.resize(samples, 0.0);
-        self.mixed += self.out.read(&mut self.buf) as u64;
+        // (Reads short of sound are counted for the stats.)
+        self.out.read(&mut self.buf);
         self.frames += (samples / CHANNELS) as u64;
         self.calls += 1;
         let _ = stream.put_data_f32(&self.buf);
@@ -64,10 +64,9 @@ impl AudioCallback<f32> for Pull {
             if self.last_log.elapsed() >= Duration::from_secs(10) {
                 self.last_log = Instant::now();
                 log::debug!(
-                    "audio: {} frames played ({} per request), {} silent (underrun or no mixer yet), peak {:.3}",
+                    "audio: {} frames played ({} per request), peak {:.3}",
                     self.frames,
                     self.frames / self.calls.max(1),
-                    self.frames - self.mixed,
                     std::mem::take(&mut self.peak)
                 );
             }

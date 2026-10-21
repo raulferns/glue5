@@ -230,8 +230,9 @@ impl Mem {
     }
 }
 
-/// The process's memory footprint (what iOS limits) and, on iOS and tvOS, how much
-/// more it may take before the system terminates it, in bytes.
+/// The process's memory footprint (what iOS limits; the resident set on
+/// Android and Linux) and, on iOS and tvOS, how much more it may take before
+/// the system terminates it, in bytes.
 pub fn footprint() -> (Option<u64>, Option<u64>) {
     #[cfg(target_vendor = "apple")]
     let used = unsafe {
@@ -243,7 +244,12 @@ pub fn footprint() -> (Option<u64>, Option<u64>) {
         let ok = proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut info as *mut _ as *mut libc::c_void) == 0;
         ok.then_some(info.ri_phys_footprint)
     };
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    let used = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| {
+        let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
+    });
+    #[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
     let used = None;
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
     let available = {
@@ -333,8 +339,22 @@ fn asking<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Hook for libc++'s `operator_new_impl` (its nothrow `operator new`, which
+/// std::stable_sort takes its buffers from: a cutscene's load events, the
+/// HUD's markers, past 128 of them): rage's `operator delete` frees them,
+/// into the thread's rage heap, which owns no dlmalloc block (it stops the
+/// game, or takes the block as its own). Rage's `operator new` makes them,
+/// as zlib's default allocator does.
+pub(crate) unsafe extern "C" fn nothrow_new(env: *mut Env, size: u64) -> u64 {
+    match u32::try_from(size.max(1)) {
+        Ok(size) => unsafe { orig::zcalloc(env, 0, 1, size) },
+        Err(_) => 0,
+    }
+}
+
 /// This module's hooks.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
+    hooks.nothrow_new = Some(nothrow_new);
     hooks.grow_heap = Some(grow_heap);
     hooks.memory_available = Some(memory_available);
     hooks.largest_block = Some(largest_block);

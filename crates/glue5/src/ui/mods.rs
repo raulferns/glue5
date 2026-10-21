@@ -7,7 +7,7 @@ use egui::{Color32, CornerRadius, RichText, Sense, vec2};
 use glue5_mods::ModState;
 
 use super::pages::{card_title, sheet, small};
-use super::widgets::{Control, action_button, choice, inline_button, segmented, setting, slider, toggle};
+use super::widgets::{Control, action_button, action_buttons, choice, inline_button, segmented, setting, slider, toggle};
 use super::{Status, WARN, theme};
 use crate::settings::Settings;
 
@@ -70,6 +70,56 @@ pub(super) fn summary(settings: &Settings, status: &Status) -> String {
         parts.push("Studio on".into());
     }
     parts.join(" · ")
+}
+
+/// The start page's card while mods are on: what there is, and the way
+/// into the Studio.
+pub(super) fn home_card(ui: &mut egui::Ui, settings: &Settings, status: &Status, go: &mut Option<Option<super::Page>>) {
+    let state = match status.started.as_ref() {
+        Some(s) if !s.mods => ("Next start", WARN),
+        _ => ("On", super::pages::READY),
+    };
+    card_title(ui, "MODS", Some(state));
+    let mods = glue5_mods::mods();
+    let running = mods.iter().filter(|m| m.state == ModState::Running).count();
+    let mut line = match mods.len() {
+        0 => "No mods yet".to_owned(),
+        1 => "1 mod".to_owned(),
+        n => format!("{n} mods"),
+    };
+    if running > 0 {
+        line.push_str(&format!(" · {running} running"));
+    }
+    match &status.studio {
+        Some(info) => {
+            line.push_str(if info.lan { " · Studio on this network" } else { " · Studio on this device" });
+            small(ui, &line, theme::MUTED);
+            let address = info.url.split('?').next().unwrap_or(&info.url).trim_end_matches('/').to_owned();
+            ui.label(RichText::new(format!("{address}  ·  code {}", info.code)).monospace().color(Color32::WHITE));
+            let [open, copy, page] = <[_; 3]>::try_from(
+                ui.horizontal(|ui| action_buttons(ui, &["Open Studio", "Copy address", "Mods"])).inner,
+            )
+            .unwrap();
+            if open.on_hover_text("In this device's browser").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&info.url));
+            }
+            if copy.clicked() {
+                ui.ctx().copy_text(info.url.clone());
+            }
+            if page.clicked() {
+                *go = Some(Some(super::Page::Mods));
+            }
+        }
+        None => {
+            if !settings.studio {
+                line.push_str(" · Studio off");
+            }
+            small(ui, &line, theme::MUTED);
+            if ui.horizontal(|ui| action_button(ui, "Mods")).inner.clicked() {
+                *go = Some(Some(super::Page::Mods));
+            }
+        }
+    }
 }
 
 /// True when closed.
@@ -212,9 +262,9 @@ fn mods_tab(ui: &mut egui::Ui, page: &mut ModsPage, status: &Status) {
     // Before the game: which start with it.
     if !status.mods {
         for m in &mods {
-            let mut on = m.autostart;
+            let mut on = m.info.autostart;
             let note = if on { "Starts with the game" } else { "Not started with the game" };
-            setting(ui, &m.name, Control::Toggle, Some(note), |ui| {
+            setting(ui, &m.info.title, Control::Toggle, Some(note), |ui| {
                 if toggle(ui, &mut on).changed()
                     && let Err(e) = glue5_mods::set_autostart(&m.name, on)
                 {
@@ -229,14 +279,14 @@ fn mods_tab(ui: &mut egui::Ui, page: &mut ModsPage, status: &Status) {
             ModState::Running if m.waiting => "Waiting".to_owned(),
             ModState::Running => format!("Running · {:.1} ms per frame", m.cpu_ms),
             ModState::Error => format!("Error · {}", m.error.as_deref().unwrap_or("")),
-            ModState::Stopped if m.autostart => "Stopped · starts with the game".to_owned(),
+            ModState::Stopped if m.info.autostart => "Stopped · starts with the game".to_owned(),
             ModState::Stopped => "Stopped".to_owned(),
         };
         let dot = match m.state {
             ModState::Running => "• ",
             _ => "",
         };
-        setting(ui, &format!("{dot}{}", m.name), Control::Action, Some(&subtitle), |ui| {
+        setting(ui, &format!("{dot}{}", m.info.title), Control::Action, Some(&subtitle), |ui| {
             let running = m.state == ModState::Running;
             if action_button(ui, if running { "Stop" } else { "Start" }).clicked() {
                 if running {
@@ -276,13 +326,21 @@ fn studio_tab(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
             // The address as typed; copied with the code in it.
             let address = info.url.split('?').next().unwrap_or(&info.url).trim_end_matches('/');
             let open = if info.lan { "Open it in a browser on this network" } else { "Open it in a browser on this device" };
-            setting(ui, address, Control::Action, Some(open), |ui| {
-                if action_button(ui, "Copy").clicked() {
+            setting(ui, address, Control::Actions, Some(open), |ui| {
+                let [go, copy] = <[_; 2]>::try_from(action_buttons(ui, &["Open", "Copy"])).unwrap();
+                if go.on_hover_text("In this device's browser").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(&info.url));
+                }
+                if copy.clicked() {
                     ui.ctx().copy_text(info.url.clone());
                 }
             });
-            setting(ui, &info.code, Control::Action, Some("Pairing code: the page asks for it once"), |ui| {
-                if action_button(ui, "Copy").clicked() {
+            setting(ui, &info.code, Control::Actions, Some("Pairing code: the page asks for it once"), |ui| {
+                let [new, copy] = <[_; 2]>::try_from(action_buttons(ui, &["New", "Copy"])).unwrap();
+                if new.on_hover_text("A new code: browsers paired with this one must pair again").clicked() {
+                    settings.studio_code.clear();
+                }
+                if copy.clicked() {
                     ui.ctx().copy_text(info.code.clone());
                 }
             });
@@ -293,7 +351,7 @@ fn studio_tab(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
         None if settings.studio => small(ui, "Starting…", theme::MUTED),
         None => {}
     }
-    muted(ui, "Whoever has the code can run code in the game; it changes each time the Studio starts.");
+    muted(ui, "Whoever has the code can run code in the game: make a new one if someone should no longer have it.");
 }
 
 /// The address as a QR code, in a row like the settings': a tablet's or a
@@ -323,12 +381,14 @@ fn qr_row(ui: &mut egui::Ui, url: &str) {
 
 fn log_tab(ui: &mut egui::Ui) {
     let scale = theme::density(ui);
-    let (lines, _) = glue5_mods::logs(0);
+    // The last lines only (a copy of the whole log each frame held the lock
+    // the mods' update takes).
+    let lines = glue5_mods::recent_logs(80);
     if lines.is_empty() {
         muted(ui, "Nothing yet.");
     }
     panel(ui, |ui| {
-        for l in lines.iter().rev().take(80).rev() {
+        for l in &lines {
             let color = if l.level == glue5_mods::LogLevel::Error { ERR } else { Color32::from_gray(213) };
             ui.label(RichText::new(format!("{} · {}", l.module, l.text)).monospace().size(12.0 * scale).color(color));
         }
@@ -337,9 +397,17 @@ fn log_tab(ui: &mut egui::Ui) {
 
 /// `text` as a QR code, dark on white.
 fn qr(ui: &mut egui::Ui, text: &str, size: f32) {
-    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else { return };
-    let modules = code.width();
-    let colors = code.to_colors();
+    // Encoded once per address (the page is drawn every frame).
+    thread_local! {
+        static CODE: std::cell::RefCell<Option<(String, usize, Vec<qrcode::Color>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let code = CODE.with_borrow_mut(|cached| {
+        if cached.as_ref().is_none_or(|(t, ..)| t != text) {
+            *cached = qrcode::QrCode::new(text.as_bytes()).ok().map(|c| (text.to_string(), c.width(), c.to_colors()));
+        }
+        cached.as_ref().map(|(_, modules, colors)| (*modules, colors.clone()))
+    });
+    let Some((modules, colors)) = code else { return };
     let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same((10.0 * theme::density(ui)) as u8), Color32::WHITE);

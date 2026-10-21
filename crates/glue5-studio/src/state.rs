@@ -20,6 +20,13 @@ pub(crate) struct ModInfo {
     pub(crate) cpu_ms: f64,
     pub(crate) autostart: bool,
     pub(crate) files: Vec<String>,
+    /// From its mod.json.
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    #[serde(default, rename = "restartOnSave")]
+    pub(crate) restart_on_save: bool,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Debug)]
@@ -99,6 +106,8 @@ pub(crate) struct S {
     pub(crate) connected: RwSignal<bool>,
     pub(crate) hello: RwSignal<Value>,
     pub(crate) mods: RwSignal<Vec<ModInfo>>,
+    /// The game told which mods it has (until then the list is unknown, not empty).
+    pub(crate) listed: RwSignal<bool>,
     pub(crate) menus: RwSignal<Vec<MenuInfo>>,
     pub(crate) rows: RwSignal<Vec<(u64, Row)>>,
     pub(crate) tabs: RwSignal<Vec<Tab>>,
@@ -110,12 +119,13 @@ pub(crate) struct S {
     pub(crate) drawer: RwSignal<bool>,
     pub(crate) diags: RwSignal<HashMap<String, Vec<Diag>>>,
     pub(crate) cursor: RwSignal<(u32, u32)>,
-    pub(crate) restart_on_save: RwSignal<bool>,
     pub(crate) filter: RwSignal<Filter>,
     pub(crate) query: RwSignal<String>,
     pub(crate) found: RwSignal<Vec<Value>>,
     pub(crate) palette: RwSignal<bool>,
     pub(crate) notice: RwSignal<Option<String>>,
+    /// The code typed did not work.
+    pub(crate) pair_failed: RwSignal<bool>,
 }
 
 thread_local! {
@@ -125,6 +135,10 @@ thread_local! {
     pub(crate) static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     pub(crate) static EDITOR: RefCell<Option<StudioEditor>> = const { RefCell::new(None) };
     pub(crate) static NEXT_ROW: Cell<u64> = const { Cell::new(1) };
+    /// The console's "run this" callback, made once.
+    pub(crate) static REPL_RUN: RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut(String)>>> = const { RefCell::new(None) };
+    /// The page was paired with the game once (a lost connection is retried).
+    pub(crate) static PAIRED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) fn with_editor(f: impl FnOnce(&StudioEditor)) {
@@ -158,7 +172,20 @@ pub(crate) fn push_row(s: S, row: Row) {
 }
 
 pub(crate) fn mod_of(path: &str) -> &str {
-    path.split('/').next().unwrap_or("")
+    path.strip_prefix(MOD_PAGE).unwrap_or(path).split('/').next().unwrap_or("")
+}
+
+/// A tab's path for a mod's page (`mod:trainer`), not a file.
+pub(crate) const MOD_PAGE: &str = "mod:";
+
+/// The mod whose page `path` is, if it is one.
+pub(crate) fn mod_page(path: &str) -> Option<&str> {
+    path.strip_prefix(MOD_PAGE)
+}
+
+/// The files the tree shows: not mod.json (the mod's page is it).
+pub(crate) fn shown_file(path: &str) -> bool {
+    path.split_once('/').is_none_or(|(_, f)| f != "mod.json")
 }
 
 /// `trainer/main.luau:12` in a message: the file and line it points at.

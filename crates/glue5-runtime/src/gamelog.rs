@@ -77,9 +77,18 @@ fn run(rx: Receiver<Vec<u8>>, file: File, to_stdout: bool) {
     #[cfg(target_os = "android")]
     let mut stdout = to_stdout.then(Logcat::default);
     let mut repeats = Repeats::default();
+    // Written since the last flush: only then a timeout to flush on (none
+    // to wake for while the engine is quiet; a drop comes with a full queue).
+    let mut unflushed = false;
     loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
+        let next = if unflushed {
+            rx.recv_timeout(Duration::from_millis(200))
+        } else {
+            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        };
+        match next {
             Ok(bytes) => {
+                unflushed = true;
                 if let Some(why) = fatal_error(&bytes) {
                     crate::exit::fail(why);
                 }
@@ -104,6 +113,7 @@ fn run(rx: Receiver<Vec<u8>>, file: File, to_stdout: bool) {
                 if let Some(out) = &mut stdout {
                     let _ = out.flush();
                 }
+                unflushed = false;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }

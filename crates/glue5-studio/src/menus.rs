@@ -60,7 +60,11 @@ fn MenuCard(s: S, id: u32, module: String, title: String) -> impl IntoView {
     let items = move || s.menus.with(|m| m.iter().find(|m| m.id == id).map(|m| m.items.clone()).unwrap_or_default());
     view! {
         <section class="mcard">
-            <header><b>{title}</b><span>{module.clone()}</span></header>
+            // Its mod, unless the title says it already.
+            <header><b>{title.clone()}</b>{(!title.eq_ignore_ascii_case(&module)).then(|| view! { <span>{module.clone()}</span> })}</header>
+            <Show when=move || items().is_empty()>
+                <p class="mempty">"Nothing in it yet"</p>
+            </Show>
             // Keyed by what the item shows, so a change from the mod redraws it.
             <For each=items key=|i| format!("{}:{:?}:{}:{:?}", i.id, i.value, i.label, i.note) let(item)>
                 {row(s, module.clone(), item)}

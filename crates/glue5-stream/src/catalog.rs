@@ -30,6 +30,10 @@ pub struct Catalog {
     pub data_files: usize,
     /// Changes whenever a path, size or time does.
     pub hash: String,
+    /// The dates the engine is told for its files (the first `data_files`;
+    /// none: their times), see [`game_dates`]. Not in the hash: the copy's
+    /// bytes are the same whatever date the engine is told.
+    pub dates: Vec<u64>,
     lookup: HashMap<String, u32>,
 }
 
@@ -55,8 +59,13 @@ impl Catalog {
             bail!("{}/index.json is missing", game.join(&shader_dir).display());
         }
         let data_files = data.len();
+        let game = game_dates(&game.join("data"));
+        let dates = data
+            .iter()
+            .map(|e| date(&game, e.path.strip_prefix("data/").unwrap_or(&e.path), e.size).unwrap_or(e.mtime))
+            .collect();
         data.extend(shaders);
-        Ok(Catalog::new(build.to_string(), data, data_files))
+        Ok(Catalog { dates, ..Catalog::new(build.to_string(), data, data_files) })
     }
 
     pub fn new(build: String, entries: Vec<Entry>, data_files: usize) -> Catalog {
@@ -70,7 +79,7 @@ impl Catalog {
         }
         let hash = hex(&sha.finalize()[..8]);
         let lookup = entries.iter().enumerate().map(|(i, e)| (e.path.to_ascii_lowercase(), i as u32)).collect();
-        Catalog { build, entries, data_files, hash, lookup }
+        Catalog { build, entries, data_files, hash, dates: Vec::new(), lookup }
     }
 
     /// The id of the file at `path` (relative to the game folder, any case).
@@ -81,7 +90,7 @@ impl Catalog {
     pub fn to_json(&self) -> Vec<u8> {
         let files: Vec<_> = self.entries.iter().map(|e| (&e.path, e.size, e.mtime)).collect();
         serde_json::to_vec(&serde_json::json!({
-            "build": self.build, "data_files": self.data_files, "files": files,
+            "build": self.build, "data_files": self.data_files, "files": files, "dates": self.dates,
         }))
         .expect("catalog json")
     }
@@ -103,7 +112,13 @@ impl Catalog {
         if data_files > entries.len() {
             bail!("catalog: {data_files} data files of {}", entries.len());
         }
-        Ok(Catalog::new(build, entries, data_files))
+        // (A catalog of an earlier version has none.)
+        let dates: Vec<u64> =
+            v["dates"].as_array().map_or(Vec::new(), |d| d.iter().filter_map(|t| t.as_u64()).collect());
+        if !dates.is_empty() && dates.len() != data_files {
+            bail!("catalog: {} dates for {data_files} data files", dates.len());
+        }
+        Ok(Catalog { dates, ..Catalog::new(build, entries, data_files) })
     }
 
     /// The manifest the engine reads (`wasm_httpfs_manifest_js`), in the
@@ -111,11 +126,36 @@ impl Catalog {
     pub fn engine_manifest(&self) -> Vec<u8> {
         let files: Vec<_> = self.entries[..self.data_files]
             .iter()
-            .map(|e| (e.path.strip_prefix("data/").unwrap_or(&e.path), e.size, e.mtime))
+            .enumerate()
+            .map(|(i, e)| {
+                (e.path.strip_prefix("data/").unwrap_or(&e.path), e.size, *self.dates.get(i).unwrap_or(&e.mtime))
+            })
             .collect();
         serde_json::to_vec(&serde_json::json!({ "mount": "/game/", "version": self.hash, "files": files }))
             .expect("manifest json")
     }
+}
+
+/// The game's files as the whale5 server listed them, by lowercase path
+/// under `data/`: (size, date in seconds), from its manifest
+/// (`data/manifest.json`, `files` of [path, size, date]). The engine's map
+/// caches (`common/data/gta5_cache_*.dat`) hold these dates: told others
+/// (a copy's), it builds the cache again at every start (seconds) and
+/// cannot save it. Empty without a manifest.
+pub fn game_dates(data: &Path) -> HashMap<String, (u64, u64)> {
+    let Ok(bytes) = fs::read(data.join("manifest.json")) else { return HashMap::new() };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        log::warn!("{}: not a manifest", data.join("manifest.json").display());
+        return HashMap::new();
+    };
+    let files = manifest["files"].as_array().map_or(&[][..], Vec::as_slice);
+    files.iter().filter_map(|f| Some((f[0].as_str()?.to_ascii_lowercase(), (f[1].as_u64()?, f[2].as_u64()?)))).collect()
+}
+
+/// The date of the file at `rel` (under `data/`) of `size` bytes, if the
+/// manifest lists it so: a file changed since is not the one it lists.
+pub fn date(dates: &HashMap<String, (u64, u64)>, rel: &str, size: u64) -> Option<u64> {
+    dates.get(&rel.to_ascii_lowercase()).filter(|(s, _)| *s == size).map(|&(_, t)| t)
 }
 
 fn walk(dir: &Path, rel: &str, out: &mut Vec<Entry>) -> io::Result<()> {
@@ -150,6 +190,21 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn manifest_dates() {
+    let dir = std::env::temp_dir().join(format!("glue5-catalog-dates-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("manifest.json"), br#"{"mount":"/game/","files":[["x64/A.rpf",10,1790644442],["b.xml",3,9]]}"#)
+        .unwrap();
+    let dates = game_dates(&dir);
+    assert_eq!(date(&dates, "x64/a.rpf", 10), Some(1790644442));
+    // Changed since (another size), or not listed.
+    assert_eq!(date(&dates, "b.xml", 4), None);
+    assert_eq!(date(&dates, "c.xml", 3), None);
+    assert!(game_dates(&dir.join("none")).is_empty());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn round_trip() {
     let entries = vec![
         Entry { path: "data/common/a.xml".into(), size: 3, mtime: 7 },
@@ -162,6 +217,13 @@ fn round_trip() {
     assert_eq!(back.find("DATA/Common/A.xml"), Some(0));
     let m: serde_json::Value = serde_json::from_slice(&c.engine_manifest()).unwrap();
     assert_eq!(m["files"][0][0], "common/a.xml");
+    assert_eq!(m["files"][0][2], 7);
     assert_eq!(m["files"].as_array().unwrap().len(), 1);
+    // The engine's dates: told it, kept, out of the hash.
+    let dated = Catalog { dates: vec![5], ..Catalog::new("x".into(), entries.clone(), 1) };
+    let back = Catalog::from_json(&dated.to_json()).unwrap();
+    assert_eq!((back.dates, back.hash), (vec![5], c.hash.clone()));
+    let m: serde_json::Value = serde_json::from_slice(&dated.engine_manifest()).unwrap();
+    assert_eq!(m["files"][0][2], 5);
     assert!(!safe_path("data/../x") && !safe_path("/etc") && !safe_path("c:/x") && safe_path("data/x"));
 }

@@ -25,8 +25,7 @@ both `Assets.car` and the fallback `Glue5.icns` in the Mac app.
 
 Verification: Xcode 26.3 Release iPhoneOS build with signing disabled succeeded.
 Standalone macOS asset compilation also produced `Assets.car` and `Glue5.icns`.
-Compiled previews and the legacy Mac export are in
-`docs/icon-concepts/composer/`. Dynamic motion and tinted rendering still need
+Dynamic motion and tinted rendering still need
 checking on an actual device; static previews do not exercise those effects.
 
 Artwork separation used built-in ImageGen edits of the approved dark sunset

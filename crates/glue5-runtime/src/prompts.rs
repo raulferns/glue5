@@ -84,20 +84,26 @@ static BARS: Mutex<Option<HashMap<u32, Bar>>> = Mutex::new(None);
 /// Whether the manager's movie `id` is a bar of instructional buttons
 /// (the scripts', the pause menu's, the store's: their files end so).
 fn is_bar(mem: Mem, id: u32) -> bool {
+    movie_file(mem, id).is_some_and(|name| name.to_ascii_lowercase().ends_with(b"instructional_buttons"))
+}
+
+/// The file of movie `id` (its slot's, which a later movie may take).
+fn movie_file(mem: Mem, id: u32) -> Option<Vec<u8>> {
     let base = mem.u64(MOVIES);
     if base == 0 || id as u64 >= mem.u16(MOVIE_COUNT) as u64 {
-        return false;
+        return None;
     }
     let name = mem.bytes(base + id as u64 * MOVIE_SIZE + MOVIE_NAME, 64);
-    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
-    name.to_ascii_lowercase().ends_with(b"instructional_buttons")
+    Some(name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())].to_vec())
 }
 
 /// Movies showing a cursor of their own (the browser's, a hacking
-/// screen's: their scripts do for keyboard and mouse only), and when a
-/// script last moved one (those calls come each frame it is used).
+/// screen's: their scripts do for keyboard and mouse only), with their
+/// files (a movie released with its cursor shown leaves its slot to
+/// another), and when a script last moved one (those calls come each
+/// frame it is used).
 struct Pointer {
-    shown: Vec<u32>,
+    shown: Vec<(u32, Option<Vec<u8>>)>,
     moved: Option<Instant>,
 }
 
@@ -118,9 +124,9 @@ fn pointer_method(mem: Mem, movie: u32, method: &[u8], args: u64, count: u32) {
     };
     if let Some(show) = show {
         let mut pointer = POINTER.lock().unwrap();
-        pointer.shown.retain(|&m| m != movie);
+        pointer.shown.retain(|(m, _)| *m != movie);
         if show {
-            pointer.shown.push(movie);
+            pointer.shown.push((movie, movie_file(mem, movie)));
         }
     }
 }
@@ -133,10 +139,11 @@ pub(crate) fn pointer_shown(env: *mut Env) -> bool {
     if pointer.moved.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
         return true;
     }
+    let shows = |id: u32| pointer.shown.iter().any(|(m, file)| *m == id && movie_file(mem, id) == *file);
     !pointer.shown.is_empty()
         && (0..20)
             .map(|i| SCRIPT_MOVIES + i * SCRIPT_MOVIE_SIZE)
-            .any(|e| mem.u8(e + SCRIPT_MOVIE_DRAWN) == 1 && pointer.shown.contains(&(mem.i32(e) as u32)))
+            .any(|e| mem.u8(e + SCRIPT_MOVIE_DRAWN) == 1 && shows(mem.i32(e) as u32))
 }
 
 /// Hook for `CScaleformMgr::CallMethodInternal`: every method call of the
@@ -200,7 +207,10 @@ fn bar_method(mem: Mem, movie: u32, method: &[u8], args: u64, count: u32) {
                     }
                     GFX_BOOL => clickable = mem.u8(value + 16) != 0,
                     GFX_STRING => {
-                        let text = c_str(mem, mem.u64(value + 16), 256);
+                        // A managed string (0x40) points at its text's pointer.
+                        let at = mem.u64(value + 16);
+                        let at = if mem.u8(value + 8) & 0x40 != 0 { mem.u64(at) } else { at };
+                        let text = c_str(mem, at, 256);
                         if text.starts_with("b_") || text.starts_with("t_") {
                             slot.icons.extend(text.split('%').filter(|t| !t.is_empty()).map(str::to_owned));
                         } else if slot.label.is_empty() {
@@ -275,7 +285,7 @@ const HELP_TEXT_LEN: usize = 600;
 
 /// The player's controls (`CControlMgr`'s main player control): its inputs'
 /// values at +33704, 72 bytes each.
-const CONTROL: u64 = 24488864;
+pub(crate) const CONTROL: u64 = 24488864;
 const CONTROL_VALUES: u64 = 33704;
 const CONTROL_VALUE_SIZE: u64 = 72;
 /// `GetInputSource`'s device: the first pad (its mapping, whichever device
@@ -283,7 +293,7 @@ const CONTROL_VALUE_SIZE: u64 = 72;
 const PAD: u32 = 0;
 /// `rage::ioSource` devices: a pad's button (parameter: its bit), analog
 /// button (its bit's index), axis (0x1000 + LX, LY, RX, RY; 0x1016.. the
-/// left stick's directions, 0x101A.. the right's).
+/// left stick's up, down, left, right, 0x101A.. the right's).
 const PAD_BUTTON: u32 = 9;
 const PAD_ANALOG: u32 = 11;
 const PAD_AXIS: u32 = 12;
@@ -301,10 +311,10 @@ unsafe fn input_pad(env: *mut Env, input: u32) -> Option<Pad> {
     match (device, parameter) {
         (PAD_BUTTON, bits) if bits != 0 && bits <= 0xFFFF => Some(Pad::Buttons(bits as u16)),
         (PAD_ANALOG, index) if index < 16 => Some(Pad::Buttons(1 << index)),
-        (PAD_AXIS, 0x1000 | 0x1016..=0x1017) => Some(stick(false, true, false)),
-        (PAD_AXIS, 0x1001 | 0x1018..=0x1019) => Some(stick(false, false, true)),
-        (PAD_AXIS, 0x1002 | 0x101A..=0x101B) => Some(stick(true, true, false)),
-        (PAD_AXIS, 0x1003 | 0x101C..=0x101D) => Some(stick(true, false, true)),
+        (PAD_AXIS, 0x1000 | 0x1018..=0x1019) => Some(stick(false, true, false)),
+        (PAD_AXIS, 0x1001 | 0x1016..=0x1017) => Some(stick(false, false, true)),
+        (PAD_AXIS, 0x1002 | 0x101C..=0x101D) => Some(stick(true, true, false)),
+        (PAD_AXIS, 0x1003 | 0x101A..=0x101B) => Some(stick(true, false, true)),
         _ => None,
     }
 }

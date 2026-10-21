@@ -390,7 +390,8 @@ unsafe fn inject(env: *mut Env, text: &str, from: u64) {
             let (reader, sender, channel) = (at + text_size, at + text_size + 32, at + text_size + 64);
             m.bytes_mut(at, text.len()).copy_from_slice(text.as_bytes());
             m.bytes_mut(channel, 5).copy_from_slice(b"self\0");
-            // The sender: the friend's handle.
+            // The sender: the friend's handle, of type 0 (a local message: the
+            // engine checks nothing against it, `checked` did).
             m.set_u64(sender, from);
             m.set_u8(sender + 8, 3);
             orig::rson_reader(env, reader, at, len as u32);

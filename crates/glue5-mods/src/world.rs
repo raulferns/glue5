@@ -131,7 +131,7 @@ static CATALOG: Mutex<Option<Catalog>> = Mutex::new(None);
 
 /// The catalog, once read (this session, or the last one's, saved).
 pub fn catalog() -> Option<Catalog> {
-    CATALOG.lock().unwrap().clone()
+    crate::lock(&CATALOG).clone()
 }
 
 /// Reads the catalog from the engine's tables (after loading).
@@ -194,7 +194,7 @@ fn valid(n: &str) -> bool {
 /// checker has the types before the game loads), and the checker made
 /// again when it changed.
 pub fn set_catalog(c: Catalog) {
-    let mut slot = CATALOG.lock().unwrap();
+    let mut slot = crate::lock(&CATALOG);
     if slot.as_ref() == Some(&c) {
         return;
     }
@@ -202,12 +202,17 @@ pub fn set_catalog(c: Catalog) {
     let text = definitions_of(Some(&c));
     *slot = Some(c);
     drop(slot);
-    *ALIASES.lock().unwrap() = None;
-    if let Some(dir) = crate::dir() {
-        let _ = std::fs::create_dir_all(dir.join(".glue5"));
-        let _ = std::fs::write(dir.join(".glue5/world.d.luau"), text);
-    }
-    crate::checker::Checker::release();
+    *crate::lock(&ALIASES) = None;
+    // The rest off the caller's thread (the engine's): a file to write, and
+    // the Studio's type checker to wait for (busy for a while at times).
+    let dir = crate::dir().map(std::path::Path::to_path_buf);
+    let _ = std::thread::Builder::new().name("mods catalog".into()).spawn(move || {
+        if let Some(dir) = dir {
+            let _ = std::fs::create_dir_all(dir.join(".glue5"));
+            let _ = std::fs::write(dir.join(".glue5/world.d.luau"), text);
+        }
+        crate::checker::Checker::release();
+    });
 }
 
 /// The catalog saved by an earlier session.
@@ -221,8 +226,8 @@ pub fn load_saved(dir: &std::path::Path) {
     };
     let c = Catalog { vehicles: list("VehicleModel"), peds: list("PedModel"), weapons: list("WeaponName") };
     if !c.vehicles.is_empty() {
-        *CATALOG.lock().unwrap() = Some(c);
-        *ALIASES.lock().unwrap() = None;
+        *crate::lock(&CATALOG) = Some(c);
+        *crate::lock(&ALIASES) = None;
     }
 }
 
@@ -231,7 +236,7 @@ pub fn load_saved(dir: &std::path::Path) {
 static ALIASES: Mutex<Option<Vec<(&'static str, std::collections::HashSet<String>)>>> = Mutex::new(None);
 
 fn aliases() -> Vec<(&'static str, std::collections::HashSet<String>)> {
-    let mut slot = ALIASES.lock().unwrap();
+    let mut slot = crate::lock(&ALIASES);
     if slot.is_none() {
         let c = catalog().unwrap_or_default();
         let set = |lists: &[&Vec<String>]| lists.iter().flat_map(|l| l.iter().cloned()).collect();
@@ -308,7 +313,7 @@ pub fn shorten(text: &str) -> String {
 /// The world's types for the checker: the catalog's names as string
 /// unions, or plain strings before there is a catalog.
 pub fn definitions() -> String {
-    definitions_of(CATALOG.lock().unwrap().as_ref())
+    definitions_of(crate::lock(&CATALOG).as_ref())
 }
 
 fn definitions_of(c: Option<&Catalog>) -> String {
@@ -341,8 +346,8 @@ mod tests {
     fn long_unions_get_their_names() {
         let names = |p: &str, n: usize| (0..n).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
         let c = Catalog { vehicles: names("car", 8), peds: names("ped", 7), weapons: names("WEAPON_", 6) };
-        *CATALOG.lock().unwrap() = Some(c.clone());
-        *ALIASES.lock().unwrap() = None;
+        *crate::lock(&CATALOG) = Some(c.clone());
+        *crate::lock(&ALIASES) = None;
         let union = |l: &[String]| l.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(" | ");
         let both: Vec<String> = c.vehicles.iter().chain(&c.peds).cloned().collect();
         assert_eq!(

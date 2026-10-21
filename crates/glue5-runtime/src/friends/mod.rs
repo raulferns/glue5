@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crypto::{Identity, Key, Salt, Tag};
 use session::{Handshake, Pattern, Transport};
 
+use crate::Locked;
 use crate::dht;
 
 /// The file of friends, the player's key and code, in the user directory.
@@ -244,6 +245,11 @@ struct Friend {
     transport: Option<Transport>,
     /// The channel before the last handshake, for datagrams still on the way.
     previous: Option<Transport>,
+    /// A channel it opened (its handshake answered here), taken once a
+    /// datagram comes on it: proof the other end has it (a handshake
+    /// message 1 replayed, or a message 2 lost, would else take the
+    /// friend's traffic to a channel no one reads).
+    pending: Option<Transport>,
     presence: Option<Presence>,
     /// When it was last told the presence, and what.
     presence_sent: Option<(Instant, Presence)>,
@@ -524,16 +530,22 @@ pub(crate) struct Saving {
 }
 
 impl Saving {
-    /// Writes the file, unless newer content was written already.
+    /// Writes the file, unless newer content was written already. When it
+    /// could not (a full disk), the changes are saved again later: else they
+    /// would wait for some other change, and be lost at exit.
     fn write(self) {
-        let mut written = self.written.lock().unwrap();
+        let mut written = self.written.locked();
         if self.version <= *written {
             return;
         }
         let temp = self.path.with_file_name(format!("{FILE}.new"));
         match write_private(&temp, &self.bytes).and_then(|()| std::fs::rename(&temp, &self.path)) {
             Ok(()) => *written = self.version,
-            Err(e) => log::warn!("friends: saving {}: {e}", self.path.display()),
+            Err(e) => {
+                log::warn!("friends: saving {}: {e}", self.path.display());
+                drop(written);
+                with(|s, _| s.save());
+            }
         }
     }
 }
@@ -731,6 +743,7 @@ impl Service {
             since,
             transport: None,
             previous: None,
+            pending: None,
             presence: None,
             presence_sent: None,
             last_time: 0,
@@ -772,6 +785,7 @@ impl Service {
         }
         self.drop_channel(f.transport);
         self.drop_channel(f.previous);
+        self.drop_channel(f.pending);
         self.handshakes.retain(|_, (_, o)| *o != Owner::Friend(*key));
         self.generation += 1;
         self.save();
@@ -885,6 +899,11 @@ impl Service {
                 self.drop_channel(t);
             }
             let f = self.friends.get_mut(&key).unwrap();
+            if f.pending.as_ref().is_some_and(|t| now - t.heard > HANDSHAKE * 2) {
+                let t = f.pending.take();
+                self.drop_channel(t);
+            }
+            let f = self.friends.get_mut(&key).unwrap();
             let Some(t) = f.transport.as_mut() else { continue };
             if now - t.heard > SILENCE {
                 log::info!("friends: {} is offline", f.name);
@@ -913,7 +932,9 @@ impl Service {
             if stale {
                 f.presence_sent = Some((now, presence.clone()));
                 out.push(t.addr, seal(t, &Message::Presence(presence.clone())));
-            } else if now - t.sent > PING {
+            } else if now - t.sent > if t.heard == t.established { RESEND } else { PING } {
+                // A channel nothing came on yet: often, until the other side
+                // takes it (it waits for a datagram on it; see `pending`).
                 out.push(t.addr, seal(t, &Message::Ping));
             }
             // Fresh keys now and then: the side that starts handshakes.
@@ -1310,8 +1331,12 @@ impl Service {
                 f.last_time = time;
                 let Some(d) = h.write(&[]) else { return };
                 out.send.push((from, d));
+                // Taken when the friend's first datagram on it comes (it
+                // sends its presence at once): see `Friend::pending`.
                 if let Some(t) = h.into_transport(now) {
-                    self.open_friend(key, t, now, out);
+                    self.channels.insert(t.index, Owner::Friend(key));
+                    let older = f.pending.replace(t);
+                    self.drop_channel(older);
                 }
             }
             Pattern::Code => {
@@ -1404,6 +1429,10 @@ impl Service {
             }
             Owner::Asker(_) => {
                 if self.blocked.contains(&key) {
+                    // Declined before: told again (that answer is sent once,
+                    // and lost it would have them ask for ever).
+                    let mut t = t;
+                    out.push(t.addr, seal(&mut t, &Message::Decline));
                     return;
                 }
                 if self.friends.contains_key(&key) {
@@ -1468,11 +1497,20 @@ impl Service {
 
     fn on_data(&mut self, from: SocketAddrV4, index: u32, d: &[u8], now: Instant, out: &mut Out) {
         let Some(owner) = self.channels.get(&index).cloned() else { return };
+        let mut confirmed = None;
         let payload = match &owner {
             Owner::Friend(key) => {
                 let Some(f) = self.friends.get_mut(key) else { return };
-                let t = [f.transport.as_mut(), f.previous.as_mut()].into_iter().flatten().find(|t| t.index == index);
-                t.and_then(|t| t.open(d, from, now))
+                if f.pending.as_ref().is_some_and(|t| t.index == index) {
+                    let opened = f.pending.as_mut().and_then(|t| t.open(d, from, now));
+                    if opened.is_some() {
+                        confirmed = f.pending.take();
+                    }
+                    opened
+                } else {
+                    let t = [f.transport.as_mut(), f.previous.as_mut()].into_iter().flatten().find(|t| t.index == index);
+                    t.and_then(|t| t.open(d, from, now))
+                }
             }
             Owner::Asker(Some(key)) => self.requests.get_mut(key).and_then(|r| r.transport.open(d, from, now)),
             Owner::Asking(id) => {
@@ -1480,6 +1518,9 @@ impl Service {
             }
             Owner::Asker(None) => None,
         };
+        if let (Some(t), Owner::Friend(key)) = (confirmed, &owner) {
+            self.open_friend(*key, t, now, out);
+        }
         let Some(message) = payload.and_then(|p| serde_json::from_slice::<Message>(&p).ok()) else { return };
         match owner {
             Owner::Friend(key) => self.on_friend(key, message, now, out),
@@ -1490,6 +1531,7 @@ impl Service {
     }
 
     fn on_friend(&mut self, key: Key, message: Message, now: Instant, out: &mut Out) {
+        let online = self.local.playing == Playing::Online;
         let Some(f) = self.friends.get_mut(&key) else { return };
         match message {
             Message::Presence(p) => {
@@ -1497,6 +1539,10 @@ impl Service {
                 let taken = self.id_taken(p.id, &key);
                 let Some(f) = self.friends.get_mut(&key) else { return };
                 if f.presence.as_ref() != Some(&p) {
+                    // Out of GTA Online: its invite is to a session it left.
+                    if p.playing != Playing::Online && f.invited.take().is_some() {
+                        self.generation += 1;
+                    }
                     if !p.name.is_empty() && p.name != f.name {
                         f.name = p.name.clone();
                     }
@@ -1514,12 +1560,17 @@ impl Service {
                 }
             }
             Message::Game { seq, text } => {
-                if !f.first_time(seq, out) || text.len() > game::MAX_EVENT {
+                // For GTA Online's session: none kept while the player is
+                // elsewhere (they would all come at once, stale, later).
+                if !f.first_time(seq, out) || text.len() > game::MAX_EVENT || !online {
                     return;
                 }
                 log::info!("friends: a game event from {}", f.name);
                 self.events.push_back(GameEvent { from: f.id, name: f.name.clone(), text });
-                self.events.truncate(32);
+                // The newest kept.
+                if self.events.len() > 32 {
+                    self.events.pop_front();
+                }
             }
             Message::Invite { seq, lobby, session } => {
                 if !f.first_time(seq, out) || f.invited.as_ref().is_some_and(|i| now - i.at < INVITE_AGAIN) {
@@ -1688,7 +1739,7 @@ fn send(p2p: &crate::p2p::P2p, out: Out) {
 fn with<R>(f: impl FnOnce(&mut Service, &mut Out) -> R) -> Option<R> {
     let mut out = Out::default();
     let r = {
-        let mut service = SERVICE.lock().unwrap();
+        let mut service = SERVICE.locked();
         f(service.as_mut()?, &mut out)
     };
     if !out.send.is_empty()
@@ -1718,7 +1769,7 @@ pub(crate) fn tick(p2p: &crate::p2p::P2p, now: Instant) {
     let players = p2p.players();
     let mut out = Out::default();
     let (wanted, saving) = {
-        let mut service = SERVICE.lock().unwrap();
+        let mut service = SERVICE.locked();
         let Some(s) = service.as_mut() else { return };
         s.tick(now, lobbies, &players, p2p.port(), &mut out);
         (s.lookups(unix()), s.saving(now, false))
@@ -1727,7 +1778,7 @@ pub(crate) fn tick(p2p: &crate::p2p::P2p, now: Instant) {
     if let Some(saving) = saving {
         saving.write();
     }
-    let mut current = LOOKUPS.lock().unwrap();
+    let mut current = LOOKUPS.locked();
     let keys: Vec<dht::Id> = wanted.iter().map(|(k, _)| *k).collect();
     p2p.dht(|dht| {
         for old in current.iter().filter(|k| !keys.contains(k)) {
@@ -1744,7 +1795,7 @@ pub(crate) fn tick(p2p: &crate::p2p::P2p, now: Instant) {
 /// A datagram of the friends' kinds (after the magic and the kind).
 pub(crate) fn receive(p2p: &crate::p2p::P2p, from: SocketAddrV4, kind: u8, d: &[u8]) {
     let mut out = Out::default();
-    if let Some(s) = SERVICE.lock().unwrap().as_mut() {
+    if let Some(s) = SERVICE.locked().as_mut() {
         s.receive(from, kind, d, Instant::now(), &mut out);
     }
     send(p2p, out);
@@ -1753,7 +1804,7 @@ pub(crate) fn receive(p2p: &crate::p2p::P2p, from: SocketAddrV4, kind: u8, d: &[
 /// An address the DHT gave for a key not a lobby's.
 pub(crate) fn found(p2p: &crate::p2p::P2p, key: dht::Id, addr: SocketAddrV4) {
     let mut out = Out::default();
-    if let Some(s) = SERVICE.lock().unwrap().as_mut() {
+    if let Some(s) = SERVICE.locked().as_mut() {
         s.found(key, addr, Instant::now(), &mut out);
     }
     send(p2p, out);
@@ -1765,7 +1816,7 @@ pub(crate) fn found(p2p: &crate::p2p::P2p, key: dht::Id, addr: SocketAddrV4) {
 /// network once there is something to do on it). `name`: the player's name.
 pub fn start(user_dir: &Path, name: &str) {
     let id = crate::online::gamer_id_in(user_dir);
-    let mut service = SERVICE.lock().unwrap();
+    let mut service = SERVICE.locked();
     if service.is_some() {
         return;
     }
@@ -1788,6 +1839,14 @@ fn start_network() {
     }
 }
 
+/// Writes what the network changed and is not saved yet (it waits up to a
+/// few seconds otherwise): the application ends.
+pub fn flush() {
+    if let Some(Some(saving)) = with(|s, _| s.saving(Instant::now(), true)) {
+        saving.write();
+    }
+}
+
 /// The player's name as its friends see it.
 pub fn set_name(name: &str) {
     with(|s, _| s.local.name = clean_name(name));
@@ -1804,6 +1863,7 @@ pub(crate) fn set_playing(playing: Playing) {
         s.local.playing = playing;
         if playing != Playing::Online {
             s.local.session = None;
+            s.events.clear();
         }
     });
 }

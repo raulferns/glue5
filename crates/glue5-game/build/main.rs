@@ -8,9 +8,11 @@
 mod codegen;
 mod compile;
 mod formats;
+mod hot;
 mod mangle;
 mod module;
 mod natives;
+mod optimise;
 mod ordering;
 mod page_map;
 
@@ -56,8 +58,13 @@ fn run() -> Result<()> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let root = manifest.parent().and_then(Path::parent).context("workspace root")?.to_path_buf();
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    let tools =
-        env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("target")).join("glue5-tools");
+    // (A relative target directory is cargo's, from where it runs: the
+    // workspace's root as the tasks run it; build scripts run in their
+    // crate's directory.)
+    let tools = env::var_os("CARGO_TARGET_DIR")
+        .map(|t| root.join(t))
+        .unwrap_or_else(|| root.join("target"))
+        .join("glue5-tools");
 
     for path in ["build", "hooks.rs", "hooks", "csrc"] {
         println!("cargo:rerun-if-changed={}", manifest.join(path).display());
@@ -88,7 +95,8 @@ fn run() -> Result<()> {
     // OUT_DIR so every profile and target shares them and their objects.
     let wasm2c = tools.join("bin").join(format!("wasm2c{}", env::consts::EXE_SUFFIX));
     ensure!(wasm2c.exists(), "{} not found: run `mise run setup` first", wasm2c.display());
-    let tool_stamp = fs::read_to_string(tools.join("wasm2c.stamp")).unwrap_or_default();
+    let tool_stamp = fs::read_to_string(tools.join("wasm2c.stamp"))
+        .with_context(|| format!("{}: run `mise run setup` first", tools.join("wasm2c.stamp").display()))?;
     println!("cargo:rerun-if-changed={}", wasm2c.display());
     let gen_dir = tools.join("gen").join(&sha[..16]);
     let stamp_path = gen_dir.join("wasm2c.stamp");
@@ -100,29 +108,47 @@ fn run() -> Result<()> {
             .args(["--enable-threads", "-n", "game", &format!("--num-outputs={OUTPUTS}"), "-o"])
             .arg(tmp.join("game.c"))
             .arg(&wasm_path)
-            .status()?;
-        ensure!(status.success(), "wasm2c failed");
+            .status();
+        if !status.as_ref().is_ok_and(|s| s.success()) {
+            // Not left behind (a GB or more each time, a full disk likely).
+            let _ = fs::remove_dir_all(&tmp);
+            bail!("wasm2c failed: {status:?}");
+        }
         fs::write(tmp.join("wasm2c.stamp"), &tool_stamp)?;
-        let _ = fs::remove_dir_all(&gen_dir);
-        fs::rename(&tmp, &gen_dir)?;
+        if fs::read_to_string(&stamp_path).ok().as_deref() == Some(tool_stamp.as_str()) {
+            // Another build put the same there meanwhile (and may be reading it).
+            let _ = fs::remove_dir_all(&tmp);
+        } else {
+            let _ = fs::remove_dir_all(&gen_dir);
+            fs::rename(&tmp, &gen_dir)?;
+        }
     }
 
     // 3. Hooks and glue.
     let module = module::parse(&wasm)?;
-    let hooks = codegen::resolve_hooks(&module, &HOOKS.concat())?;
+    let hooks = codegen::resolve_hooks(&module, &HOOKS.concat(), CALLED_ONLY)?;
     let mut sources: Vec<PathBuf> = (0..OUTPUTS).map(|i| gen_dir.join(format!("game_{i}.c"))).collect();
     let mut texts: Vec<Option<String>> = vec![None; sources.len()];
     apply_hooks(&hooks, &sources, &mut texts)?;
     ordering::apply(&sources, &mut texts)?;
     page_map::apply(&sources, &mut texts)?;
     formats::apply(&sources, &mut texts)?;
+    let optimise = optimise::Options::from_env(env::var("CARGO_CFG_TARGET_ENV")? == "msvc")?;
+    let hot = match optimise.hot_list()? {
+        Some(list) => hot::gather(&list, &sources, &mut texts, &gen_dir)?,
+        None => Vec::new(),
+    };
+    // (Not over the shared `.hooked.c` files with functions moved out: a
+    // build without them may read those meanwhile.)
+    let patched = if hot.is_empty() { "hooked.c" } else { "hot.c" };
     for (source, text) in sources.iter_mut().zip(texts) {
         if let Some(text) = text {
-            let patched = source.with_extension("hooked.c");
+            let patched = source.with_extension(patched);
             write_if_changed(&patched, &text)?;
             *source = patched;
         }
     }
+    sources.extend(hot);
     write_if_changed(&gen_dir.join("glue.c"), &codegen::glue_c(&module, &hooks)?)?;
     fs::write(out.join("bindings.rs"), codegen::bindings_rs(&module, &hooks))?;
     // The natives, for the crates that call them (DEP_GLUE5_GAME_NATIVES).
@@ -215,7 +241,13 @@ fn run() -> Result<()> {
     // Cargo's -j, but at most 8: each job holds a 15 MB C file's compilation.
     let jobs = env::var("NUM_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or(4).min(8);
     let cache = tools.join("objcache").join(env::var("TARGET")?);
-    let mut objects = compile::compile(&build, &sources, &game_key, &cache, jobs)?;
+    let mut game_build = build.clone();
+    optimise.apply(&mut game_build);
+    let game_key = format!("{game_key}{}", optimise.key());
+    let objects = compile::compile(&game_build, &sources, &game_key, &cache, jobs)?;
+    let ltocache = tools.join("ltocache").join(env::var("TARGET")?);
+    let mut objects = optimise.link(&game_build, objects, &ltocache, &out)?;
+    optimise.runtime(&build)?;
     objects.extend(compile::compile(&build, &glue, &glue_key, &cache, jobs)?);
     objects.extend(compile::compile(&build, &runtime, &runtime_key, &cache, jobs)?);
     let lib = if msvc { "glue5_game.lib" } else { "libglue5_game.a" };
@@ -247,41 +279,54 @@ fn find_wasm(game_dir: &Path) -> Result<(String, PathBuf)> {
 
 /// Renames each hooked function's definition to `<symbol>_orig` in its
 /// file's text (`texts`, written as `game_N.hooked.c`, which replaces the
-/// original in the build).
+/// original in the build); those only called are left as they are, once
+/// found (a definition the glue can call). One pass over each file: its
+/// functions' names looked up among the hooks (a search per hook took
+/// minutes).
 fn apply_hooks(hooks: &[codegen::Hook], sources: &[PathBuf], texts: &mut [Option<String>]) -> Result<()> {
-    let mut pending: Vec<&codegen::Hook> = hooks.iter().collect();
+    const PARAMS: &str = "(w2c_game* instance";
+    let mut pending: std::collections::HashMap<&str, &codegen::Hook> =
+        hooks.iter().map(|h| (h.symbol.as_str(), h)).collect();
     for (source, patched) in sources.iter().zip(texts.iter_mut()) {
         if pending.is_empty() {
             break;
         }
         let text = fs::read_to_string(source)?;
-        pending.retain(|hook| {
-            let needle = format!(" {}(w2c_game* instance", hook.symbol);
-            let current = patched.as_deref().unwrap_or(&text);
-            let Some(line_start) = current
-                .match_indices(&needle)
-                .map(|(i, _)| current[..i].rfind('\n').map_or(0, |n| n + 1))
-                .find(|&ls| {
-                    // A definition, not a declaration: its signature (on
-                    // one line, or wrapped over several) ends with `{`.
-                    let rest = &current[ls..];
-                    let end = rest.find(['{', ';']).unwrap_or(0);
-                    rest[end..].starts_with('{') && !rest.starts_with("static")
-                })
-            else {
-                return true;
-            };
-            let line_end = current[line_start..].find('\n').map_or(current.len(), |n| line_start + n);
-            let line = current[line_start..line_end].replacen(
-                &format!(" {}(", hook.symbol),
-                &format!(" {}_orig(", hook.symbol),
-                1,
-            );
-            *patched = Some(format!("{}{}{}", &current[..line_start], line, &current[line_end..]));
-            false
-        });
+        // Where each hooked definition's name ends (`_orig` goes there).
+        let mut renames = Vec::new();
+        for (at, _) in text.match_indices(PARAMS) {
+            let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+            let Some(space) = text[line_start..at].rfind(' ') else { continue };
+            let symbol = &text[line_start + space + 1..at];
+            if !pending.contains_key(symbol) {
+                continue;
+            }
+            // A definition, not a declaration: its signature (on one line,
+            // or wrapped over several) ends with `{`.
+            let rest = &text[line_start..];
+            let end = rest.find(['{', ';']).unwrap_or(0);
+            if rest[end..].starts_with('{')
+                && !rest.starts_with("static")
+                && let Some(hook) = pending.remove(symbol)
+                && !hook.called_only
+            {
+                renames.push(at);
+            }
+        }
+        if renames.is_empty() {
+            continue;
+        }
+        let mut out = String::with_capacity(text.len() + renames.len() * 5);
+        let mut from = 0;
+        for at in renames {
+            out.push_str(&text[from..at]);
+            out.push_str("_orig");
+            from = at;
+        }
+        out.push_str(&text[from..]);
+        *patched = Some(out);
     }
-    if let Some(hook) = pending.first() {
+    if let Some(hook) = hooks.iter().find(|h| pending.contains_key(h.symbol.as_str())) {
         bail!("hook `{}`: definition of {} not found in the wasm2c output", hook.field, hook.symbol);
     }
     Ok(())

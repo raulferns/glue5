@@ -17,7 +17,7 @@ use crate::storage::Storage;
 use crate::{EvalResult, json, menus, natives};
 
 /// How long a mod may run before it yields to the game for this frame.
-const SLICE: Duration = Duration::from_millis(2);
+pub const SLICE: Duration = Duration::from_millis(2);
 /// How long a mod may run without calling `wait` before it is stopped.
 const RUNAWAY: Duration = Duration::from_secs(2);
 /// Memory a mod's VM may use.
@@ -36,6 +36,11 @@ pub struct Vm {
     /// Tasks: `task.spawn`/`task.delay`, menus' callbacks.
     sched: Sched,
     deadline: Rc<Cell<Instant>>,
+    /// When this turn's time is up (all its coroutines share it).
+    turn_end: Cell<Instant>,
+    /// Which goes first this turn, the main chunk or the tasks (they take
+    /// turns, so neither starves the other).
+    main_first: Cell<bool>,
     /// The mod's `storage` (none for the REPL).
     storage: Option<Rc<Storage>>,
 }
@@ -47,6 +52,10 @@ struct Sched {
     /// The game time of the current turn, ms.
     now: Rc<Cell<u64>>,
     handlers: menus::Handlers,
+    /// This run of the mod (its menus are its own).
+    instance: u64,
+    /// The coroutine the scheduler is running (`Thread::to_pointer`).
+    resumed: Rc<Cell<*const std::ffi::c_void>>,
 }
 
 struct Task {
@@ -77,7 +86,7 @@ enum Outcome {
 impl Vm {
     /// Loads mod `name`'s `main.luau` from `dir`; `log` gets what it prints.
     pub fn new(name: &str, dir: &Path, log: Rc<dyn Fn(&str)>) -> mlua::Result<Vm> {
-        let sched = Sched::default();
+        let sched = Sched { instance: menus::next_instance(), ..Sched::default() };
         let (lua, deadline) = base(name, log, &sched)?;
         lua.globals().set("require", require(&lua, name, dir)?)?;
         let storage = Storage::open(name);
@@ -109,13 +118,15 @@ impl Vm {
             main_busy: Duration::ZERO,
             sched,
             deadline,
+            turn_end: Cell::new(Instant::now()),
+            main_first: Cell::new(false),
             storage: Some(storage),
         })
     }
 
     /// The REPL: runs `jobs`' snippets, as expressions when they are.
     pub fn repl(jobs: Jobs, log: Rc<dyn Fn(&str)>) -> mlua::Result<Vm> {
-        let sched = Sched::default();
+        let sched = Sched { instance: menus::next_instance(), ..Sched::default() };
         let (lua, deadline) = base("eval", log, &sched)?;
         let waiting: Rc<RefCell<HashMap<i64, Sender<EvalResult>>>> = Rc::default();
         let next = Cell::new(0i64);
@@ -170,14 +181,16 @@ impl Vm {
             .call((take, reply))?;
         lua.sandbox(true)?;
         let main = lua.create_thread(main)?;
-        Ok(Vm { lua, module: "~eval".into(), main: Some(main), main_wake: 0, main_busy: Duration::ZERO, sched, deadline, storage: None })
+        Ok(Vm { lua, module: "eval".into(), main: Some(main), main_wake: 0, main_busy: Duration::ZERO, sched, deadline, turn_end: Cell::new(Instant::now()), main_first: Cell::new(false), storage: None })
     }
 
     /// A turn at game time `now` (ms): what the player did with the menus
     /// becomes tasks; the tasks and the main chunk that are due run, until
     /// they wait, end, fail or run out of time.
-    pub fn step(&mut self, now: u64) -> Step {
+    pub fn step(&mut self, now: u64, slice: Duration) -> Step {
         self.sched.now.set(now);
+        self.turn_end.set(Instant::now() + slice.min(SLICE));
+        self.main_first.set(!self.main_first.get());
         if let Some(storage) = &self.storage {
             storage.flush(false);
         }
@@ -191,6 +204,32 @@ impl Vm {
                 Err(e) => crate::log_line(&self.module, crate::LogLevel::Error, &error_text(&e)),
             }
         }
+        if self.main_first.get() {
+            if let Some(failed) = self.run_main(now) {
+                return failed;
+            }
+            self.run_tasks(now);
+        } else {
+            self.run_tasks(now);
+            if let Some(failed) = self.run_main(now) {
+                return failed;
+            }
+        }
+        let menus = menus::has_menus(self.sched.instance);
+        let tasks = self.sched.tasks.borrow();
+        if self.main.is_none() && tasks.is_empty() && !menus {
+            return Step::Finished;
+        }
+        // A menu may be used any time: every frame then.
+        if menus {
+            return Step::Wait(0);
+        }
+        let next = tasks.iter().map(|t| t.wake).chain(self.main.as_ref().map(|_| self.main_wake)).min().unwrap_or(now);
+        Step::Wait(next.saturating_sub(now).min(u64::from(u32::MAX)) as u32)
+    }
+
+    /// The tasks that are due, while the turn lasts.
+    fn run_tasks(&mut self, now: u64) {
         // The tasks that are due; others may be added while they run.
         let due: Vec<Task> = {
             let mut tasks = self.sched.tasks.borrow_mut();
@@ -199,6 +238,11 @@ impl Vm {
             due
         };
         for mut task in due {
+            // Out of time this turn: next turn, as it was.
+            if Instant::now() >= self.turn_end.get() {
+                self.sched.tasks.borrow_mut().push(task);
+                continue;
+            }
             let args = task.args.take().unwrap_or_default();
             let (outcome, spent) = self.run(&task.thread, args);
             task.busy += spent;
@@ -221,8 +265,13 @@ impl Vm {
             }
             self.sched.tasks.borrow_mut().push(task);
         }
+    }
+
+    /// The main chunk, if due and the turn lasts; a failure ends the mod.
+    fn run_main(&mut self, now: u64) -> Option<Step> {
         if let Some(main) = self.main.clone()
             && self.main_wake <= now
+            && Instant::now() < self.turn_end.get()
         {
             let (outcome, spent) = self.run(&main, MultiValue::new());
             self.main_busy += spent;
@@ -231,23 +280,13 @@ impl Vm {
                     self.main_wake = now + u64::from(ms);
                     self.main_busy = Duration::ZERO;
                 }
-                Outcome::Preempted if self.main_busy >= RUNAWAY => return Step::Failed(runaway()),
+                Outcome::Preempted if self.main_busy >= RUNAWAY => return Some(Step::Failed(runaway())),
                 Outcome::Preempted => self.main_wake = now,
                 Outcome::Finished => self.main = None,
-                Outcome::Failed(e) => return Step::Failed(e),
+                Outcome::Failed(e) => return Some(Step::Failed(e)),
             }
         }
-        let menus = menus::has_menus(&self.module);
-        let tasks = self.sched.tasks.borrow();
-        if self.main.is_none() && tasks.is_empty() && !menus {
-            return Step::Finished;
-        }
-        // A menu may be used any time: every frame then.
-        if menus {
-            return Step::Wait(0);
-        }
-        let next = tasks.iter().map(|t| t.wake).chain(self.main.as_ref().map(|_| self.main_wake)).min().unwrap_or(now);
-        Step::Wait(next.saturating_sub(now).min(u64::from(u32::MAX)) as u32)
+        None
     }
 
     /// Runs a coroutine until it yields, ends or fails; and how long it ran.
@@ -256,7 +295,8 @@ impl Vm {
             return (Outcome::Finished, Duration::ZERO);
         }
         let start = Instant::now();
-        self.deadline.set(start + SLICE);
+        self.deadline.set(self.turn_end.get());
+        self.sched.resumed.set(thread.to_pointer());
         let result = thread.resume::<MultiValue>(args);
         let spent = start.elapsed();
         let outcome = match result {
@@ -307,7 +347,8 @@ fn base(name: &str, log: Rc<dyn Fn(&str)>, sched: &Sched) -> mlua::Result<(Lua, 
     g.set(
         "print",
         lua.create_function(move |_, args: MultiValue| {
-            log(&args.iter().map(describe_plain).collect::<Vec<_>>().join(" "));
+            let line = args.iter().map(describe_plain).collect::<Vec<_>>().join(" ");
+            log(&line);
             Ok(())
         })?,
     )?;
@@ -340,7 +381,7 @@ fn base(name: &str, log: Rc<dyn Fn(&str)>, sched: &Sched) -> mlua::Result<(Lua, 
             Ok(())
         })?,
     )?;
-    menus::install(&lua, name, sched.handlers.clone())?;
+    menus::install(&lua, name, sched.instance, sched.handlers.clone())?;
     json::install(&lua)?;
     // `world.vehicles()`..., the catalog's lists.
     let world = lua.create_table()?;
@@ -393,8 +434,22 @@ fn base(name: &str, log: Rc<dyn Fn(&str)>, sched: &Sched) -> mlua::Result<(Lua, 
 
     let deadline = Rc::new(Cell::new(Instant::now() + SLICE));
     let interrupt_deadline = deadline.clone();
-    lua.set_interrupt(move |_| {
-        Ok(if Instant::now() >= interrupt_deadline.get() { VmState::Yield } else { VmState::Continue })
+    let resumed = sched.resumed.clone();
+    lua.set_interrupt(move |lua| {
+        let late = Instant::now().saturating_duration_since(interrupt_deadline.get());
+        if late.is_zero() {
+            return Ok(VmState::Continue);
+        }
+        // Past the runaway limit whatever runs: a yield where Luau cannot
+        // (a metamethod, a sort's comparator, a module `require` runs) is
+        // dropped, so a loop there would never give the game back.
+        if late >= RUNAWAY {
+            return Err(mlua::Error::runtime(runaway()));
+        }
+        // Only the coroutine the scheduler resumed yields back to it; one
+        // the mod made itself (coroutine.wrap) would hand its resume an
+        // empty result. That one runs on, up to the runaway limit.
+        if lua.current_thread().to_pointer() == resumed.get() { Ok(VmState::Yield) } else { Ok(VmState::Continue) }
     });
     Ok((lua, deadline))
 }
@@ -489,6 +544,35 @@ fn describe_plain(v: &Value) -> String {
 fn short(x: f32) -> String {
     let s = format!("{x:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+impl Vm {
+    /// This run of the mod.
+    pub fn instance(&self) -> u64 {
+        self.sched.instance
+    }
+
+    /// Writes what the mod stored, now.
+    pub fn flush_storage(&self) {
+        if let Some(storage) = &self.storage {
+            storage.flush(true);
+        }
+    }
+
+    /// Writes what the mod stored when it is time (every couple of
+    /// seconds), also while it waits long between its turns.
+    pub fn flush_storage_due(&self) {
+        if let Some(storage) = &self.storage {
+            storage.flush(false);
+        }
+    }
+
+    /// Empties the mod's storage.
+    pub fn clear_storage(&self) {
+        if let Some(storage) = &self.storage {
+            storage.clear_now();
+        }
+    }
 }
 
 impl Drop for Vm {

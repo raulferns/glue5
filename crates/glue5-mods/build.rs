@@ -246,8 +246,9 @@ fn studio_files(root: &Path, out: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 
     // The wasm: a cargo of its own (the outer one holds this target
     // directory), without this build's flags, which are for its target.
+    // (A relative target directory is cargo's, from the workspace root.)
     let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
+        .map(|t| root.join(t))
         .unwrap_or_else(|| root.join("target"))
         .join("glue5-tools/studio");
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -304,6 +305,7 @@ fn studio_files(root: &Path, out: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     }
     let fonts = root.join("crates/glue5/assets/ui");
     for f in ["Barlow-SemiBold.ttf", "BarlowCondensed-Bold.ttf"] {
+        println!("cargo:rerun-if-changed={}", fonts.join(f).display());
         files.push((format!("/fonts/{f}"), fs::read(fonts.join(f))?));
     }
     // The page, with the import map of the editor's modules.

@@ -18,6 +18,9 @@ icon!(TERMINAL, "21", "<rect x=\"3.5\" y=\"5\" width=\"17\" height=\"14\" rx=\"2
 icon!(SLIDERS, "21", "<path d=\"M4 7h9M17 7h3M4 17h3M11 17h9\"/><circle cx=\"15\" cy=\"7\" r=\"2\"/><circle cx=\"9\" cy=\"17\" r=\"2\"/>");
 icon!(CODE, "21", "<path d=\"m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14\"/>");
 icon!(SEARCH, "15", "<circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"m20 20-3.5-3.5\"/>");
+icon!(IMPORT, "15", "<path d=\"M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14\"/>");
+icon!(PENCIL, "13", "<path d=\"M4 20h4L19 9l-4-4L4 16z\"/><path d=\"m13.5 6.5 4 4\"/>");
+icon!(TRASH, "13", "<path d=\"M5 7h14M10 7V4.5h4V7M7 7l1 13h8l1-13\"/>");
 icon!(PLUS, "15", "<path d=\"M12 5v14M5 12h14\"/>");
 icon!(FILE, "15", "<path d=\"M6 3.5h8l4 4v13H6z\"/><path d=\"M14 3.5v4h4\"/>");
 icon!(LOCK, "11", "<rect x=\"5\" y=\"10.5\" width=\"14\" height=\"10\" rx=\"2\"/><path d=\"M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3\"/>");

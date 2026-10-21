@@ -548,6 +548,11 @@ pub(crate) unsafe extern "C" fn set_mouse_cursor_this_frame(env: *mut Env, info:
 /// reads the mouse.
 pub(crate) unsafe extern "C" fn control_update(env: *mut Env, this: u64) {
     unsafe { orig::control_update(env, this) };
+    // Only the player's: with the debug control on, the rest ran twice a
+    // frame.
+    if this != crate::prompts::CONTROL {
+        return;
+    }
     let mem = unsafe { Mem::of(env) };
     let ped = unsafe { orig::find_player_ped(env) };
     let info = if ped != 0 { mem.u64(ped + PED_PLAYER_INFO) } else { 0 };

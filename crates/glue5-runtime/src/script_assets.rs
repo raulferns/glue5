@@ -11,15 +11,43 @@
 //!   interaction animations (the quick action, pointing...) wait for the
 //!   snacks bank with sprint, attacks, the weapon wheel and the phone
 //!   disabled until the player dies.
+//!   A bank named by a later update (an apartment shower's
+//!   `dlc_EXEC1/MP_APARTMENT_SHOWER_01`) is not even in the bank list: the
+//!   request by name answers "not yet" for good, and a player who spawns in
+//!   the shower waits in the sky.
 //! - Texture dictionaries (GTA Online's `MPShopSale`): one the streaming
 //!   store has no slot for is never loaded, so the interaction menu, which
 //!   waits for it with its other assets, opens without ever being drawn.
 //!
 //! - Models and text blocks of later updates (golf waits for two models,
 //!   the awards' texts `MPAWD` and the club emblems' textures).
+//! - Animation dictionaries, clip sets, particle assets and Scaleform movies
+//!   of later updates: the apartment's door (`anim@apt_trans@hinge_l`, the
+//!   heists'), the heist board's movies, freemode's pointing
+//!   (`anim@mp_point`). Every script's requests, scanned, name hundreds
+//!   this data lacks.
+//! - Cutscenes of later updates: Lester's introduction to the heists
+//!   (`HEIST_INT`), which `am_Heist_Int` plays for a high-end apartment's
+//!   owner, waiting for it to load. Started, a cutscene the data lacks ends
+//!   at once, and the scripts go on as after it.
 //!
 //! Each counts as loaded for the scripts here: they go on without those
 //! sounds, textures, models or texts.
+//!
+//! Objects of later updates are created by scripts that wait for them to
+//! exist: an apartment's front door (`hei_heist_apart2_door`, the heists'),
+//! which the apartment's script creates again every frame, its other
+//! players waiting for it. A model the data lacks makes a stand-in here,
+//! hidden and without collision: the script has its object, the player
+//! sees the place as this data built it.
+//!
+//! Interiors that later updates rebuilt: GTA Online's high-end apartments
+//! became `hei_dlc_apart_high_new*` with the heists, and the scripts look
+//! for the apartment by that type. This data has the earlier apartment at
+//! the same place, under another name, so the lookup finds nothing and a
+//! player who owns one, spawning there, waits in the sky forever ("Joining
+//! GTA Online"). A type the data lacks finds the interior at those
+//! coordinates here, whatever its type.
 //!
 //! Whole places are missing too: GTA Online's "simple interiors" (the
 //! casino, bunkers, hangars, nightclubs, the arcade...), DLC from 2016 on.
@@ -86,36 +114,70 @@ pub(crate) unsafe extern "C" fn bank_request(env: *mut Env, bank: u32, over_netw
     loaded
 }
 
+/// The sound factory (`audSoundFactory`), whose banks requests name.
+const SOUND_FACTORY: u64 = 12033216;
+/// Bank indices above this are none (not found).
+const LAST_BANK: u32 = 65534;
+
+/// Hook for `audScriptAudioEntity::RequestScriptBank(char const*, bool,
+/// unsigned int, bool)`: yes for a name no bank has.
+pub(crate) unsafe extern "C" fn named_bank_request(env: *mut Env, name: u64, over_network: u32, players: u32, hint: u32) -> u32 {
+    let loaded = unsafe { orig::script_named_bank_request(env, name, over_network, players, hint) };
+    if loaded != 0 || name == 0 { loaded } else { !bank_known(env, &unsafe { Mem::of(env) }.str(name)) as u32 }
+}
+
+/// Whether the sound factory has a bank of this name, looked up as the
+/// request does: with backslashes, then under `SCRIPT\`.
+fn bank_known(env: *mut Env, name: &str) -> bool {
+    let name = name.replace('/', "\\");
+    [name.clone(), format!("SCRIPT\\{name}")].iter().any(|n| {
+        let Ok(top) = (unsafe { exports::emscripten_stack_get_current(env) }) else { return true };
+        let Ok(at) = (unsafe { exports::_emscripten_stack_alloc(env, n.len() as u64 + 1) }) else { return true };
+        unsafe { Mem::of(env) }.write_str(at, n, n.len() + 1);
+        let index = unsafe { orig::bank_index_from_name(env, SOUND_FACTORY, at) };
+        let _ = unsafe { exports::_emscripten_stack_restore(env, top) };
+        index <= LAST_BANK
+    })
+}
+
 /// Hook for `rage::audWaveSlot::GetBankLoadingStatus(unsigned int) const`.
 pub(crate) unsafe extern "C" fn bank_loading_status(env: *mut Env, slot: u64, bank: u32) -> u32 {
     let status = unsafe { orig::bank_loading_status(env, slot, bank) };
     if status == FAILED && REQUEST.with(Cell::get) { LOADED } else { status }
 }
 
-/// The texture dictionary store's map from name hashes to slots, in this
-/// build: the bucket count, the buckets (the first entry's index each), the
-/// entries ({ u32 hash, u32 slot, u32 next }).
-const TXD_BUCKET_COUNT: u64 = 11097520;
-const TXD_BUCKETS: u64 = 11097512;
-const TXD_ENTRIES: u64 = 11097504;
+/// A streaming store's map from name hashes to slots, in this build: at
+/// `map` the entries ({ u32 hash, u32 slot, u32 next }), at +8 the buckets
+/// (the first entry's index each), at +16 the bucket count.
+#[derive(Clone, Copy)]
+struct SlotMap(u64);
+
+/// The texture dictionary store's.
+const TXDS: SlotMap = SlotMap(11097504);
+/// The particle asset store's.
+const PTFX_ASSETS: SlotMap = SlotMap(12283968);
+/// The cutscene store's (its names hashed in the files' namespace, 1).
+const CUTSCENES: SlotMap = SlotMap(19337352);
 const NONE: u32 = u32::MAX;
 
-/// Whether the texture dictionary store has a slot for this name hash.
-fn txd_slot_exists(m: Mem, hash: u32) -> bool {
-    let buckets = m.u32(TXD_BUCKET_COUNT);
-    if buckets == 0 {
-        return false;
-    }
-    let entries = m.u64(TXD_ENTRIES);
-    let mut i = m.u32(m.u64(TXD_BUCKETS) + u64::from(hash % buckets) * 4);
-    while i != NONE {
-        let entry = entries + u64::from(i) * 12;
-        if m.u32(entry) == hash {
-            return m.u32(entry + 4) != NONE;
+impl SlotMap {
+    /// Whether the store has a slot for this name hash.
+    fn has(self, m: Mem, hash: u32) -> bool {
+        let buckets = m.u32(self.0 + 16);
+        if buckets == 0 {
+            return false;
         }
-        i = m.u32(entry + 8);
+        let entries = m.u64(self.0);
+        let mut i = m.u32(m.u64(self.0 + 8) + u64::from(hash % buckets) * 4);
+        while i != NONE {
+            let entry = entries + u64::from(i) * 12;
+            if m.u32(entry) == hash {
+                return m.u32(entry + 4) != NONE;
+            }
+            i = m.u32(entry + 8);
+        }
+        false
     }
-    false
 }
 
 /// Hook for `graphics_commands::HasStreamedTxdLoaded(char const*)`.
@@ -124,7 +186,145 @@ pub(crate) unsafe extern "C" fn txd_loaded(env: *mut Env, name: u64) -> u32 {
         return 1;
     }
     let hash = unsafe { orig::hash_string(env, 0, name) };
-    !txd_slot_exists(unsafe { Mem::of(env) }, hash) as u32
+    !TXDS.has(unsafe { Mem::of(env) }, hash) as u32
+}
+
+/// Hook for `streaming_commands::HasAnimDictLoaded(char const*)`: yes too for
+/// a dictionary the anim store has no slot for.
+pub(crate) unsafe extern "C" fn anim_dict_loaded(env: *mut Env, name: u64) -> u32 {
+    if unsafe { orig::anim_dict_loaded(env, name) } != 0 {
+        return 1;
+    }
+    (unsafe { orig::anim_dict_exists(env, name) } == 0) as u32
+}
+
+/// Hook for `streaming_commands::HasClipSetLoaded(char const*)` (clip sets and
+/// anim sets): yes too for a name no clip set has.
+pub(crate) unsafe extern "C" fn clip_set_loaded(env: *mut Env, name: u64) -> u32 {
+    if unsafe { orig::clip_set_loaded(env, name) } != 0 {
+        return 1;
+    }
+    let hash = unsafe { orig::hash_string(env, 0, name) };
+    let Ok(top) = (unsafe { exports::emscripten_stack_get_current(env) }) else { return 0 };
+    let Ok(id) = (unsafe { exports::_emscripten_stack_alloc(env, 16) }) else { return 0 };
+    unsafe { Mem::of(env) }.set_u32(id, hash);
+    let clip_set = unsafe { orig::clip_set(env, id) };
+    let _ = unsafe { exports::_emscripten_stack_restore(env, top) };
+    (clip_set == 0) as u32
+}
+
+/// Hook for `streaming_commands::HasNamedPtFxAssetLoaded(char const*)`: yes
+/// too for an asset the particle asset store has no slot for.
+pub(crate) unsafe extern "C" fn named_ptfx_loaded(env: *mut Env, name: u64) -> u32 {
+    if unsafe { orig::named_ptfx_loaded(env, name) } != 0 {
+        return 1;
+    }
+    let hash = unsafe { orig::hash_string(env, 0, name) };
+    !PTFX_ASSETS.has(unsafe { Mem::of(env) }, hash) as u32
+}
+
+/// Script threads that asked for a Scaleform movie this data lacks (which
+/// the request answers with 0).
+static LACKING_MOVIE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Hook for `graphics_commands::CommandRequestScaleformMovieCommon(char
+/// const*, bool, bool)`: REQUEST_SCALEFORM_MOVIE and its variants.
+pub(crate) unsafe extern "C" fn scaleform_request(env: *mut Env, name: u64, a: u32, b: u32) -> u32 {
+    let movie = unsafe { orig::scaleform_request(env, name, a, b) };
+    if movie == 0 && name != 0 && !movie_in_image(env, &unsafe { Mem::of(env) }.str(name)) {
+        let thread = unsafe { orig::script_active_thread(env) };
+        let mut lacking = LACKING_MOVIE.lock().unwrap();
+        if thread != 0 && !lacking.contains(&thread) {
+            lacking.push(thread);
+        }
+    }
+    movie
+}
+
+/// Whether the game data has this Scaleform movie (its file).
+fn movie_in_image(env: *mut Env, name: &str) -> bool {
+    let Ok(top) = (unsafe { exports::emscripten_stack_get_current(env) }) else { return true };
+    // Room for what the engine adds to the name.
+    let cap = name.len() + 64;
+    let Ok(at) = (unsafe { exports::_emscripten_stack_alloc(env, cap as u64) }) else { return true };
+    unsafe { Mem::of(env) }.write_str(at, name, cap);
+    let exists = unsafe { orig::scaleform_in_image(env, at) } != 0;
+    let _ = unsafe { exports::_emscripten_stack_restore(env, top) };
+    exists
+}
+
+/// The cutscene last asked for lacks in this data.
+static LACKING_CUTSCENE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the cutscene store has this cutscene.
+fn cutscene_exists(env: *mut Env, name: u64) -> bool {
+    let hash = unsafe { orig::hash_string(env, 1, name) };
+    CUTSCENES.has(unsafe { Mem::of(env) }, hash)
+}
+
+/// Hook for `cutscene_commands::CommandRequestCutScene(char const*, int)`.
+pub(crate) unsafe extern "C" fn cutscene_request(env: *mut Env, name: u64, flags: u32) {
+    LACKING_CUTSCENE.store(name != 0 && !cutscene_exists(env, name), Ordering::Relaxed);
+    unsafe { orig::cutscene_request(env, name, flags) }
+}
+
+/// Hook for `cutscene_commands::CommandRequestCutSceneWithPlayBackList(char
+/// const*, int, int)`.
+pub(crate) unsafe extern "C" fn cutscene_request_list(env: *mut Env, name: u64, sections: u32, flags: u32) {
+    LACKING_CUTSCENE.store(name != 0 && !cutscene_exists(env, name), Ordering::Relaxed);
+    unsafe { orig::cutscene_request_list(env, name, sections, flags) }
+}
+
+/// Hook for `scrWrapped_HAS_CUTSCENE_LOADED::Call(rage::scrThread::Info&)`:
+/// yes too when the cutscene asked for lacks.
+pub(crate) unsafe extern "C" fn cutscene_loaded(env: *mut Env, info: u64) {
+    unsafe { orig::cutscene_loaded(env, info) };
+    let m = unsafe { Mem::of(env) };
+    let result = m.u64(info);
+    if m.u32(result) == 0 && LACKING_CUTSCENE.load(Ordering::Relaxed) {
+        m.set_u32(result, 1);
+    }
+}
+
+/// Hook for `scrWrapped_HAS_THIS_CUTSCENE_LOADED::Call(rage::scrThread::
+/// Info&)` (the cutscene's name the first parameter): yes too for a
+/// cutscene this data lacks.
+pub(crate) unsafe extern "C" fn this_cutscene_loaded(env: *mut Env, info: u64) {
+    unsafe { orig::this_cutscene_loaded(env, info) };
+    let m = unsafe { Mem::of(env) };
+    let result = m.u64(info);
+    let name = m.u64(m.u64(info + 16));
+    if m.u32(result) == 0 && name != 0 && !cutscene_exists(env, name) {
+        m.set_u32(result, 1);
+    }
+}
+
+/// Hook for `scrWrapped_HAS_SCALEFORM_MOVIE_FILENAME_LOADED::Call(rage::
+/// scrThread::Info&)` (the movie's name the first parameter): yes too for a
+/// movie this data lacks.
+pub(crate) unsafe extern "C" fn scaleform_file_loaded(env: *mut Env, info: u64) {
+    unsafe { orig::scaleform_file_loaded(env, info) };
+    let m = unsafe { Mem::of(env) };
+    let result = m.u64(info);
+    let name = m.u64(m.u64(info + 16));
+    if m.u32(result) == 0 && name != 0 && !movie_in_image(env, &m.str(name)) {
+        m.set_u32(result, 1);
+    }
+}
+
+/// Hook for `scrWrapped_HAS_SCALEFORM_MOVIE_LOADED::Call(rage::scrThread::
+/// Info&)` (the movie the first parameter, the answer the result): the movie
+/// 0 counts as loaded for a script that asked for one this data lacks.
+pub(crate) unsafe extern "C" fn scaleform_loaded(env: *mut Env, info: u64) {
+    unsafe { orig::scaleform_loaded(env, info) };
+    let m = unsafe { Mem::of(env) };
+    let result = m.u64(info);
+    if m.u32(result) == 0
+        && m.u32(m.u64(info + 16)) == 0
+        && LACKING_MOVIE.lock().unwrap().contains(&unsafe { orig::script_active_thread(env) })
+    {
+        m.set_u32(result, 1);
+    }
 }
 
 /// Hook for `streaming_commands::HasModelLoaded(int)`: HAS_MODEL_LOADED,
@@ -133,11 +333,80 @@ pub(crate) unsafe extern "C" fn model_loaded(env: *mut Env, hash: u32) -> u32 {
     if unsafe { orig::script_model_loaded(env, hash) } != 0 {
         return 1;
     }
-    let Ok(top) = (unsafe { exports::emscripten_stack_get_current(env) }) else { return 0 };
-    let Ok(id) = (unsafe { exports::_emscripten_stack_alloc(env, 16) }) else { return 0 };
+    !has_archetype(env, hash) as u32
+}
+
+/// What stands in for a model the data lacks: a small one of the base game.
+const STAND_IN: &str = "prop_golf_ball";
+
+/// The engine's name hash (`rage::atStringHash`, Jenkins' one-at-a-time
+/// over the lowercase name).
+const fn name_hash(name: &str) -> u32 {
+    let bytes = name.as_bytes();
+    let mut h: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        h = h.wrapping_add(bytes[i].to_ascii_lowercase() as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+        i += 1;
+    }
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h.wrapping_add(h << 15)
+}
+
+/// A script's object creation (its model the first parameter, the object
+/// the result): a model no archetype has becomes `STAND_IN`, hidden.
+fn create_object(env: *mut Env, info: u64, create: impl FnOnce()) {
+    let m = unsafe { Mem::of(env) };
+    let model = m.u64(info + 16);
+    let lacking = !has_archetype(env, m.u32(model));
+    if lacking {
+        if !has_archetype(env, name_hash(STAND_IN)) {
+            return create();
+        }
+        m.set_u32(model, name_hash(STAND_IN));
+    }
+    create();
+    let object = m.u32(m.u64(info));
+    if lacking && object != 0 {
+        unsafe {
+            orig::set_entity_visible(env, object, 0, 0);
+            orig::set_entity_collision(env, object, 0, 0);
+        }
+    }
+}
+
+/// Hook for `scrWrapped_CREATE_OBJECT::Call(rage::scrThread::Info&)`.
+pub(crate) unsafe extern "C" fn create_object_offset(env: *mut Env, info: u64) {
+    create_object(env, info, || unsafe { orig::create_object(env, info) });
+}
+
+/// Hook for `scrWrapped_CREATE_OBJECT_NO_OFFSET::Call(rage::scrThread::Info&)`.
+pub(crate) unsafe extern "C" fn create_object_no_offset(env: *mut Env, info: u64) {
+    create_object(env, info, || unsafe { orig::create_object_no_offset(env, info) });
+}
+
+/// Hook for `interior_commands::CommandGetInteriorAtCoordsOfType(rage::
+/// scrVector const&, char const*)`: GET_INTERIOR_AT_COORDS_WITH_TYPE, the
+/// interior at those coordinates for a type no archetype has (see above).
+pub(crate) unsafe extern "C" fn interior_of_type(env: *mut Env, coords: u64, kind: u64) -> u32 {
+    let interior = unsafe { orig::interior_of_type(env, coords, kind) };
+    if interior != 0 || kind == 0 {
+        return interior;
+    }
+    let hash = unsafe { orig::hash_string(env, 0, kind) };
+    if has_archetype(env, hash) { interior } else { unsafe { orig::interior_at(env, coords) } }
+}
+
+/// Whether an archetype (a model, an interior) has this name hash.
+fn has_archetype(env: *mut Env, hash: u32) -> bool {
+    let Ok(top) = (unsafe { exports::emscripten_stack_get_current(env) }) else { return true };
+    let Ok(id) = (unsafe { exports::_emscripten_stack_alloc(env, 16) }) else { return true };
     let archetype = unsafe { orig::archetype_from_hash(env, hash, id) };
     let _ = unsafe { exports::_emscripten_stack_restore(env, top) };
-    (archetype == 0) as u32
+    archetype != 0
 }
 
 /// The additional text slots (CTextFile's 23) and the block each was last
@@ -305,12 +574,26 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.as_function_invoke = Some(as_function_invoke);
     hooks.user_function_invoke = Some(user_function_invoke);
     hooks.script_model_loaded = Some(model_loaded);
+    hooks.interior_of_type = Some(interior_of_type);
+    hooks.create_object = Some(create_object_offset);
+    hooks.create_object_no_offset = Some(create_object_no_offset);
     hooks.additional_text_loaded = Some(additional_text_loaded);
     hooks.text_request = Some(text_request);
     hooks.text_free = Some(text_free);
     hooks.script_bank_request = Some(bank_request);
     hooks.bank_loading_status = Some(bank_loading_status);
+    hooks.script_named_bank_request = Some(named_bank_request);
     hooks.script_txd_loaded = Some(txd_loaded);
+    hooks.anim_dict_loaded = Some(anim_dict_loaded);
+    hooks.clip_set_loaded = Some(clip_set_loaded);
+    hooks.named_ptfx_loaded = Some(named_ptfx_loaded);
+    hooks.scaleform_request = Some(scaleform_request);
+    hooks.scaleform_loaded = Some(scaleform_loaded);
+    hooks.scaleform_file_loaded = Some(scaleform_file_loaded);
+    hooks.cutscene_request = Some(cutscene_request);
+    hooks.cutscene_request_list = Some(cutscene_request_list);
+    hooks.cutscene_loaded = Some(cutscene_loaded);
+    hooks.this_cutscene_loaded = Some(this_cutscene_loaded);
     hooks.script_request = Some(script_request);
     hooks.script_loaded = Some(script_loaded);
 }
@@ -367,6 +650,13 @@ mod tests {
         for _ in 0..100 {
             assert!(nested(|| ()));
         }
+    }
+
+    #[test]
+    fn names_hash_as_the_engine_does() {
+        // The heists' apartment door, as the apartment's script asks for it.
+        assert_eq!(name_hash("hei_heist_apart2_door"), 34120519);
+        assert_eq!(name_hash("HEI_HEIST_APART2_DOOR"), 34120519);
     }
 
     #[test]

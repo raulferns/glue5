@@ -40,7 +40,7 @@ mod uploads;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -98,6 +98,20 @@ pub unsafe fn enable_metal_hud() {
     };
 }
 
+/// Has the renderer free, at its next frame, what it keeps only to be faster
+/// and can make again: the system is short of memory (iOS's memory warning,
+/// Android's `onTrimMemory`). Callable from any thread.
+pub fn trim() {
+    TRIM.store(true, Ordering::Relaxed);
+}
+
+static TRIM: AtomicBool = AtomicBool::new(false);
+
+/// [`trim`] was asked for since the last call.
+pub(crate) fn take_trim() -> bool {
+    TRIM.swap(false, Ordering::Relaxed)
+}
+
 /// The wgpu instance for this platform (create surfaces with it).
 pub fn instance() -> wgpu::Instance {
     let backends = if cfg!(target_vendor = "apple") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN };
@@ -110,7 +124,7 @@ pub fn instance() -> wgpu::Instance {
 /// The renderer as the runtime's GPU backend; presents on `screen` if given.
 pub fn backend(settings: Settings, screen: Option<Screen>) -> GpuBackend {
     Box::new(move |ring: GpuRing| {
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("gpu".into())
             .spawn(move || match init(ring, settings, screen) {
                 Ok(gpu) => {
@@ -121,8 +135,11 @@ pub fn backend(settings: Settings, screen: Option<Screen>) -> GpuBackend {
                     log::error!("gpu: {e:#}");
                     drain(ring);
                 }
-            })
-            .expect("spawning the GPU thread");
+            });
+        // (Called by the engine: a panic here would abort, with no message.)
+        if let Err(e) = spawned {
+            glue5_runtime::exit::fail(format!("no thread for the renderer: {e}"));
+        }
     })
 }
 
@@ -164,11 +181,16 @@ fn pipeline_cache_name(info: &wgpu::AdapterInfo) -> String {
 /// Writes the driver's pipeline cache for the next run (Vulkan; Metal keeps
 /// its own): the whole cache, megabytes, so only when pipelines were added.
 fn save_pipeline_cache(compiler: &pipeline::Compiler, adapter: &wgpu::Adapter, dir: &std::path::Path) {
+    // One at a time (they share the temporary file).
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cache) = &compiler.cache
         && let Some(data) = cache.get_data()
     {
         let path = dir.join(pipeline_cache_name(&adapter.get_info()));
-        if let Err(e) = std::fs::write(&path, data) {
+        // Through a copy: a cache cut short is refused whole next time.
+        let tmp = path.with_extension("bin.tmp");
+        if let Err(e) = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &path)) {
             log::warn!("gpu: saving {}: {e}", path.display());
         }
     }
@@ -295,13 +317,24 @@ impl Device {
             label: Some("glue5"),
             required_features: features,
             required_limits: adapter.limits(),
-            memory_hints: wgpu::MemoryHints::Performance,
+            // Vulkan suballocates from blocks it frees only once empty (and
+            // never the last of a kind): with its default 64-256 MB blocks a
+            // Pixel's GPU memory grew 0.3-0.5 GB over a run while the live
+            // resources stayed flat. Metal ignores it.
+            memory_hints: wgpu::MemoryHints::Manual { suballocated_device_memory_block_size: (32 << 20)..(64 << 20) },
             ..Default::default()
         }))
         .context("creating the GPU device")?;
         log::info!("gpu: {} ({:?}, {}), features {:?}", info.name, info.backend, info.driver_info, features);
         device.on_uncaptured_error(error_handler(None));
-        device.set_device_lost_callback(|reason, message| log::error!("gpu: device lost ({reason:?}): {message}"));
+        device.set_device_lost_callback(|reason, message| {
+            log::error!("gpu: device lost ({reason:?}): {message}");
+            // Nothing is drawn any more: the game says so and ends, rather
+            // than run on behind a still picture.
+            if reason != wgpu::DeviceLostReason::Destroyed {
+                glue5_runtime::exit::fail(format!("the GPU device was lost: {message}"));
+            }
+        });
         Ok(Device { adapter, device, queue, features, profile })
     }
 }
@@ -367,7 +400,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         Some(p) => p.thread.join().map_err(|_| anyhow::anyhow!("preparing the pipelines panicked"))??,
         None => prepare::prepare(&gpu, &settings, &Default::default())?,
     };
-    let prepare::Prepared { library, compiler, pipes, known } = prepared;
+    let prepare::Prepared { library, compiler, pipes, known, computes, known_computes, blits } = prepared;
     let Device { adapter, device, queue, features: _, profile } = gpu;
     device.on_uncaptured_error(error_handler(Some(ring)));
     let caps = compiler.caps;
@@ -420,7 +453,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         pdirty: true,
         last_pipe: None,
         last_programs: (0, 0, 0, 0),
-        formats_seen: [0; 3],
+        srvs: Default::default(),
         bound_formats: Default::default(),
         chunk_passes: 0,
         batch_since: None,
@@ -432,12 +465,14 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         known,
         pass_tails: Default::default(),
         recipes_new: Vec::new(),
+        known_computes,
+        computes_new: Vec::new(),
         key: Vec::new(),
         binds: Default::default(),
         packs: Default::default(),
         dummies: Default::default(),
-        blits: Default::default(),
-        computes: Default::default(),
+        blits,
+        computes,
         next_buffer_uid: 0,
         slabs,
         recycler,
@@ -461,11 +496,26 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
     })
 }
 
+/// [`log_once`] for a kind of message about thing `id` (a program's):
+/// nothing allocated for one said before (callers come at every draw).
+pub(crate) fn log_once_for(kind: &'static str, id: u64, msg: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(&'static str, u64)>>> = Mutex::new(None);
+    if SEEN.lock().unwrap().get_or_insert_default().insert((kind, id)) {
+        log::warn!("gpu: {}", msg());
+    }
+}
+
 pub(crate) fn log_once(key: &str, msg: impl FnOnce() -> String) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    if SEEN.lock().unwrap().get_or_insert_default().insert(key.to_owned()) {
+    // (Some callers come at every draw: no copy of a key seen before.)
+    let mut seen = SEEN.lock().unwrap();
+    let seen = seen.get_or_insert_default();
+    if !seen.contains(key) {
+        seen.insert(key.to_owned());
         log::warn!("gpu: {}", msg());
     }
 }

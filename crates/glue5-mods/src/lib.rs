@@ -14,6 +14,7 @@ mod json;
 mod menus;
 pub mod natives;
 mod storage;
+mod zip;
 pub mod studio;
 mod vm;
 pub mod world;
@@ -42,10 +43,25 @@ impl ModState {
     }
 }
 
+/// What a mod says of itself: its `mod.json`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModInfo {
+    /// As people see it (the folder's name when it has none).
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    pub version: String,
+    /// It starts with the game.
+    pub autostart: bool,
+    /// Saving one of its files restarts it while it runs.
+    pub restart_on_save: bool,
+}
+
 /// A mod, as the application shows it.
 #[derive(Clone, Debug)]
 pub struct Mod {
     pub name: String,
+    pub info: ModInfo,
     pub state: ModState,
     /// Why it stopped, when it failed.
     pub error: Option<String>,
@@ -53,8 +69,6 @@ pub struct Mod {
     pub cpu_ms: f32,
     /// Memory of its VM, in bytes.
     pub memory: usize,
-    /// It starts with the game.
-    pub autostart: bool,
     /// It waits (the engine counts the time).
     pub waiting: bool,
 }
@@ -82,6 +96,8 @@ enum Command {
     Start(String),
     Stop(String),
     Eval(String, Sender<EvalResult>),
+    /// Empties a running mod's storage.
+    ClearStorage(String),
 }
 
 struct State {
@@ -166,7 +182,7 @@ pub fn note_failure() -> Option<String> {
 
 /// The mods kept from starting with the game this time, and why.
 pub fn held_back() -> Vec<String> {
-    HELD_BACK.lock().unwrap().clone()
+    crate::lock(&HELD_BACK).clone()
 }
 
 /// The mods folder `dir` (made if missing): its mods listed, their files
@@ -205,16 +221,22 @@ pub fn install(dir: &Path) {
         }
         if !names.is_empty() {
             let text = format!("{} did not start: the game stopped while it ran last time.", names.join(", "));
-            SHARED.state.lock().unwrap().notices.push_back(("mods".into(), text));
+            crate::lock(&SHARED.state).notices.push_back(("mods".into(), text));
         }
-        *HELD_BACK.lock().unwrap() = names;
+        *crate::lock(&HELD_BACK) = names;
     }
     let held = held_back();
     let autostart: Vec<String> =
-        mods().into_iter().filter(|m| m.autostart && !held.contains(&m.name)).map(|m| m.name).collect();
+        mods().into_iter().filter(|m| m.info.autostart && !held.contains(&m.name)).map(|m| m.name).collect();
     for name in autostart {
         start(&name);
     }
+}
+
+/// A mutex's value, also after a panic while it was held (the panic was
+/// caught and its mod stopped; what it guards stays usable).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The mods folder, once open.
@@ -234,9 +256,47 @@ pub fn cannot_start() -> Option<&'static str> {
     (!installed()).then_some("mods run with the game, and it is not running with them: start it (mods on), or mark the mod to start with the game")
 }
 
+/// A mod's file was saved (`path`), from the Studio or by an agent: the
+/// mod restarts with it when it runs and its page says so ("Restart when a
+/// file is saved"). Whether it restarts.
+pub fn saved(path: &str) -> bool {
+    let Some((name, file)) = path.split_once('/') else { return false };
+    if !file.ends_with(".luau") {
+        return false;
+    }
+    let restarts = mods().iter().any(|m| m.name == name && m.state == ModState::Running && m.info.restart_on_save);
+    if restarts {
+        restart(name);
+    }
+    restarts
+}
+
+/// What mod `name` keeps in its storage, as JSON (`{}` when nothing).
+pub fn stored(name: &str) -> String {
+    if !files::valid_name(name) {
+        return "{}".into();
+    }
+    dir()
+        .and_then(|d| std::fs::read_to_string(d.join(".glue5/storage").join(format!("{name}.json"))).ok())
+        .unwrap_or_else(|| "{}".into())
+}
+
+/// Empties mod `name`'s storage (a running mod's too).
+pub fn clear_stored(name: &str) {
+    if !files::valid_name(name) {
+        return;
+    }
+    if let Some(d) = dir() {
+        let _ = std::fs::remove_file(d.join(".glue5/storage").join(format!("{name}.json")));
+    }
+    command(Command::ClearStorage(name.to_string()));
+}
+
 /// Whether mod `name` starts with the game.
 pub fn set_autostart(name: &str, on: bool) -> Result<(), String> {
-    files::set_autostart(name, on)
+    let mut info = files::info(name);
+    info.autostart = on;
+    files::set_info(name, &info)
 }
 
 /// Reads the mods folder again (new or removed mods).
@@ -248,20 +308,20 @@ pub fn refresh() {
             let path = entry.path();
             if path.join("main.luau").is_file() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                found.push((name, files::autostart(&path)));
+                found.push((name.clone(), files::info_at(&path, &name)));
             }
         }
     }
-    found.sort();
-    let mut s = SHARED.state.lock().unwrap();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut s = crate::lock(&SHARED.state);
     let before = s.mods.len();
     s.mods.retain(|m| m.state != ModState::Stopped || found.iter().any(|(n, _)| *n == m.name));
     let mut changed = before != s.mods.len();
-    for (name, autostart) in found {
+    for (name, info) in found {
         match s.mods.iter_mut().find(|m| m.name == name) {
             Some(m) => {
-                changed |= m.autostart != autostart;
-                m.autostart = autostart;
+                changed |= m.info != info;
+                m.info = info;
             }
             None => {
                 changed = true;
@@ -271,21 +331,57 @@ pub fn refresh() {
                     error: None,
                     cpu_ms: 0.0,
                     memory: 0,
-                    autostart,
+                    info,
                     waiting: false,
                 })
             }
         }
     }
-    s.mods.sort_by(|a, b| a.name.cmp(&b.name));
+    // As people read them: by the name shown, numbers as numbers.
+    s.mods.sort_by(|a, b| natural(&a.info.title, &b.info.title).then_with(|| a.name.cmp(&b.name)));
     if changed {
         SHARED.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
+/// Text compared as people expect: case aside, digits as numbers
+/// (`filler-2` before `filler-10`).
+fn natural(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let number = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut n = 0u64;
+                    while let Some(d) = it.peek().and_then(|c| c.to_digit(10)) {
+                        n = n.saturating_mul(10).saturating_add(u64::from(d));
+                        it.next();
+                    }
+                    n
+                };
+                let ord = number(&mut a).cmp(&number(&mut b));
+                if ord.is_ne() {
+                    return ord;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let ord = x.to_lowercase().cmp(y.to_lowercase());
+                if ord.is_ne() {
+                    return ord;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
 /// The mods and their state.
 pub fn mods() -> Vec<Mod> {
-    SHARED.state.lock().unwrap().mods.clone()
+    crate::lock(&SHARED.state).mods.clone()
 }
 
 /// Changes whenever [`mods`] would give something else (but the time and
@@ -296,12 +392,17 @@ pub fn generation() -> u64 {
 
 /// Starts mod `name` (again, if it ran before).
 pub fn start(name: &str) {
-    command(Command::Start(name.to_string()));
+    // A folder of the mods folder, nothing else.
+    if files::valid_name(name) {
+        command(Command::Start(name.to_string()));
+    }
 }
 
 /// Stops mod `name`: its thread ends, with what it created.
 pub fn stop(name: &str) {
-    command(Command::Stop(name.to_string()));
+    if files::valid_name(name) {
+        command(Command::Stop(name.to_string()));
+    }
 }
 
 /// Stops mod `name` if it runs, then starts it.
@@ -324,26 +425,34 @@ fn command(c: Command) {
     if !installed() {
         return;
     }
-    SHARED.state.lock().unwrap().commands.push(c);
+    crate::lock(&SHARED.state).commands.push(c);
     SHARED.pending.store(true, Ordering::Release);
 }
 
 /// The log lines after `seq` (0: all kept), and the cursor to pass next.
 pub fn logs(seq: u64) -> (Vec<LogLine>, u64) {
-    let s = SHARED.state.lock().unwrap();
-    let lines: Vec<LogLine> = s.log.iter().filter(|l| l.seq > seq).cloned().collect();
+    let s = crate::lock(&SHARED.state);
+    // From the end: the lines are in order, and callers ask for the newest.
+    let new = s.log.iter().rev().take_while(|l| l.seq > seq).count();
+    let lines: Vec<LogLine> = s.log.iter().skip(s.log.len() - new).cloned().collect();
     (lines, s.next_seq - 1)
+}
+
+/// The last `n` log lines.
+pub fn recent_logs(n: usize) -> Vec<LogLine> {
+    let s = crate::lock(&SHARED.state);
+    s.log.iter().skip(s.log.len().saturating_sub(n)).cloned().collect()
 }
 
 /// The files changed after `seq` (by any client), and the cursor to pass next.
 pub fn changes(seq: u64) -> (Vec<String>, u64) {
-    let s = SHARED.state.lock().unwrap();
+    let s = crate::lock(&SHARED.state);
     let paths = s.changes.iter().filter(|(n, _)| *n > seq).map(|(_, p)| p.clone()).collect();
     (paths, s.next_change - 1)
 }
 
 pub(crate) fn changed(path: &str) {
-    let mut s = SHARED.state.lock().unwrap();
+    let mut s = crate::lock(&SHARED.state);
     if s.changes.len() == 256 {
         s.changes.pop_front();
     }
@@ -356,6 +465,9 @@ pub(crate) fn changed(path: &str) {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Menu {
     pub module: String,
+    /// The run of the mod that made it (a restarted mod's menus are its
+    /// new run's; the old run's go with it).
+    pub instance: u64,
     pub id: u32,
     pub title: String,
     pub items: Vec<MenuItem>,
@@ -390,28 +502,42 @@ pub enum MenuInput {
 
 /// The mods' menus.
 pub fn menus() -> Vec<Menu> {
-    SHARED.state.lock().unwrap().menus.clone()
+    crate::lock(&SHARED.state).menus.clone()
 }
 
 /// Whether a mod has a menu.
 pub fn has_menus() -> bool {
-    !SHARED.state.lock().unwrap().menus.is_empty()
+    !crate::lock(&SHARED.state).menus.is_empty()
 }
 
 /// The player changed or pressed an item: the menu shows it at once, the
 /// mod hears of it at its next turn.
 pub fn menu_input(module: &str, item: u32, input: MenuInput) {
-    let mut s = SHARED.state.lock().unwrap();
+    let mut s = crate::lock(&SHARED.state);
+    // What the mod hears is what the menu shows: the value checked against
+    // the item, nothing for an item that is gone or of another kind.
+    let mut checked = None;
     for m in s.menus.iter_mut().filter(|m| m.module == module) {
         for i in m.items.iter_mut().filter(|i| i.id == item) {
-            match (&mut i.kind, input) {
-                (MenuKind::Toggle(on), MenuInput::Toggle(v)) => *on = v,
-                (MenuKind::Slider { value, min, max, .. }, MenuInput::Value(v)) => *value = v.clamp(*min, *max),
-                (MenuKind::Choice { options, index }, MenuInput::Choose(v)) if v < options.len() => *index = v,
-                _ => {}
-            }
+            checked = match (&mut i.kind, input) {
+                (MenuKind::Toggle(on), MenuInput::Toggle(v)) => {
+                    *on = v;
+                    Some(input)
+                }
+                (MenuKind::Slider { value, min, max, .. }, MenuInput::Value(v)) if v.is_finite() => {
+                    *value = v.clamp(*min, *max);
+                    Some(MenuInput::Value(*value))
+                }
+                (MenuKind::Choice { options, index }, MenuInput::Choose(v)) if v < options.len() => {
+                    *index = v;
+                    Some(input)
+                }
+                (MenuKind::Button, MenuInput::Press) => Some(input),
+                _ => None,
+            };
         }
     }
+    let Some(input) = checked else { return };
     s.inputs.push((module.to_string(), item, input));
     drop(s);
     SHARED.pending.store(true, Ordering::Release);
@@ -420,7 +546,7 @@ pub fn menu_input(module: &str, item: u32, input: MenuInput) {
 
 /// What the mods notified since the last call: (mod, text).
 pub fn take_notices() -> Vec<(String, String)> {
-    SHARED.state.lock().unwrap().notices.drain(..).collect()
+    crate::lock(&SHARED.state).notices.drain(..).collect()
 }
 
 /// Whether a native trapped: the game may now misbehave.
@@ -433,7 +559,7 @@ pub(crate) fn log_line(module: &str, level: LogLevel, text: &str) {
         LogLevel::Info => log::info!("mod {module}: {text}"),
         LogLevel::Error => log::error!("mod {module}: {text}"),
     }
-    let mut s = SHARED.state.lock().unwrap();
+    let mut s = crate::lock(&SHARED.state);
     if s.log.len() == LOG_LINES {
         s.log.pop_front();
     }

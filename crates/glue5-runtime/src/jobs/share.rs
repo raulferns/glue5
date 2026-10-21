@@ -10,10 +10,12 @@
 //! job's header and its file at once).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{Job, Kind, MAX_FILE, add, fingerprint, is_content_id, jobs, parse_job, shared_dir};
+use super::{Job, Kind, MAX_FILE, add, fingerprint, is_content_id, library, parse_job, shared_dir};
+
+use crate::Locked;
 
 /// The port on the virtual LAN (the engine's sockets take 6672 and 50000 up).
 pub(crate) const PORT: u16 = 47900;
@@ -32,6 +34,10 @@ const WINDOW: usize = 16;
 const RETRY: Duration = Duration::from_millis(600);
 /// A download whose announcer says nothing for this long is dropped.
 const GIVE_UP: Duration = Duration::from_secs(30);
+/// Jobs downloaded at once, and at once from one player (the others wait
+/// for a later announcement).
+const DOWNLOADS_AT_ONCE: usize = 8;
+const DOWNLOADS_PER_PLAYER: usize = 2;
 
 struct Download {
     hash: [u8; 8],
@@ -70,17 +76,20 @@ fn send(to: u32, payload: &[u8]) {
 }
 
 /// The jobs the lobby gets from this player: its own and those it got.
-fn shareable() -> Vec<Job> {
-    jobs().into_iter().filter(|j| j.kind != Kind::Game && j.size as usize <= MAX_FILE).collect()
+fn shareable(job: &Job) -> bool {
+    job.kind != Kind::Game && job.size as usize <= MAX_FILE
 }
 
 fn announce() {
-    for chunk in shareable().chunks(PER_ANNOUNCEMENT) {
+    // Ids, fingerprints and sizes only (the headers are up to MBs each).
+    let jobs: Vec<(String, [u8; 8], u32)> =
+        library().as_ref().unwrap().iter().filter(|j| shareable(j)).map(|j| (j.id.clone(), j.hash, j.size)).collect();
+    for chunk in jobs.chunks(PER_ANNOUNCEMENT) {
         let mut d = vec![ANNOUNCE];
-        for job in chunk {
-            d.extend_from_slice(job.id.as_bytes());
-            d.extend_from_slice(&job.hash);
-            d.extend_from_slice(&job.size.to_be_bytes());
+        for (id, hash, size) in chunk {
+            d.extend_from_slice(id.as_bytes());
+            d.extend_from_slice(hash);
+            d.extend_from_slice(&size.to_be_bytes());
         }
         send(BROADCAST, &d);
     }
@@ -89,7 +98,7 @@ fn announce() {
 /// Asks for the pieces missing, a window at a time.
 fn ask() {
     let now = Instant::now();
-    let mut downloads = DOWNLOADS.lock().unwrap();
+    let mut downloads = DOWNLOADS.locked();
     let Some(downloads) = downloads.as_mut() else { return };
     downloads.retain(|id, d| {
         if now.duration_since(d.heard) > GIVE_UP {
@@ -139,8 +148,9 @@ pub(crate) fn receive(from: u32, d: &[u8]) {
 }
 
 fn on_announce(from: u32, d: &[u8]) {
-    let have = jobs();
-    let mut downloads = DOWNLOADS.lock().unwrap();
+    let have: Vec<(String, Kind, [u8; 8])> =
+        library().as_ref().unwrap().iter().map(|j| (j.id.clone(), j.kind, j.hash)).collect();
+    let mut downloads = DOWNLOADS.locked();
     let downloads = downloads.get_or_insert_default();
     for e in d.as_chunks::<34>().0 {
         let Ok(id) = std::str::from_utf8(&e[..22]) else { continue };
@@ -149,12 +159,18 @@ fn on_announce(from: u32, d: &[u8]) {
         if !is_content_id(id) || size == 0 || size > MAX_FILE {
             continue;
         }
-        // The player's own jobs stay its own; a version already here stays.
-        if have.iter().any(|j| j.id == id && (j.kind == Kind::Own || j.hash == hash)) {
+        // The player's own jobs and the game's stay as they are; another
+        // version only of one shared before (a version already here stays).
+        if have.iter().any(|(i, kind, h)| i == id && (*kind != Kind::Shared || *h == hash)) {
             continue;
         }
+        // A few at a time, from each player and in all: each takes room
+        // for its pieces (MBs from announcements alone otherwise).
+        let full = downloads.len() >= DOWNLOADS_AT_ONCE
+            || downloads.values().filter(|d| d.from == from).count() >= DOWNLOADS_PER_PLAYER;
         match downloads.get_mut(id) {
             Some(d) if d.hash == hash => d.heard = Instant::now(),
+            None if full => {}
             _ => {
                 let count = size.div_ceil(PIECE_SIZE);
                 log::info!("jobs: {id} ({size} bytes) from {}", std::net::Ipv4Addr::from(from));
@@ -169,13 +185,35 @@ fn on_announce(from: u32, d: &[u8]) {
 
 fn on_get(from: u32, id: &[u8], hash: &[u8], index: usize) {
     let Ok(id) = std::str::from_utf8(id) else { return };
-    let Some(job) = shareable().into_iter().find(|j| j.id == id && j.hash == hash) else { return };
-    // A file of a few hundred KB at most, read again for each piece: the
-    // disk's cache keeps it.
-    let Ok(data) = std::fs::read(&job.path) else { return };
-    if fingerprint(&data) != job.hash {
+    // Looked up in place: pieces are asked for up to 160 times a second.
+    let Some(path) = library()
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|j| shareable(j) && j.id == id && j.hash == hash)
+        .map(|j| j.path.clone())
+    else {
         return;
-    }
+    };
+    // Read and checked once, then kept while the pieces are asked for (up
+    // to 160 a second per player: reading and hashing the whole file for
+    // each held up the network thread).
+    static SERVING: Mutex<Option<(String, [u8; 8], Arc<Vec<u8>>)>> = Mutex::new(None);
+    let data = {
+        let mut serving = SERVING.locked();
+        match &*serving {
+            Some((i, h, d)) if i == id && h == hash => d.clone(),
+            _ => {
+                let Ok(d) = std::fs::read(&path) else { return };
+                if fingerprint(&d) != hash {
+                    return;
+                }
+                let d = Arc::new(d);
+                *serving = Some((id.to_owned(), hash.try_into().unwrap(), d.clone()));
+                d
+            }
+        }
+    };
     let count = data.len().div_ceil(PIECE_SIZE);
     let Some(piece) = data.chunks(PIECE_SIZE).nth(index) else { return };
     let mut p = vec![PIECE];
@@ -189,7 +227,7 @@ fn on_get(from: u32, id: &[u8], hash: &[u8], index: usize) {
 
 fn on_piece(from: u32, id: &[u8], hash: &[u8], index: usize, count: usize, piece: &[u8]) {
     let Ok(id) = std::str::from_utf8(id) else { return };
-    let mut guard = DOWNLOADS.lock().unwrap();
+    let mut guard = DOWNLOADS.locked();
     let Some(downloads) = guard.as_mut() else { return };
     let Some(d) = downloads.get_mut(id) else { return };
     if d.hash != hash || d.from != from || count != d.pieces.len() || index >= count {
@@ -207,14 +245,41 @@ fn on_piece(from: u32, id: &[u8], hash: &[u8], index: usize, count: usize, piece
         log::warn!("jobs: {id} from {}: not what was announced", std::net::Ipv4Addr::from(from));
         return;
     }
-    let dir = shared_dir();
-    let path = dir.join(format!("{id}.json"));
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &data)) {
+    let path = shared_dir().join(format!("{id}.json"));
+    // Kept only if it is a job.
+    let Some(job) = parse_job(&data, id, Kind::Shared, "", &path) else { return };
+    if let Err(e) = crate::write_file(&path, &data) {
         log::warn!("jobs: saving {}: {e}", path.display());
         return;
     }
-    if let Some(job) = parse_job(&data, id, Kind::Shared, "", &path) {
-        add(job);
+    add(job);
+    make_room();
+}
+
+/// The lobby's jobs kept, at most: anyone in a public lobby can announce
+/// some, one after the other.
+const MAX_SHARED: usize = 256;
+const MAX_SHARED_BYTES: u64 = 64 << 20;
+
+/// Drops the first shared jobs (the oldest added) while there are too many.
+fn make_room() {
+    let mut dropped = Vec::new();
+    {
+        let mut library = library();
+        let jobs = library.as_mut().unwrap();
+        loop {
+            let shared = jobs.iter().filter(|j| j.kind == Kind::Shared);
+            let (count, bytes) = shared.fold((0, 0), |(c, b), j| (c + 1, b + u64::from(j.size)));
+            if count <= MAX_SHARED && bytes <= MAX_SHARED_BYTES {
+                break;
+            }
+            let first = jobs.iter().position(|j| j.kind == Kind::Shared).unwrap();
+            dropped.push(jobs.remove(first));
+        }
+    }
+    for job in dropped {
+        log::info!("jobs: {} \"{}\" dropped (room for newer ones)", job.id, job.name);
+        let _ = std::fs::remove_file(&job.path);
     }
 }
 

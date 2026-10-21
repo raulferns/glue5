@@ -109,6 +109,9 @@ pub struct Vfs {
     game: Option<PathBuf>,
     /// Lowercase path under `game` -> real path, for case-insensitive lookups.
     game_index: HashMap<String, String>,
+    /// The game's files' dates as its manifest lists them, which the engine
+    /// is told rather than the copy's (see `glue5_stream::catalog::game_dates`).
+    game_dates: HashMap<String, (u64, u64)>,
     user: PathBuf,
     scratch: PathBuf,
     fds: Mutex<Vec<Option<Arc<Open>>>>,
@@ -125,9 +128,11 @@ impl Vfs {
         let scratch = user.join("fsroot");
         fs::create_dir_all(&scratch)?;
         let mut game_index = HashMap::new();
+        let mut game_dates = HashMap::new();
         match &game_data {
             Some(game) => {
                 index(game, "", &mut game_index)?;
+                game_dates = glue5_stream::catalog::game_dates(game);
                 log::info!("vfs: /game -> {} ({} entries), /userdata -> {}", game.display(), game_index.len(), user.display());
             }
             None => log::info!("vfs: /game streamed, /userdata -> {}", user.display()),
@@ -138,6 +143,7 @@ impl Vfs {
         Ok(Vfs {
             game: game_data,
             game_index,
+            game_dates,
             user,
             scratch,
             fds: Mutex::new(vec![std_fd(Node::Stdin), std_fd(Node::Stdout), std_fd(Node::Stderr)]),
@@ -147,13 +153,19 @@ impl Vfs {
     /// Maps an absolute engine path to the host.
     pub fn resolve(&self, path: &str) -> Result<Host, Errno> {
         let path = normalize(path);
+        // On Windows a component with a colon (`C:`, `file:stream`) would
+        // leave the roots once joined.
+        if cfg!(windows) && path.contains(':') {
+            return Err(errno::NOENT);
+        }
         if path == "/game" || path.starts_with("/game/") {
             let Some(game) = &self.game else {
                 // The engine's own device serves /game; the browser build had nothing here either.
                 log::warn!("vfs: {path} asked of the file system while the game streams");
                 return Err(errno::NOENT);
             };
-            let rel = path.trim_start_matches("/game").trim_start_matches('/');
+            // (Once: `/game/gameconfig.xml` is `gameconfig.xml`.)
+            let rel = path.strip_prefix("/game").unwrap_or("").trim_start_matches('/');
             if rel.is_empty() {
                 return Ok(Host { path: game.clone(), read_only: true });
             }
@@ -351,8 +363,8 @@ impl Vfs {
     pub fn fstat(&self, fd: i32) -> Result<Stat, Errno> {
         let open = self.get(fd)?;
         match &open.node {
-            Node::File(f) => Ok(stat_of(&f.metadata().map_err(io_errno)?)),
-            Node::Dir(p) => Ok(stat_of(&fs::metadata(p).map_err(io_errno)?)),
+            Node::File(f) => Ok(self.stat_of(&open.path, &f.metadata().map_err(io_errno)?)),
+            Node::Dir(p) => Ok(self.stat_of(&open.path, &fs::metadata(p).map_err(io_errno)?)),
             _ => Ok(Stat { ino: fd as u64, ..DEVICE_STAT }),
         }
     }
@@ -363,7 +375,21 @@ impl Vfs {
         }
         let host = self.resolve(path)?;
         let meta = if follow { fs::metadata(&host.path) } else { fs::symlink_metadata(&host.path) };
-        Ok(stat_of(&meta.map_err(io_errno)?))
+        Ok(self.stat_of(&normalize(path), &meta.map_err(io_errno)?))
+    }
+
+    /// What `stat` reports of the file at engine path `path` (normalized):
+    /// a game file's date as the game's manifest has it.
+    fn stat_of(&self, path: &str, meta: &fs::Metadata) -> Stat {
+        let mut stat = stat_of(meta);
+        if let Some(rel) = path.strip_prefix("/game/")
+            && meta.is_file()
+            && let Some(date) = glue5_stream::catalog::date(&self.game_dates, rel, stat.size)
+        {
+            stat.mtime = UNIX_EPOCH + std::time::Duration::from_secs(date);
+            stat.ctime = stat.mtime;
+        }
+        stat
     }
 
     pub fn mkdir(&self, path: &str) -> Result<(), Errno> {
@@ -372,7 +398,13 @@ impl Vfs {
     }
 
     pub fn unlink(&self, path: &str) -> Result<(), Errno> {
-        fs::remove_file(self.writable(path)?).map_err(io_errno)
+        let host = self.writable(path)?;
+        // A folder is EISDIR, as on Linux (remove() then takes rmdir):
+        // macOS and Windows refuse it with a permission error.
+        if fs::symlink_metadata(&host).is_ok_and(|m| m.is_dir()) {
+            return Err(errno::ISDIR);
+        }
+        fs::remove_file(host).map_err(io_errno)
     }
 
     pub fn rmdir(&self, path: &str) -> Result<(), Errno> {
@@ -548,6 +580,23 @@ fn normalizes() {
     assert_eq!(normalize("/game/./x64//audio/../data"), "/game/x64/data");
     assert_eq!(normalize("\\game\\x64"), "/game/x64");
     assert_eq!(normalize("/.."), "/");
+}
+
+#[test]
+fn game_dates() {
+    let dir = std::env::temp_dir().join(format!("glue5-vfs-dates-{}", std::process::id()));
+    fs::create_dir_all(dir.join("game/x64")).unwrap();
+    fs::write(dir.join("game/manifest.json"), br#"{"files":[["x64/a.rpf",3,1790644442],["b.xml",9,5]]}"#).unwrap();
+    fs::write(dir.join("game/x64/a.rpf"), b"abc").unwrap();
+    fs::write(dir.join("game/b.xml"), b"changed").unwrap();
+    let vfs = Vfs::new(Some(dir.join("game")), dir.join("user")).unwrap();
+    let listed = UNIX_EPOCH + std::time::Duration::from_secs(1790644442);
+    assert_eq!(vfs.stat("/game/X64/A.rpf", true).unwrap().mtime, listed);
+    let fd = vfs.open("/game/x64/a.rpf", 0).unwrap();
+    assert_eq!(vfs.fstat(fd).unwrap().mtime, listed);
+    // Another size than listed: its own date.
+    assert_ne!(epoch(vfs.stat("/game/b.xml", true).unwrap().mtime).0, 5);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

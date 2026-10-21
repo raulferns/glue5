@@ -110,6 +110,9 @@ fn drain(m: Mem, table: u64, client: &Client) {
         // The engine went round the ring: the oldest were overwritten.
         tail = head.wrapping_sub(cap);
     }
+    // Asked for together: one write for a burst (cold starts announce
+    // hundreds at once).
+    let mut hints = Vec::new();
     while tail != head {
         let e = ring + 4 * (tail % cap) as u64;
         let raw = word(e + 3).load(Ordering::Acquire);
@@ -117,11 +120,14 @@ fn drain(m: Mem, table: u64, client: &Client) {
             break;
         }
         let off = word(e + 1).load(Ordering::Relaxed) as u64 | (word(e + 2).load(Ordering::Relaxed) as u64) << 32;
-        client.hint(word(e).load(Ordering::Relaxed), off, (raw & 0x3fff_ffff) as u64, raw & 0x4000_0000 != 0);
+        hints.push((word(e).load(Ordering::Relaxed), off, (raw & 0x3fff_ffff) as u64, raw & 0x4000_0000 != 0));
         word(e + 3).store(0, Ordering::Release);
         tail = tail.wrapping_add(1);
     }
     word(5).store(tail, Ordering::Release);
+    if !hints.is_empty() {
+        client.hints(&hints);
+    }
 }
 
 fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {

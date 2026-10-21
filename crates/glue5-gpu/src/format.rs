@@ -20,6 +20,9 @@ pub enum Upload {
     Direct,
     /// A8_UNORM: one byte per texel, sampled as (0, 0, 0, a); expanded to RGBA8.
     A8,
+    /// R16G16(B16A16)_UNORM on a GPU without 16-bit normalized formats:
+    /// kept as half floats, each value converted (the same 0..1).
+    Unorm16,
     /// BCn blocks decoded on the CPU (the device has no BC compression);
     /// colour re-encoded as ETC2 where the texture's format is compressed.
     Bc(Bc),
@@ -155,7 +158,8 @@ fn native_texture(dxgi: u32, depth: bool, caps: &Caps) -> TexFormat {
     match dxgi {
         2 => fmt(F::Rgba32Float),
         9 | 10 => fmt(F::Rgba16Float),
-        11 => fmt(if norm16 { F::Rgba16Unorm } else { F::Rgba16Float }),
+        11 if norm16 => fmt(F::Rgba16Unorm),
+        11 => TexFormat { format: F::Rgba16Float, view: None, upload: Upload::Unorm16 },
         16 => fmt(F::Rg32Float),
         19 | 20 => fmt(d32s8),
         21 | 22 => fmt(d32s8),
@@ -165,7 +169,8 @@ fn native_texture(dxgi: u32, depth: bool, caps: &Caps) -> TexFormat {
         29 => twin(F::Rgba8UnormSrgb, F::Rgba8Unorm),
         31 => fmt(F::Rgba8Snorm),
         33 | 34 => fmt(F::Rg16Float),
-        35 => fmt(if norm16 { F::Rg16Unorm } else { F::Rg16Float }),
+        35 if norm16 => fmt(F::Rg16Unorm),
+        35 => TexFormat { format: F::Rg16Float, view: None, upload: Upload::Unorm16 },
         39 => fmt(if depth { F::Depth32Float } else { F::R32Float }),
         40 => fmt(F::Depth32Float),
         41 => fmt(F::R32Float),

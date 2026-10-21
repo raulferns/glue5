@@ -15,6 +15,7 @@ mlua = { version = "0.12", features = ["luau"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 httparse = "1"
 getrandom = "0.4"
+flate2 = "1"
 
 [build-dependencies]
 anyhow.workspace = true

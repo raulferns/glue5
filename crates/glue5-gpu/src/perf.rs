@@ -258,7 +258,7 @@ impl GpuTimer {
 /// command buffer `encoder` makes, once the GPU is past it (`encoder` must
 /// have no commands of wgpu's).
 #[cfg(target_vendor = "apple")]
-fn on_done(encoder: &mut wgpu::CommandEncoder, done: impl Fn(f64, f64) + 'static) {
+fn on_done(encoder: &mut wgpu::CommandEncoder, done: impl Fn(f64, f64) + Send + Sync + 'static) {
     use block2::RcBlock;
     use objc2::runtime::ProtocolObject;
     use objc2_metal::MTLCommandBuffer;
@@ -278,7 +278,7 @@ fn on_done(encoder: &mut wgpu::CommandEncoder, done: impl Fn(f64, f64) + 'static
 /// An empty command buffer that calls `done` with its GPU start and end
 /// times (in seconds) once the GPU is past it.
 #[cfg(target_vendor = "apple")]
-pub(crate) fn marker(device: &wgpu::Device, done: impl Fn(f64, f64) + 'static) -> wgpu::CommandBuffer {
+pub(crate) fn marker(device: &wgpu::Device, done: impl Fn(f64, f64) + Send + Sync + 'static) -> wgpu::CommandBuffer {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timing") });
     on_done(&mut encoder, done);
     encoder.finish()

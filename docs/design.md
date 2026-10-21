@@ -374,7 +374,10 @@ shader pair, vertex layout, blend/depth/raster states and target formats, so
 they cannot all be enumerated, and the combinations appear during play.
 Every pipeline the game asks for is recorded
 (`<user dir>/cache/pipelines.jsonl`, with the vertex shader's input
-signature, which places the layout's elements).
+signature, which places the layout's elements). A recipe keeps only what
+its pipeline depends on (the state words it ignores are zeroed): engine
+states that differ elsewhere share one pipeline, about one in eight of the
+seed's.
 
 Before the game starts, Play compiles the known pipelines on every core: the
 app's seed (`crates/glue5-gpu/seed/pipelines.jsonl`, recipes merged from
@@ -400,7 +403,9 @@ Recipes include the program variants the renderer picks for what is bound
 (depth buffers read as textures, everywhere; 32-bit float textures read
 unfiltered, on GPUs that cannot filter them, such as the A15 and most
 Android GPUs). The light and foliage shaders use them, so they are recorded
-and prepared too.
+and prepared too. Compute pipelines are recorded and prepared alike (the
+shader, its variant, the formats of the storage textures bound); a dispatch
+whose pipeline is not ready makes it then, as its results are needed.
 
 Pipelines never recorded still compile in the background during play: a
 draw whose pipeline is not ready is skipped for that frame instead of
@@ -525,7 +530,10 @@ The present step scales the back buffer with one of four upscalers (Settings
 | FSR 2 (AMD, through sp-fidelity) | GPUs with the features it needs | the same as MetalFX Temporal |
 
 Upscalers run on the submit thread, on the same queue, after the game's
-commands and before the present pass, which draws their result 1:1. MetalFX
+commands and before the present pass, which draws their result 1:1. The
+game's commands and the upscaler's are submitted before the window's next
+image is taken: waiting for one does not hold the frame back from the GPU,
+and the present pass, drawing into it, is a submission of its own. MetalFX
 has command buffers of its own because wgpu does not let raw Metal commands
 share its encoder; FSR is wgpu compute passes. Upscalers are made for one
 input and one output size; while the sizes change (a window being resized)
@@ -715,8 +723,18 @@ prompts, aim assist and menu behaviour:
 ## Mods
 
 Mods are Luau scripts (`crates/glue5-mods`) that call the game's script
-commands (natives). Each mod is a folder in the user directory's `mods`
-with a `main.luau` and an optional `mod.json` (`{"autostart": true}`).
+commands (natives). Each mod is a folder in the mods folder with a
+`main.luau` and an optional `mod.json`: its name as shown, description,
+author, version, whether it starts with the game and restarts when a
+file is saved. The Studio shows mod.json as the mod's page, not as a
+file. The mods folder is the user directory's `mods` on computers and
+beside the game's folder on phones (`Documents/mods` on iOS, where the
+Files app reaches it); one from before is moved there.
+
+The Studio exports a mod as a .zip (its files, not what it stored) and
+imports one (its files at the top or in one folder, with a main.luau;
+a name taken gets `-2`); an imported mod does not start with the game
+until the player says so.
 
 The Mods page holds them: the start page's Mods button, Settings › Game ›
 Mods, F7 in the game, and on touch screens a button beside the settings
@@ -853,7 +871,14 @@ playing.
   - mods' script threads get stacks of their own (gameconfig.xml's MICRO
     stacks, 20 → 52);
   - when the game stops working, the failure names the mod and the native
-    that ran, and that mod does not start by itself next time.
+    that ran, and that mod does not start by itself next time;
+  - a panic in GLUE 5's code for a mod (a callback, a conversion) is
+    caught in the WAIT hook: that mod stops with an error, the game goes
+    on (a panic crossing into the engine would abort it); the Studio's
+    threads may panic without stopping the game either;
+  - a frame gives all the mods together 4 ms, each at most 2 ms (its main
+    code and tasks share it, taking turns going first); a mod that finds
+    the budget spent goes first in the next frame.
 
 ### GLUE 5 Studio
 
@@ -909,11 +934,20 @@ whose own browser is no place to write mods).
   `~console/input.luau`): highlighting and completions as in a file.
 - Files written by any client reach open editors (a WebSocket message),
   changing only what differs (the cursor stays); a tab with unsaved
-  changes keeps them and says so. Saving can restart the mod.
-- When the game starts again its code changes: the page asks for the new
-  one and keeps its editor, tabs and history; nothing retries the old
-  code meanwhile (the server takes no code for a minute after ten wrong
-  ones).
+  changes keeps them and says so. Saving a .luau file restarts its
+  running mod when its page says so (restartOnSave, on by default),
+  whoever saves it: the Studio or an agent's write_file, which then
+  answers with the new run's first log lines. Each run of a mod owns
+  its menus, so the old run's going does not take the new run's.
+- The pairing code is kept in the settings: a browser (and Claude Code's
+  MCP entry) paired once stays paired when the game starts again; the
+  Mods page makes a new one, which also closes the connections made with
+  the old one. A page that loses the game retries on its own; it asks
+  for a code only when the server says its code is wrong (`/check`),
+  and keeps its editor, tabs and history. A wrong code costs its
+  connection a second (no lockout that a page elsewhere could trigger);
+  bodies are read only from whoever has the code, a few connections at
+  a time.
 - Luau's indentation in the editor: a line leaving blocks or brackets
   open adds a level, however many (`f(x, function()` ... `end)`), and
   if-expressions open none.
@@ -1000,10 +1034,13 @@ whose own browser is no place to write mods).
   by a test (`cargo test -r -p glue5-gpu -- --ignored`). Doing it on the
   parsed module and handing wgpu the IR would be sturdier against a new
   game build's shaders.
-- **macOS app bundle**: the desktop build is a bare executable. As a
-  `.app` with `LSApplicationCategoryType = public.app-category.games` it
-  would get Game Mode in full screen (iOS has it already, through the same
-  key and `GCSupportsGameMode`), and could be signed and notarized for
-  distribution.
+- **Give freed wasm memory back to the system.** The wasm memory is only
+  reserved (16 GiB of address space); its pages count once the engine
+  writes them, and then for good: wasm has no `munmap` or `madvise`, so
+  memory the engine frees stays in the footprint. Hooks on
+  `rage::sysMemGrowBuddyAllocator::Free` and on large frees of the game's
+  malloc could hand whole freed pages back (`MADV_FREE_REUSABLE` on Apple
+  platforms, `MADV_DONTNEED` elsewhere): a resource heap grown past its
+  budget keeps up to 256 MB touched but free.
 
 [egui]: https://github.com/emilk/egui

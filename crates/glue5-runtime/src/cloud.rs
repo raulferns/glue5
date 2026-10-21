@@ -160,6 +160,8 @@ fn file(path: &str) -> PathBuf {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') { c } else { '_' })
         .collect();
+    // Not the folder itself or the one above it.
+    let name = if name.bytes().all(|c| c == b'.') { format!("_{name}") } else { name };
     crate::rt().config.user_dir.join("cloud").join(name)
 }
 
@@ -195,8 +197,7 @@ pub(crate) unsafe extern "C" fn post_member_file(
     let m = unsafe { Mem::of(env) };
     let name = m.str(path);
     let to = file(&name);
-    let written =
-        std::fs::create_dir_all(to.parent().unwrap()).and_then(|()| std::fs::write(&to, m.bytes(data, size as usize)));
+    let written = crate::write_file(&to, m.bytes(data, size as usize));
     match written {
         Ok(()) => {
             log::info!("cloud: saved {name} ({size} bytes)");
@@ -239,6 +240,13 @@ pub(crate) unsafe extern "C" fn get_member_file(
         Ok(data) if device == GROW_BUFFER_DEVICE => data,
         Ok(_) => {
             log::warn!("cloud: {name} asked for into device {device:#x}");
+            finish(m, status, NET_STATUS_FAILED);
+            return 1;
+        }
+        // Only a file that is not there is a new character: one that could
+        // not be read must not be replaced by one.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log::error!("cloud: reading {name}: {e}");
             finish(m, status, NET_STATUS_FAILED);
             return 1;
         }

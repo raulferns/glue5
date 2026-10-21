@@ -36,11 +36,14 @@ pub struct Checker {
 unsafe impl Send for Checker {}
 
 static CHECKER: Mutex<Option<Checker>> = Mutex::new(None);
+/// When it was last used.
+static USED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 impl Checker {
     /// Runs `f` with the checker, made the first time.
     pub fn with<R>(f: impl FnOnce(&mut Checker) -> R) -> Result<R, String> {
-        let mut slot = CHECKER.lock().unwrap();
+        *crate::lock(&USED) = Some(std::time::Instant::now());
+        let mut slot = crate::lock(&CHECKER);
         if slot.is_none() {
             let (started, before) = (std::time::Instant::now(), glue5_runtime::memory::footprint().0);
             *slot = Some(Checker::new()?);
@@ -55,9 +58,25 @@ impl Checker {
         Ok(f(slot.as_mut().unwrap()))
     }
 
+    /// The file `name` is gone (deleted, renamed): out of the checker, if
+    /// there is one (a `require` of it no longer checks).
+    pub fn forget(name: &str) {
+        if let Some(c) = crate::lock(&CHECKER).as_mut() {
+            c.set(name, None);
+        }
+    }
+
+    /// Drops the checker when it has not been used for `idle` (for users
+    /// that do not say when they are done: coding agents over MCP).
+    pub fn release_if_idle(idle: std::time::Duration) {
+        if crate::lock(&USED).is_some_and(|t| t.elapsed() >= idle) {
+            Self::release();
+        }
+    }
+
     /// Drops the checker and its memory.
     pub fn release() {
-        CHECKER.lock().unwrap().take();
+        crate::lock(&CHECKER).take();
     }
 
     fn new() -> Result<Checker, String> {

@@ -43,7 +43,7 @@ guard() {
         release=$(gh api "repos/$repo/releases/$id")
         [ "$(jq -r .draft <<<"$release")" = false ] || continue
         jq -e "any(.assets[]; $private)" <<<"$release" >/dev/null || continue
-        name=$(jq -r '.name // .tag_name' <<<"$release")
+        name=$(jq -r 'if (.name // "") != "" then .name else .tag_name end' <<<"$release")
         failed=1
         if gh api -X PATCH "repos/$repo/releases/$id" -F draft=true >/dev/null; then
             echo "::error::Release \"$name\" was published with the game's code or an app built from it: it is a draft again. Keep it a draft: published, anyone can download its files."
@@ -56,6 +56,11 @@ guard() {
             gh api -X DELETE "repos/$repo/releases/assets/$asset" ||
                 { gh api -X DELETE "repos/$repo/releases/$id" && break; }
         done
+        # Without the rights for either (a token limited by the account's
+        # settings), only its owner can.
+        if gh api "repos/$repo/releases/$id" 2>/dev/null | jq -e "(.draft | not) and any(.assets[]; $private)" >/dev/null; then
+            echo "::error::Release \"$name\" is still published with the game's code: delete it now (Releases, the release, Delete)."
+        fi
     done
     return $failed
 }

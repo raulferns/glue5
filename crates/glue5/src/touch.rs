@@ -1246,8 +1246,20 @@ impl Touch {
                     self.tapped = Some(from);
                 }
                 Some(Drag::Hold) => self.click = None,
-                Some(Drag::Scroll | Drag::Swipe | Drag::Two) => {}
+                // The pinch ends with either finger.
+                Some(Drag::Two) => self.two = None,
+                Some(Drag::Scroll | Drag::Swipe) => {}
             },
+            _ => {}
+        }
+    }
+
+    /// The system took finger `id` (an edge gesture, a call, the app going
+    /// away): it lets go of what it held, without the click a lift makes.
+    pub fn finger_cancel(&mut self, id: u64) {
+        match self.fingers.remove(&id) {
+            Some(Finger::Pinch(_) | Finger::Mouse { drag: Some(Drag::Two), .. }) => self.two = None,
+            Some(Finger::Mouse { drag: Some(Drag::Hold), .. }) => self.click = None,
             _ => {}
         }
     }

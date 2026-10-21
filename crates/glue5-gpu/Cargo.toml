@@ -14,6 +14,8 @@ arrayvec = "0.7"
 bcdec_rs = "0.2"
 ctt-etcpak = "0.6"
 bytemuck = "1"
+# 16-bit normalized texels kept as half floats where the GPU lacks the former.
+half = "2"
 # Shader text kept compressed (see shader::Wgsl).
 lz4_flex = "0.11"
 # AMD FSR 2 upscaler, ported to Rust and WGSL, with a wgpu backend.
@@ -39,5 +41,4 @@ objc2-metal-fx = { version = "0.3", default-features = false, features = ["std",
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-metal", "CALayer", "CAMetalLayer"] }
 
 [dev-dependencies]
-half = "2"
 naga = { version = "30", features = ["wgsl-in"] }

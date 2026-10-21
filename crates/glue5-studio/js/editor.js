@@ -13,7 +13,7 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import {
   StreamLanguage, HighlightStyle, syntaxHighlighting, bracketMatching, indentOnInput, indentUnit,
 } from "@codemirror/language";
-import { closeBrackets, closeBracketsKeymap, completionKeymap, completionStatus } from "@codemirror/autocomplete";
+import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, completionStatus } from "@codemirror/autocomplete";
 import { lintGutter, lintKeymap, forEachDiagnostic } from "@codemirror/lint";
 import { searchKeymap, highlightSelectionMatches, search } from "@codemirror/search";
 import { LSPClient, languageServerExtensions } from "@codemirror/lsp-client";
@@ -204,12 +204,19 @@ const theme = EditorView.theme({
   ".cm-matchingBracket": { backgroundColor: "rgba(255,255,255,0.12)", outline: "none" },
   // No overflow clipping here: the completion's notes open beside the list.
   ".cm-tooltip": { backgroundColor: "#151619", border: "1px solid #4c4c4c", borderRadius: "10px", boxShadow: "0 14px 40px rgba(0,0,0,.5)" },
-  ".cm-tooltip-autocomplete > ul": { fontFamily: "var(--mono)", maxHeight: "16em", borderRadius: "9px" },
-  ".cm-tooltip-autocomplete > ul > li": { padding: "4px 10px !important", lineHeight: "1.5" },
+  // As specific as CodeMirror's own, or its widths win.
+  ".cm-tooltip.cm-tooltip-autocomplete > ul": { fontFamily: "var(--mono)", maxHeight: "16em", borderRadius: "9px", maxWidth: "min(520px, 92vw)" },
+  // A long signature is cut here; the details show it whole.
+  ".cm-tooltip-autocomplete .cm-completionLabel": { flex: "none" },
+  ".cm-tooltip-autocomplete .cm-completionDetail": { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  ".cm-tooltip.cm-completionInfo.cm-completionInfo-under": { left: "0" },
+  ".cm-tooltip.cm-completionInfo.cm-completionInfo-right": { marginLeft: "4px" },
+  ".cm-tooltip.cm-completionInfo.cm-completionInfo-left": { marginRight: "4px" },
+  ".cm-tooltip-autocomplete > ul > li": { display: "flex", alignItems: "baseline", padding: "4px 10px !important", lineHeight: "1.5" },
   ".cm-tooltip-autocomplete > ul > li[aria-selected]": { backgroundColor: "rgba(255,255,255,0.10)", color: "#fff" },
   ".cm-completionDetail": { color: "#6b6f76", fontStyle: "normal", marginLeft: "1em" },
   ".cm-tooltip.cm-completionInfo": {
-    padding: "10px 12px", maxWidth: "420px", fontFamily: "var(--ui)", color: "#9da0a6",
+    padding: "10px 12px", maxWidth: "420px", overflowY: "auto", boxSizing: "border-box", fontFamily: "var(--ui)", color: "#9da0a6",
     backgroundColor: "#151619", border: "1px solid #4c4c4c", borderRadius: "10px", boxShadow: "0 14px 40px rgba(0,0,0,.5)",
   },
   ".cm-completionMatchedText": { textDecoration: "none", color: "#fff", fontWeight: "700" },
@@ -264,6 +271,33 @@ const phrases = EditorState.phrases.of({
   "match case": "Match case", "regexp": "Regex", "by word": "Whole word", "replace": "Replace",
   "replace all": "Replace all", "close": "Close",
 });
+
+// The completion's details beside the list, as VS Code has them: from the
+// list's top, as tall as it, scrolling on their own; never over the list
+// (CodeMirror puts them under the chosen option, over the rest, when the
+// side has no room). Without room on either side, under the whole list.
+function infoBeside(view, list, option, info, space, tooltip) {
+  const scaleY = (list.bottom - list.top) / tooltip.offsetHeight || 1;
+  const scaleX = (list.right - list.left) / tooltip.offsetWidth || 1;
+  const spaceLeft = list.left - space.left, spaceRight = space.right - list.right;
+  const right = spaceRight >= Math.min(420, spaceLeft);
+  const width = Math.min(420, (right ? spaceRight : spaceLeft) - 6);
+  const height = Math.max(list.bottom - list.top, 180);
+  if (width >= 240) {
+    return {
+      style: `top: 0; width: ${width / scaleX}px; max-height: ${height / scaleY}px`,
+      class: "cm-completionInfo-" + (right ? "right" : "left"),
+    };
+  }
+  const below = space.bottom - list.bottom >= 140 || space.bottom - list.bottom > list.top - space.top;
+  const room = below ? space.bottom - list.bottom : list.top - space.top;
+  return {
+    style: `${below ? "top" : "bottom"}: ${(list.bottom - list.top) / scaleY + 4}px; width: ${Math.min(420, space.right - list.left - 8) / scaleX}px; max-height: ${Math.max(room - 8, 100) / scaleY}px`,
+    class: "cm-completionInfo-under",
+  };
+}
+
+const completion = autocompletion({ positionInfo: infoBeside });
 
 // ---- The language server ------------------------------------------------
 
@@ -342,10 +376,12 @@ export class StudioEditor {
       highlightSelectionMatches(), indentUnit.of("    "), EditorState.tabSize.of(4), lintGutter(),
       // Over the page: the panes' edges would clip them.
       tooltips({ parent: document.body }),
+      completion,
       isJson ? json : luau, syntaxHighlighting(highlight), theme, search({ top: true }), phrases,
       this.readOnly.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),
       keymap.of([
-        { key: "Mod-s", preventDefault: true, run: () => { this.saveHandler(path); return true; } },
+        // Save: a file's, not the read-only definitions'.
+        { key: "Mod-s", preventDefault: true, run: () => { if (!readOnly) this.saveHandler(path); return true; } },
         ...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap,
         ...lintKeymap, indentWithTab,
       ]),
@@ -397,8 +433,11 @@ export class StudioEditor {
         extensions: [
           history(), drawSelection(), closeBrackets(), bracketMatching(), luau, syntaxHighlighting(highlight), theme,
           Prec.highest(replTheme),
+          // A long line goes on below, not off the side (a phone's prompt is narrow).
+          EditorView.lineWrapping,
           // Over the page: the panel's blur would clip them.
           tooltips({ parent: document.body }),
+          completion,
           Prec.highest(keymap.of([
             ...completionKeymap,
             { key: "Enter", run },
@@ -444,7 +483,12 @@ export class StudioEditor {
 
   // Shows `path` (made from `text` the first time).
   open(path, text, readOnly) {
-    if (this.current && this.files.has(this.current)) this.files.get(this.current).state = this.view.state;
+    if (this.current && this.files.has(this.current)) {
+      const was = this.files.get(this.current);
+      was.state = this.view.state;
+      // Where it was scrolled to, for when it shows again.
+      was.scroll = this.view.scrollSnapshot();
+    }
     let file = this.files.get(path);
     if (!file) {
       file = { state: EditorState.create({ doc: text, extensions: this.extensions(path, readOnly) }), saved: text, diagnostics: "" };
@@ -452,6 +496,7 @@ export class StudioEditor {
     }
     this.current = path;
     this.view.setState(file.state);
+    if (file.scroll) this.view.dispatch({ effects: file.scroll });
     const head = file.state.selection.main.head, line = file.state.doc.lineAt(head);
     this.cursorHandler(line.number, head - line.from + 1);
   }
@@ -491,6 +536,8 @@ export class StudioEditor {
     if (!file) return;
     const state = this.stateOf(path);
     const old = state.doc.toString();
+    // Typed into since the reload was asked for: that stays (it was dirty).
+    if (old !== file.saved) return;
     file.saved = text;
     if (old !== text) {
       let from = 0;

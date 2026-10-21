@@ -27,7 +27,8 @@ pub fn mangle(name: &str, double_underscores: bool) -> String {
         state = match state {
             State::Any | State::ZeroXHexDigit if ch == b'0' => State::Zero,
             State::Zero if ch == b'x' => State::ZeroX,
-            State::ZeroX if ch.is_ascii_hexdigit() => State::ZeroXHexDigit,
+            // wabt's hex digits are capitals only: "0xff" stays as it is.
+            State::ZeroX if ch.is_ascii_digit() || (b'A'..=b'F').contains(&ch) => State::ZeroXHexDigit,
             _ => State::Any,
         };
         let escape = state == State::ZeroXHexDigit
@@ -55,4 +56,6 @@ fn matches_wasm2c() {
     assert_eq!(game_symbol("rage::ioPad::Update(bool)"), "w2c_game_rage0x3A0x3AioPad0x3A0x3AUpdate0x28bool0x29");
     assert_eq!(import_symbol("wasi_snapshot_preview1", "fd_write"), "w2c_wasi__snapshot__preview1_fd_write");
     assert_eq!(import_symbol("env", "__syscall_openat"), "w2c_env_0x5F_syscall_openat");
+    assert_eq!(game_symbol("f0xab"), "w2c_game_f0xab");
+    assert_eq!(game_symbol("f0xAB"), "w2c_game_f0x0x41B");
 }

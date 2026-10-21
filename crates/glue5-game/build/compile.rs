@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 use std::{fs, thread};
 
 use anyhow::{Context, Result, bail};
@@ -50,7 +51,29 @@ pub fn compile(
     if let Some(e) = error.into_inner().unwrap() {
         return Err(e);
     }
+    prune(cache);
     Ok(objects.into_inner().unwrap())
+}
+
+/// Objects no build has used for a while go (each hit marks its object as
+/// used; archives hold copies, so the worst a prune does is a recompile),
+/// with what interrupted compiles left.
+fn prune(cache: &Path) {
+    const UNUSED: Duration = Duration::from_secs(14 * 24 * 3600);
+    const LEFT: Duration = Duration::from_secs(3600);
+    let Ok(entries) = fs::read_dir(cache) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let age = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        let stale = if name.ends_with(".o") {
+            age.is_some_and(|a| a > UNUSED)
+        } else {
+            (name.contains(".o.tmp") || name.ends_with(".c")) && age.is_some_and(|a| a > LEFT)
+        };
+        if stale {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 fn compile_one(tool: &cc::Tool, base_key: &str, src: &Path, cache: &Path) -> Result<PathBuf> {
@@ -63,18 +86,29 @@ fn compile_one(tool: &cc::Tool, base_key: &str, src: &Path, cache: &Path) -> Res
     let name = digest.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>();
     let obj = cache.join(format!("{name}.o"));
     if obj.exists() {
+        // Used: kept by the prune.
+        let _ = fs::File::options().write(true).open(&obj).and_then(|f| f.set_modified(SystemTime::now()));
         return Ok(obj);
     }
     let tmp = cache.join(format!("{name}.o.tmp{}", std::process::id()));
+    // Compiled from a copy of the very text hashed: the source may be
+    // rewritten meanwhile by another build sharing it (the generated files
+    // are shared), whose object would then be kept under this text's key
+    // for good. Its includes are all found through the include paths.
+    let copy = cache.join(format!("{name}.{}.c", std::process::id()));
+    fs::write(&copy, &text)?;
     let mut cmd: Command = tool.to_command();
-    cmd.arg("-c").arg(src);
+    cmd.arg("-c").arg(&copy);
     if tool.is_like_msvc() {
         cmd.arg(format!("-Fo{}", tmp.display()));
     } else {
         cmd.arg("-o").arg(&tmp);
     }
-    let output = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+    let output = cmd.output().with_context(|| format!("running {cmd:?}"));
+    let _ = fs::remove_file(&copy);
+    let output = output?;
     if !output.status.success() {
+        let _ = fs::remove_file(&tmp);
         bail!("compiling {} failed:\n{}", src.display(), String::from_utf8_lossy(&output.stderr));
     }
     fs::rename(&tmp, &obj)?;

@@ -91,6 +91,20 @@ impl Tex {
             p.dirty = true;
         }
     }
+
+    /// A pass writes these aspects of it (a depth target): the copies of
+    /// the others stay good (a pass with depth read-only redid its copy at
+    /// every draw that read it, breaking the pass each time).
+    pub fn mark_aspects_written(&mut self, depth: bool, stencil: bool) {
+        // Proxies: depth as float, stencil as uint, float as depth.
+        for (p, written) in self.proxies.iter_mut().zip([depth, stencil, true]) {
+            if let Some(p) = p
+                && written
+            {
+                p.dirty = true;
+            }
+        }
+    }
 }
 
 pub struct Buf {
@@ -114,6 +128,9 @@ pub struct Buf {
     pub used: Cell<u64>,
     pub uploaded: Cell<u64>,
     pub in_bind_group: Cell<bool>,
+    /// A constant buffer's copy for the stages that bind it on their own
+    /// (`shader::Pack::own`): (frame, version, first constant, size, where).
+    pub constants: Cell<Option<(u64, u32, u32, u32, crate::uniforms::Alloc)>>,
     /// The UAV counter of append/consume buffers.
     pub counter: Option<wgpu::Buffer>,
 }

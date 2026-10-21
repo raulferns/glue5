@@ -16,8 +16,10 @@ pub const GUIDE: &str = r#"# GLUE 5 mods
 
 A mod is a folder in the mods folder: `main.luau` runs when the mod starts,
 other `.luau` files load with `require("./name")`, and `mod.json`, if there
-is one, is a JSON object: `{"autostart": true}` starts the mod with the game
-(false or no mod.json: started by hand). Mods are Luau (typed Lua); start
+is one, says what the mod is (the Studio shows it as the mod's page):
+`{"name": "Trainer", "description": "...", "author": "...", "version":
+"1.0", "autostart": false, "restartOnSave": true}`, every key optional;
+`autostart` starts it with the game. Mods are Luau (typed Lua); start
 files with `--!strict` to have every type checked.
 
 ## Running
@@ -114,7 +116,12 @@ pub fn mods() -> Value {
                     "waiting": m.waiting,
                     "cpuMs": (m.cpu_ms * 100.0).round() / 100.0,
                     "memory": m.memory,
-                    "autostart": m.autostart,
+                    "autostart": m.info.autostart,
+                    "title": m.info.title,
+                    "description": m.info.description,
+                    "author": m.info.author,
+                    "version": m.info.version,
+                    "restartOnSave": m.info.restart_on_save,
                     "files": files::list(&m.name),
                 })
             })
@@ -183,7 +190,14 @@ pub fn menu_input(module: &str, item: u32, value: &Value) -> Result<(), String> 
 }
 
 /// What mod.json may hold, and of which JSON type.
-const MOD_JSON_KEYS: &[(&str, &str)] = &[("autostart", "true or false")];
+const MOD_JSON_KEYS: &[(&str, &str)] = &[
+    ("name", "text"),
+    ("description", "text"),
+    ("author", "text"),
+    ("version", "text"),
+    ("autostart", "true or false"),
+    ("restartOnSave", "true or false"),
+];
 
 /// Diagnostics of a mod.json (`text`, or as saved): JSON, an object, the
 /// keys it knows with values of their type.
@@ -217,6 +231,9 @@ fn mod_json(path: &str, text: Option<&str>) -> Value {
             Some((_, "true or false")) if !value.is_boolean() => {
                 out.push(diag(line, col, len, "error", format!("{key} is true or false")));
             }
+            Some((_, "text")) if !value.is_string() => {
+                out.push(diag(line, col, len, "error", format!("{key} is text, in quotes")));
+            }
             Some(_) => {}
             None => {
                 let known: Vec<&str> = MOD_JSON_KEYS.iter().map(|(k, _)| *k).collect();
@@ -232,10 +249,11 @@ fn mod_json(path: &str, text: Option<&str>) -> Value {
 /// disk when the checker has not got them.
 pub fn diagnostics(path: &str, text: Option<&str>) -> Value {
     let module = path.trim_start_matches('/');
-    if module.ends_with(".json") {
+    if module.ends_with("/mod.json") {
         return mod_json(module, text);
     }
     if !module.ends_with(".luau") {
+        // Other files are the mod's own business.
         return json!([]);
     }
     let result = Checker::with(|c| {

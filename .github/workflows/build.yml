@@ -66,14 +66,24 @@ jobs:
           cache_key_prefix: mise-${{ inputs.platform }}
 
       # The APK's key, kept in the draft: an update signed with another one
-      # would have to replace the app, and that deletes its game folder.
+      # would have to replace the app, and that deletes its game folder. The
+      # first build makes it: Gradle does not, on the runner. Gradle reads
+      # it from ANDROID_USER_HOME.
       - name: Android signing key
         if: inputs.platform == 'android'
         run: |
           yes | mise exec -- sdkmanager --licenses >/dev/null || true
           mkdir -p ~/.android
+          echo "ANDROID_USER_HOME=$HOME/.android" >>"$GITHUB_ENV"
           cd ~/.android && "$GITHUB_WORKSPACE/.github/scripts/draft.sh" get "${{ steps.game.outputs.release }}" Glue5-android.keystore
-          if [ -f Glue5-android.keystore ]; then mv Glue5-android.keystore debug.keystore; fi
+          if [ -f Glue5-android.keystore ]; then
+              mv Glue5-android.keystore debug.keystore
+          else
+              # Android's own debug key, as Gradle would make it.
+              mise -C "$GITHUB_WORKSPACE" exec -- keytool -genkeypair -noprompt -keystore debug.keystore \
+                  -storepass android -keypass android -alias androiddebugkey \
+                  -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
       - name: Build
         run: |

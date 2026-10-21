@@ -91,6 +91,9 @@ struct Args {
     /// for this device only.
     #[arg(long, value_name = "PORT", requires = "mods")]
     studio: Option<u16>,
+    /// With --studio: its pairing code (8 characters; default: a new one).
+    #[arg(long, value_name = "CODE", requires = "studio")]
+    studio_code: Option<String>,
     /// Saves, settings and the pipeline cache (default: glue5-headless in
     /// the temporary directory).
     #[arg(long, value_name = "DIR")]
@@ -238,7 +241,7 @@ fn main() -> Result<()> {
     }
     let _studio = match args.studio {
         Some(port) => {
-            let studio = glue5_mods::studio::Studio::start(port, false)?;
+            let studio = glue5_mods::studio::Studio::start(port, false, args.studio_code.as_deref().unwrap_or(""))?;
             log::info!("studio: {} (code {})", studio.url("127.0.0.1"), studio.pairing_code());
             Some(studio)
         }
@@ -339,6 +342,11 @@ fn command(line: &str, t: f64, game: &Game, presses: &mut Vec<(f64, u16)>, keys:
             let (w, h) = size.split_once('x').context("size <width>x<height>")?;
             game.input().context("no input yet")?.resize(w.parse()?, h.parse()?);
         }
+        // The window's focus, as the app gives it (with the game's "pause on
+        // focus loss" the engine pauses without it).
+        ["focus", on @ ("on" | "off")] => game.input().context("no input yet")?.focus(on == "on"),
+        // The system's low-memory event, as the app gets it.
+        ["low-memory"] => glue5_gpu::trim(),
         ["friends", ..] => friends(&line.split_whitespace().collect::<Vec<_>>()[1..])?,
         ["mods", "list"] => log::info!("mods: {:?}", glue5_mods::mods()),
         ["mods", "start", name] => glue5_mods::start(name),
@@ -357,7 +365,8 @@ fn command(line: &str, t: f64, game: &Game, presses: &mut Vec<(f64, u16)>, keys:
         }
         _ => bail!(
             "expected `press <button>`, `key <key>`, `hold <key> <s>`, `text <text>`, `size <w>x<h>` or \
-             `friends code|ask <code>|accept|list|join|invite|play|add <name>` or `mods list|start|stop|menus|input`"
+             `friends code|ask <code>|accept|list|join|invite|play|add <name>`, `focus on|off`, `low-memory` or \
+             `mods list|start|stop|menus|input`"
         ),
     }
     Ok(())

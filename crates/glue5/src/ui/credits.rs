@@ -59,7 +59,7 @@ pub(super) fn credits_page(ctx: &egui::Context) -> bool {
                     ui,
                     "GTA V's WebAssembly build as a native application for phones, tablets and computers: \
                      the game's code recompiled for this device, with its graphics, sound, controls and \
-                     online play. Free software, under the MIT or Apache-2.0 license.",
+                     online play. Free software, under the GNU General Public License, version 3 or later.",
                 );
             });
         text(

@@ -1,411 +1,173 @@
 <p align="center">
-  <img src="docs/assets/glue5-logo.png" alt="Glue 5 logo" width="160" height="160">
-</p>
-
-<h1 align="center">Glue 5</h1>
-
-Glue 5 is a recompilation toolchain and native compatibility layer for
-GTA V's WebAssembly build. It turns user-supplied game code into a native
-application and connects it to the device's graphics, audio, storage and
-controls. The game runs locally on iOS and macOS. Phones, tablets and
-computers share the same code base; more platforms are planned.
-
-The game's code is compiled for the target device when you build the app.
-It runs without just-in-time (JIT) compilation. Its files are read from a
-folder on the device, or streamed from a computer that has them.
-Improvements to the shared runtime benefit both mobile and desktop builds.
-
-**This project provides only the recompilation tools and compatibility
-layer. It does not include or distribute ANY GTA V assets or game binaries.**
-Users must supply the required files from the supported **WebAssembly
-(WASM) version of the game**: `game.wasm` at build time, and the prepared
-game assets and translated shaders at run time. Files from a regular PC
-or console installation alone are not sufficient.
-
-`game.wasm` is translated to C with [wasm2c] at build time, compiled with the
-platform's C compiler and linked into a Rust host that provides the
-Emscripten/WASI imports, threads, file access, input, audio and GPU support.
-
-**Status:** the story mode runs on macOS and iOS devices (wgpu on Metal,
-with sound); keyboard, mouse, gamepads and touch controls work. The
-Android app builds (wgpu on Vulkan); it has not run on a device yet. The
-Linux build and AppImage (wgpu on Vulkan, X11 and Wayland) are set up but
-not yet built or run.
-
-See [design.md](docs/design.md) for architecture, tradeoffs and known limits.
-
-<p align="center">
-  <img src="docs/screenshots/ios-gameplay.png" alt="GTA V running in Glue 5 on iOS, driving through Los Santos with on-screen touch controls" width="100%">
+  <img src="docs/images/hero.webp" alt="GLUE 5: GTA V on an iPhone, an Android phone, a MacBook Pro and an iPad" width="100%">
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/ios-launcher.jpg" alt="Glue 5 start page on iOS with Play, Settings and Find Files buttons and game files ready" width="100%">
+  <b>GTA V, running natively on your iPhone, iPad, Mac, Android phone and PC.</b><br>
+  A recompiler and runtime for the game's WebAssembly build: no emulator, no JIT, nothing rendered in the cloud.
 </p>
 
-## Layout
+<p align="center">
+  <img src="https://img.shields.io/badge/iOS-000000?style=for-the-badge&amp;logo=apple&amp;logoColor=white" alt="iOS">
+  <img src="https://img.shields.io/badge/iPadOS-000000?style=for-the-badge&amp;logo=apple&amp;logoColor=white" alt="iPadOS">
+  <img src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&amp;logo=apple&amp;logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/tvOS-000000?style=for-the-badge&amp;logo=appletv&amp;logoColor=white" alt="tvOS">
+  <img src="https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&amp;logo=android&amp;logoColor=white" alt="Android">
+  <img src="https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&amp;logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCc%2BPHBhdGggZmlsbD0nd2hpdGUnIGQ9J00wIDBoMTEuNHYxMS40SDB6TTEyLjYgMEgyNHYxMS40SDEyLjZ6TTAgMTIuNmgxMS40VjI0SDB6TTEyLjYgMTIuNkgyNFYyNEgxMi42eicvPjwvc3ZnPg%3D%3D" alt="Windows">
+  <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&amp;logo=linux&amp;logoColor=black" alt="Linux">
+</p>
 
-| Path | What |
-|---|---|
-| `crates/glue5-game` | The game module. Its build script verifies `game.wasm`, runs wasm2c, applies hooks and compiles the C. |
-| `crates/glue5-runtime` | Host runtime: Emscripten/WASI imports, threads, VFS, input, audio output, the GPU command ring (and a null backend). |
-| `crates/glue5-gpu` | The renderer: executes the engine's D3D11-style command ring with wgpu (Metal on Apple platforms, Vulkan elsewhere). |
-| `crates/glue5-stream` | The game's files over the network: `glue5-serve` (a game folder to other devices), the client and its local copy, Bonjour discovery. |
-| `crates/glue5-mods` | Mods: Luau scripts in the game's own script threads, calling its natives; the natives' table and Luau definitions are generated from game.wasm and the natives database. |
-| `crates/glue5-studio` | GLUE 5 Studio, the mods' web IDE the game serves: Leptos (wasm) around CodeMirror, built by glue5-mods. |
-| `crates/glue5` | The application (SDL3), the same on every platform: window, input, audio, settings and touch controls (egui overlay). Its `headless` example runs the game without a window. |
-| `platform/ios` | What iOS needs around it: `main.c`, entitlements, the xcodegen spec. |
-| `platform/tvos` | The same for the Apple TV (so far run in the simulator only). |
-| `platform/android` | The Gradle project around it: manifest, the activity (SDL's, subclassed), the adaptive icon. |
-| `platform/macos` | Extra bundle metadata; cargo-packager configuration lives in `crates/glue5/Cargo.toml`. |
-| `platform/linux` | The container the AppImage is built in (`Dockerfile`). |
-| `.mise` | [mise]: the toolchain (`config.toml`) and the developer tasks (`tasks/`): setup, desktop, iOS, Android and Linux. |
-| `patches` | Our patches to wasm2c, wgpu, wgpu-core, wgpu-hal and sp-fidelity, applied by `mise run setup` ([README](patches/README.md)). |
-| `third_party/wabt` | wasm2c's sources, pinned (a submodule). `third_party/wgpu`, `third_party/wgpu-core`, `third_party/wgpu-hal` and `third_party/sp-fidelity`, the patched crates, are made by setup and not in git. |
+<p align="center">
+  <a href="https://github.com/mempage4k/glue5/stargazers"><img src="https://img.shields.io/github/stars/mempage4k/glue5?style=for-the-badge&amp;logo=github&amp;color=yellow" alt="GitHub stars"></a>
+  <a href="https://github.com/mempage4k/glue5/forks"><img src="https://img.shields.io/github/forks/mempage4k/glue5?style=for-the-badge&amp;logo=github" alt="GitHub forks"></a>
+  <a href="https://github.com/mempage4k/glue5/commits/next"><img src="https://img.shields.io/github/last-commit/mempage4k/glue5/next?style=for-the-badge&amp;logo=github" alt="Last commit"></a>
+  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&amp;logo=rust&amp;logoColor=white" alt="Rust">
+</p>
 
-Symlink your game directory
-(`b/<build>/game.wasm`, `b/<build>/shaders/`, `data/`) to `./game`, or point
-`GLUE5_GAME_DIR` at it. The build checks `game.wasm` against the supported
-build.
+> [!IMPORTANT]
+> GLUE 5 contains **no game files**. It turns files you supply, from GTA V's
+> **WebAssembly build** (`game.wasm`, its translated shaders and its prepared
+> data), into an app for your device. Files from a regular PC or console
+> installation are not enough. GLUE 5 is not affiliated with Rockstar Games
+> or Take-Two Interactive.
 
-## Building
+## Highlights
 
-Requirements: [mise] and a C/C++ compiler; for iOS, Xcode; for Windows
-and Linux, [see below](#windows). mise installs
-Rust, CMake and [xcodegen] (`.mise/config.toml`) on first use, and for
-Android the JDK, Gradle, the SDK's command-line tools and cargo-ndk; the
-Android tasks install the SDK packages they need (platform, build tools,
-NDK: versions in `platform/android/gradle.properties`) with sdkmanager.
+- **Native on every device.** The game's code is compiled ahead of time
+  for your device's CPU and drawn with Metal on Apple devices, Vulkan
+  elsewhere. MetalFX and FSR 2 upscaling, frame generation on Apple
+  silicon, frame pacing matched to the display.
+- **Made for touch and controllers.** An on-screen controller that hides
+  as soon as you pick up a gamepad or a keyboard, haptics, aim assist and
+  the game's own button prompts for whatever you hold.
+- **GTA Online, without servers.** Freemode sessions between GLUE 5
+  players, found automatically on your network and over the Internet.
+  Friends, invites and joins, end-to-end encrypted.
+- **Your files, on every screen.** Keep the game on one computer and
+  stream it to your phone, tablet or Apple TV, or copy it once and play
+  offline.
+- **Mods in Luau, with a Studio.** Write mods in your browser, with every
+  one of the game's 6,000+ native functions typed and documented. Menus
+  that work with touch and controllers. Coding agents can drive it too.
 
-```sh
-mise run play          # the first build compiles ~1 GB of generated C
-```
+## Screenshots
 
-Without a computer set up for it, GitHub Actions can build the app in
-your fork from your own `game.wasm`, which stays private:
-[docs/github-build.md](docs/github-build.md).
-
-Every task first runs `mise run setup`, which prepares wgpu-core, wgpu-hal
-and wasm2c with our patches (only when they change). Run cargo by hand
-through mise too: in a shell with `mise activate`, or `mise exec -- cargo ...`.
-
-Compiled C objects are cached in `target/glue5-tools/objcache`, shared by
-debug and release builds; later builds only recompile what changed.
-
-### Windows
-
-The MSVC toolchain (`x86_64-pc-windows-msvc`): no MinGW or MSYS compiler.
-Besides mise, install:
-
-- Visual Studio Build Tools 2022 or later, with *Desktop development with
-  C++* (MSVC and the Windows SDK): Rust's linker, SDL, wasm2c.
-- LLVM, for `clang-cl` on the `PATH` (e.g. `scoop install llvm`): the
-  game's generated C is compiled with it, against MSVC's headers and
-  runtime. `cl.exe` truncates the engine's longest names. `CC` overrides it.
-- Git for Windows (the full one, not MinGit), whose bash runs the tasks.
-  Point mise at it, ahead of WSL's `bash.exe`: set `MISE_BASH_PATH` to its
-  `bin\bash.exe` in your user environment.
-- Developer Mode (Settings › For developers), so mise can link tools.
-
-The repository checks out with LF line endings on every platform
-(`.gitattributes`): the tasks are bash scripts and the patches apply to LF
-sources. Link the game directory with a junction
-(`New-Item -ItemType Junction game -Target <dir>`) or set `GLUE5_GAME_DIR`.
-Rendering is wgpu on Vulkan: the GPU driver provides it.
-
-### Linux
-
-Clang compiles the game's generated C (`CC` overrides it), and SDL is built
-against the headers of the backends it supports: install them before the
-first build, or SDL leaves those out (no window without X11 or Wayland's).
-On Debian and Ubuntu, the list in `platform/linux/Dockerfile`; on other
-distributions, SDL's `docs/README-linux.md`. SDL loads X11 or Wayland
-(Wayland when the compositor has `fifo-v1`, X11 or XWayland otherwise;
-`SDL_VIDEO_DRIVER=x11` or `wayland` forces one), the sound server and udev
-at run time. Rendering is wgpu on Vulkan, from the GPU driver.
-
-`mise run linux:package` builds `target/package/glue5_<version>_<arch>.AppImage`
-with cargo-packager (it downloads linuxdeploy on first use). The AppImage
-holds the executable and the icon only: glibc, Vulkan and the libraries SDL
-loads are the system's, so it runs on systems with the glibc it was built
-against or later. `mise run linux:container [x86_64|aarch64]` builds it in
-`platform/linux/Dockerfile` (Ubuntu 22.04, glibc 2.35) with Docker, from any
-system, its build tree in `target/linux-<arch>`. Give Docker the memory for
-up to eight C compilations of ~15 MB files at once.
-
-The game is looked for in `game/` beside the AppImage, as beside the Mac app.
-
-## Tasks
-
-| What | Command |
-|---|---|
-| Play (desktop) | `mise run play` |
-| Serve the game folder to the app on other devices (streaming) | `mise run serve [folder]` (`-- --help` lists the options) |
-| macOS: build and open the app bundle | `mise run macos` |
-| macOS: build only the app bundle | `mise run macos:build` |
-| macOS: open the built app again | `mise run macos:run` |
-| macOS: build a distributable disk image | `mise run macos:package` |
-| Linux: build the AppImage (on Linux) | `mise run linux:package` |
-| Linux: build the AppImage in a container (Docker), on any system | `mise run linux:container [x86_64\|aarch64]` |
-| Run without a window: scripted input, PNG shots, statistics | `mise run headless --press 30 start --for 40 --shots 300 shots` (`mise run headless -- --help` lists the options) |
-| Tests | `mise run test`; every translated shader through the adapter and naga's validator: `mise run test:shaders` |
-| Merge recorded pipelines into the app's seed | `mise run shaders:seed <pipelines.jsonl>...` |
-| Record pipelines on automated runs (benchmark, map tours, graphics settings) into the seed | `mise run shaders:collect [default low min mid high max]` |
-| iOS: build, sign, install, launch on the connected device | `mise run ios [device]` |
-| iOS: only check that the app builds | `mise run ios:build` |
-| iOS: an unsigned IPA, for a sideloading tool to sign | `mise run ios:ipa` |
-| iOS: launch the installed app again, with its console | `mise run ios:run [device]` |
-| iOS: copy the game into the app's Documents/game | `mise run ios:game [device]` |
-| Apple TV: build, sign, install, launch on the paired Apple TV | `mise run tvos [device]` |
-| Apple TV: only check that the app builds | `mise run tvos:build` |
-| Apple TV: launch the installed app again, with its console | `mise run tvos:run [device]` |
-| Apple TV simulator: build, install, launch with its console | `mise run tvos:sim [simulator]` |
-| Android: build, install, launch on the connected device with its log | `mise run android [device]` |
-| Android: only build the APK | `mise run android:build` |
-| Android: launch the installed app again, with its log | `mise run android:run [device]` |
-| Android: copy the game into the app's Android/data/local.glue5/files/game | `mise run android:game [device]` |
-
-`mise tasks` lists them all. iOS signing uses the team in `GLUE5_TEAM`:
-put it in `.mise/config.local.toml` (ignored by git) under `[env]`. With several
-phones connected, pass the device (name, identifier or UDID); for Android,
-its serial number (`adb devices`). The Apple TV tasks sign the same way; they
-need Xcode's tvOS platform (Xcode › Settings › Components) and an Apple TV
-paired with Xcode (on the TV: Settings › Remotes and Devices › Remote App and
-Devices).
-
-### macOS packaging
-
-`mise run macos:build` creates `target/package/Glue 5.app` for the Mac's
-architecture; `mise run macos:package` also creates a DMG in `target/package`.
-These tasks require Xcode 26+ for the shared Icon Composer icon. mise manages
-cargo-packager alongside the other tools in `.mise/config.toml` on macOS
-and Linux.
-Direct Cargo builds and the packaged app both target macOS 14+, configured in
-`.cargo/config.toml`. There is no bundle signing, Developer ID or notarization
-step; the executable retains the linker-generated ad-hoc signature on Apple
-Silicon. Downloaded unsigned distributions may be blocked by Gatekeeper.
-
-Game data and shaders are **not bundled**. Choose the external game directory
-on the start page, or put a `game` directory beside `Glue 5.app`. The executable
-still contains the game code compiled from the build-time `game.wasm`.
-Saves and settings remain in the user's Application Support directory.
-
-`mise run macos` builds and opens the bundle through Launch Services; an
-already running instance is brought forward. For a fresh launch, quit it
-first. Arguments can be passed, e.g. `mise run macos --play /absolute/game`.
-`mise run play` remains the direct Cargo workflow with terminal logs.
-
-The bundle declares the Games category and Game Mode support. On Apple
-Silicon, enter native macOS fullscreen using the green window button and
-check Game Mode in the system game menu/overlay. The OS decides whether to
-activate it; the plist alone does not guarantee activation. See Apple's
-[Game Mode requirements](https://support.apple.com/en-us/105118).
-
-### Runtime options
-
-The app and headless runner accept these environment variables.
-`mise run ios` and `ios:run` (and the `tvos` ones) forward `RUST_LOG` and
-`GLUE5_*` variables to the device; so do `mise run android` and `android:run` (as the launch
-intent's extras).
-
-| Variable | Effect |
-|---|---|
-| `GLUE5_GAME_DIR` | The game directory, for the build and at run time (`./game` under cargo). |
-| `RUST_LOG` | Log filter (default `info`): renderer statistics every 10 s (frame times, CPU time per renderer stage, memory); `glue5::audio=debug` adds the sound device's. |
-| `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too (it is always in `<user dir>/game.log`). |
-| `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-FrameQueueLimit=2`. |
-| `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics. |
-| `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
-| `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1` | Mobile GPU fallbacks on a desktop GPU: BC textures decoded on the CPU (and re-encoded as ETC2 where the GPU has it), 32-bit float textures unfiltered. |
-| `GLUE5_NO_ETC2=1` | Decoded BC textures stay RGBA8 instead of ETC2. |
-| `GAMERESOURCEMB`, `KEEPTHREADS` | The engine's module settings (`gameResourceMB`, `keepThreads`), read like the browser build reads them under Node. |
-| `GLUE5_ALLOW_UNKNOWN_BUILD=1` | Build against a `game.wasm` other than the supported one. |
-| `GLUE5_TEAM` | Apple development team id, to sign the iOS app. |
-
-## Controls
-
-Keyboard, mouse and controllers work as on PC, including the game's
-controller prompts. Click to capture the pointer; Esc releases it. On
-touch screens, an on-screen controller appears while touch is in use and
-hides when a controller or keyboard is used. The game's text boxes bring
-up the system keyboard on touch devices.
-
-The start page shows the game files, Story mode, GTA Online, Sandbox (the
-whole map, free roam, no missions) and Settings; the last mode played comes
-first. App settings cover resolution, upscaling, VSync, frame rate, touch
-controls, low memory and where the game files come from. During play,
-open them with F1, the ⚙ button on touch screens, or by holding Back +
-Start on a controller. Use the D-pad or arrow keys to navigate, A or Enter
-to select, and B or Esc to go back.
-
-Esc / Start opens the game's own menu. Graphics quality is configured in
-Settings › Graphics and saved in `settings.xml`. Confirming a change that
-requires a restart, such as texture quality, ends the game. On desktop,
-the app restarts directly into the game. On a phone, reopen the app.
-
-## GTA Online
-
-GTA Online's freemode runs without Rockstar's services and without a
-server of ours. GTA ONLINE on the start page puts the player in the lobby
-of everyone playing, where the game's own matchmaking finds or hosts a
-public session. The pause menu's other sessions (invite only, crew,
-closed friends, solo) are hosted in a lobby of their own, new each time,
-reached only through an invite or, for a closed friends session, by
-friends. The name other players see is set on the start page, in the GTA
-ONLINE card.
-
-- The lobby is a virtual LAN the engine plays on as on a real one
-  (`vnet.rs`): its sockets carry their datagrams over one UDP socket per
-  player (`p2p.rs`, port 47000 to 47015, or another if all are taken).
-- Players find each other on the same network by broadcast, and on the
-  Internet through the BitTorrent DHT (`dht.rs`), where each announces
-  itself under the lobby's key. Behind NATs both send until the NATs let
-  them through; players who cannot reach each other go through one who
-  can.
-- Characters are kept in the user directory, `cloud/` (`cloud.rs`, with the
-  stats the game's data lacks: `stats.rs`); the gamer id in `online-id`.
-
-### Friends
-
-Friends see when the other plays, join each other in GTA Online and
-invite each other, from the game's own menus too, still with no server of
-ours (`friends/`). As Social Club's overlay did, the app's Friends page
-(♡ on the start page, Home, or Back + RB on a controller) has the
-friends, the friend requests, the game invites and the players to ask,
-and notifications come up at the top right: a friend online or offline,
-a request, a request accepted, an invite (Settings › Game turns them
-off).
-
-- Each player has a key pair made on the device and a friend code
-  (16 characters: 75 bits of a hash of its key and a random salt, and a
-  check character) to give out. Asking with a code reaches its owner, who
-  says yes or no: the owner answers with the salt, and the asker checks
-  that the code comes from the key that answered, so knowing a code is
-  not enough to answer for it. A new code (a new salt) retires the old
-  one. A player met online can be asked without one,
-  from the page's players met or the pause menu's "Send Friend Request"
-  on a player of the session: the players of a lobby tell each other
-  their key, and a request without a code is answered only while its
-  sender is in the same lobby. The key, the code, the friends and the
-  players met are in `friends.json` in the user directory (readable by the
-  player only).
-- Friends meet on the DHT and the local network under a key only the two
-  of them can compute (from their keys' Diffie-Hellman secret, changing
-  every 6 hours), then talk over a Noise channel (`IK`, or `XXpsk0` with a
-  code; ChaCha20-Poly1305, BLAKE2s, X25519, by `snow`): a player answers
-  no one else, and what friends say to each other cannot be read or forged
-  by anyone else. A friend sees the player's Internet address, as a player
-  of the same lobby does.
-- In the game, the friends are the pause menu's; their invites (to a
-  session, to a job) and answers travel over the channel, accepted only
-  from that friend. The game knows a friend by its gamer id, which each
-  player says itself: one that another friend has is not taken. A friend tells the others its session only when they
-  may join it (public, or closed friends); an invite carries a private
-  one. "Join" on a friend's card or on the app's page, accepting an
-  invite, and the pause menu's "Join Friends" take the player into the
-  friend's lobby (introduced by it) and session.
-
-## Renderer
-
-The engine emits D3D11-style commands into a ring in wasm memory (the browser
-build's `wgpu_worker.js` protocol); `glue5-gpu` executes them in order on one
-thread. The translated WGSL shaders (`shaders/`) are adapted at load time
-(constant buffers packed into one dynamic uniform binding per stage, vertex
-outputs given the pixel shader's interpolation) and compiled, with render
-pipelines, on background threads. Draws whose pipeline is still compiling
-are skipped (the headless runner's `--sync-pipelines` compiles them on the
-spot instead).
-
-The back buffer follows the window: its size in pixels times the render
-scale (Settings › Resolution). The present step scales it to the window
-using MetalFX on supported Apple GPUs or a bicubic filter otherwise
-(Settings › Upscaling). The app's UI is drawn afterwards at the window's
-resolution. With a frame rate set, Apple platforms show frames at that pace,
-each for the same time ([frame pacing](docs/design.md#frame-pacing)): on
-120 Hz displays 40 is offered too.
-
-Pipeline recipes are recorded in `<user dir>/cache/pipelines.jsonl`. Before
-the game starts, Play compiles the pipelines known for it (the app's seed,
-`crates/glue5-gpu/seed/`, and the recorded ones) while the start page shows
-how far it is: minutes on a phone's first run (an iPhone 13 Pro takes ~200 ms
-of CPU per pipeline the system has not seen), about a second after, when
-Metal's system cache or the saved Vulkan pipeline cache has them. Recipes
-are the same on every device (each makes its own pipeline of one), so the
-seed is grown on a computer: `mise run shaders:collect` runs the game
-headless at levels of the graphics settings (a new player's, the low-memory
-devices', minimum, middle, high, maximum), each time through the game's
-benchmark (a fly-through of the map) and a tour of the map
-(`crates/glue5/examples/tour.txt`: interiors, places at several hours and
-weathers); the two shader qualities also tour a grid over the whole map (a
-stop every 400 m, the sea skipped). It merges what they drew into the seed
-(about 80 minutes). Recordings from playthroughs on devices go in with
-`mise run shaders:seed <pipelines.jsonl>...`.
+<table>
+  <tr>
+    <td width="50%" align="center"><img src="docs/images/app-start.webp" alt="The start page on a MacBook Pro: story mode, GTA Online, sandbox and benchmark"><br><sub>The start page: story mode, GTA Online, sandbox, benchmark</sub></td>
+    <td width="50%" align="center"><img src="docs/images/studio.webp" alt="GLUE 5 Studio on a tablet, editing a mod with its menu live from the game"><br><sub>GLUE 5 Studio: a mod, its menu live from the game</sub></td>
+  </tr>
+</table>
 
 ## Platforms
 
-All platforms use `crates/glue5`. The desktop binary calls `glue5::main`.
-On iOS, an Xcode project generated by [xcodegen] from
-`platform/ios/project.yml` links the crate as a static library. On Android,
-as SDL's README-android describes, the Gradle project in `platform/android`
-packages the crate as a shared library (`libglue5.so`, built with
-cargo-ndk), SDL's own (`libSDL3.so`) and SDL's Java activity, taken from the
-`sdl3-src` crate the libraries are built with; the activity calls `SDL_main`.
+| Device | Status | Graphics | Notes |
+|---|---|---|---|
+| **iPhone, iPad** | ✅ Playable | Metal · MetalFX | iOS 16.4 or later. Tested on iPhone 16 Pro and iPhone 13 Pro. |
+| **Mac** | ✅ Playable | Metal · MetalFX | macOS 14 or later, Apple silicon. |
+| **Android** | 🧪 Early | Vulkan | Tested on Pixel 8a. |
+| **Windows** | 🧪 Early | Vulkan | Builds; little tested. |
+| **Linux** | 🧪 Early | Vulkan | AppImage, X11 and Wayland; little tested. |
+| **Apple TV** | 🧪 Preview | Metal | Streams the game's files from a computer. Run in the simulator so far. |
 
-The app looks for the game in this order: the command line (desktop),
-`GLUE5_GAME_DIR`, the saved location in `glue5.json`, then platform defaults.
-On desktop, the default is `game` next to the executable or in the
-repository. On iOS, it is `Documents/game`, populated with
-`mise run ios:game`, Finder > device > Files, or the Files app. On Android,
-it is `Android/data/local.glue5/files/game`, populated with
-`mise run android:game`. The Apple TV has no game folder: it keeps only
-caches the system may empty, so the game always streams there; its
-settings, saves and friends are in that cache folder too.
+## Get started
 
-The files can also stream from another computer instead (Settings › Game
-› Game files › Server, or Stream from a server on the start page): the app
-on a computer with the game, with Settings › Game › Share on the network
-on, or `glue5-serve` on any desktop system. The Servers page (the start
-page's Server button, or Settings › Game › Server) lists the computers on
-the same network that share the game, whether each serves this game and
-how far it is; elsewhere an address is typed, `host` or `host:port` (port
-47100). The app keeps what it received in its cache folder for the next
-starts; Download the whole game, on the same page, makes it a copy of the
-game of its own, which plays without the server. See
-[design.md](docs/design.md#streaming-the-games-files).
+1. **Have your game files.** GTA V's WebAssembly build: `game.wasm`, its
+   `shaders` folder and its `data` folder.
+2. **Build the app.** The game's code ends up inside the app, so nobody
+   can hand you a ready-made one: you build your own. The easiest way
+   needs only a GitHub account: [build it on GitHub](docs/github-build.md),
+   free, from your own `game.wasm`, which stays private. With a computer
+   set up for development, [build it yourself](docs/building.md).
+3. **Install it and add the files.** [Getting started](docs/getting-started.md)
+   shows how on each device.
 
-If the files are missing, the start page explains where to put them.
-Desktop users can choose a folder; on iOS, the app checks again when it
-returns to the foreground. `glue5 --play`, or a game folder passed on the
-command line, skips the start page.
+## Documentation
 
-## Hooks
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install the app and put the game's files on each device. |
+| [Playing](docs/playing.md) | Game modes, controls, settings, performance and troubleshooting. |
+| [GTA Online and friends](docs/online.md) | Sessions, friends and invites without servers, and how they stay private. |
+| [Streaming the game's files](docs/streaming.md) | Play from a computer's copy on your phone, tablet or Apple TV. |
+| [Mods and GLUE 5 Studio](docs/mods.md) | Write mods in Luau, in your browser or with a coding agent. |
+| [Build on GitHub](docs/github-build.md) | The app from your `game.wasm`, with no development setup. |
+| [Building from source](docs/building.md) | Toolchain, tasks, platforms, options and the repository's layout. |
+| [Design notes](docs/design.md) | How it works inside: the recompiler, the renderer, streaming, mods. |
 
-`crates/glue5-game/hooks.rs` lists game functions the host replaces, by their
-wasm name. Signatures come from the module; an unset hook keeps the original,
-and a hook can call the original through `glue5_game::orig`.
+## FAQ
 
-## Future work
+<details>
+<summary><b>Is the game included?</b></summary>
 
-- **Give freed wasm memory back to the system.** The wasm memory is only
-  reserved (16 GiB of address space); its pages count once the engine writes
-  them, and then for good: wasm has no `munmap` or `madvise`, so memory the
-  engine frees stays in the footprint. Most of the ~1.3 GB written is the
-  engine's own data (macOS, low memory, early in story mode: the resource
-  heap at 1023 MiB with ~770 in use, ~500 MB of other heaps). Hooks on
-  `rage::sysMemGrowBuddyAllocator::Free` (its bookkeeping looks to be kept
-  outside the blocks, which needs checking) and on large frees of the game's
-  malloc (the pages inside the chunk) could hand whole freed pages back
-  (`MADV_FREE_REUSABLE` on Apple platforms, `MADV_DONTNEED` elsewhere): at
-  most ~250 MB there, less where free space was never written. No compiler
-  or wasm flag changes how much the engine writes.
+No. GLUE 5 is the recompiler and the runtime around the game. You supply
+the game's files, from its WebAssembly build.
+</details>
 
-## Notes
+<details>
+<summary><b>Why can't I just download the app?</b></summary>
 
-- Game data must be the copies prepared for the browser build (re-keyed archives).
-- The user directory (saves, `glue5.json`, the engine log `game.log`, the
-  renderer's caches in `cache/`) is SDL's per-user application directory:
-  `~/Library/Application Support/glue5` on macOS, `~/.local/share/glue5` on
-  Linux, `%APPDATA%\glue5` on Windows.
+The app is made from the game's own code (`game.wasm`), compiled for your
+device. An app built from it contains the game, so it is never shared:
+everyone builds their own, from their own files. GitHub can do it for you
+in your account ([how](docs/github-build.md)).
+</details>
 
-[wasm2c]: https://github.com/WebAssembly/wabt/tree/main/wasm2c
-[xcodegen]: https://github.com/yonaskolb/XcodeGen
-[mise]: https://mise.jdx.dev
+<details>
+<summary><b>Will it run on my phone?</b></summary>
+
+The game needs a recent device: on iPhone, a 13 Pro or newer plays well;
+devices with less than 8 GB of memory use a low-memory profile (smaller
+pools, lighter graphics) by default. In the game's benchmark an iPhone 16
+Pro averages about 42 fps at the default settings. Phones get hot after a
+while, and then slower: see [Performance](docs/playing.md#performance).
+</details>
+
+<details>
+<summary><b>Is GTA Online the real one?</b></summary>
+
+It is the game's own freemode, played between GLUE 5 players. Nothing
+connects to Rockstar's services: sessions are hosted by the players, and
+characters are kept on the device. See [GTA Online and friends](docs/online.md).
+</details>
+
+<details>
+<summary><b>Do I need a JIT, a jailbreak or developer mode?</b></summary>
+
+No. The game is compiled before it is installed, so it runs like any other
+app. On iPhone and iPad you install it as your own app (sideloading, with
+your Apple ID).
+</details>
+
+## Contributing
+
+Bug reports, fixes and ports are welcome: read
+[CONTRIBUTING.md](CONTRIBUTING.md) first, and follow the
+[code of conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+GLUE 5 is free software: you can redistribute it and modify it under the
+terms of the [GNU General Public License](LICENSE), version 3 or (at your
+option) any later version.
+
+The patches in [`patches/`](patches/README.md) change other projects and
+are offered under each project's own license, so they can go upstream.
+The fonts and touch icons in `crates/glue5/assets` keep their licenses
+([OFL](crates/glue5/assets/ui/OFL.txt),
+[icons](crates/glue5/assets/touch/README.md)). The game itself is not part
+of GLUE 5 and is covered by none of this.
+
+## Acknowledgements
+
+GLUE 5 is built on [wasm2c](https://github.com/WebAssembly/wabt/tree/main/wasm2c),
+[wgpu](https://wgpu.rs), [SDL](https://libsdl.org), [egui](https://github.com/emilk/egui),
+[Luau](https://luau.org) with [mlua](https://github.com/mlua-rs/mlua),
+[Leptos](https://leptos.dev), [CodeMirror](https://codemirror.net),
+[snow](https://github.com/mcginty/snow), [mise](https://mise.jdx.dev) and
+many other open-source projects: the app's Credits page lists them all,
+with their licenses.
+
+Grand Theft Auto and GTA are trademarks of Take-Two Interactive Software.
+GLUE 5 is an independent project, not endorsed by or affiliated with
+Rockstar Games or Take-Two Interactive.

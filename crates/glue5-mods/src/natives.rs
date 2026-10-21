@@ -182,11 +182,12 @@ pub static TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// # Safety
 /// `env` is the engine thread's, inside a script's update.
 pub unsafe fn call_int(env: *mut Env, name: &str) -> Option<i32> {
-    let handler = NATIVES
-        .iter()
-        .find(|n| n.name == name && n.params.is_empty())
-        .map(|n| n.handler)
-        .or_else(|| reserved_handler(name))?;
+    // By name, once: every script's WAIT asks for some (thousands a second).
+    static NO_PARAMS: std::sync::LazyLock<std::collections::HashMap<&str, u64>> = std::sync::LazyLock::new(|| {
+        let reserved = RESERVED.iter().map(|&(n, h)| (n, h));
+        reserved.chain(NATIVES.iter().filter(|n| n.params.is_empty()).map(|n| (n.name, n.handler))).collect()
+    });
+    let handler = *NO_PARAMS.get(name)?;
     let mem = unsafe { Mem::of(env) };
     let top = unsafe { exports::emscripten_stack_get_current(env) }.ok()?;
     let r = (|| {
@@ -206,6 +207,9 @@ pub unsafe fn call_int(env: *mut Env, name: &str) -> Option<i32> {
 pub fn qualified(n: &Native) -> String {
     format!("{}.{}", NAMESPACES[n.ns as usize], n.lua)
 }
+
+/// The longest string a native takes from Lua.
+const MAX_STRING: usize = 16 << 10;
 
 /// Calls native `index` with Lua's arguments.
 pub fn call(lua: &Lua, index: usize, args: MultiValue) -> mlua::Result<MultiValue> {
@@ -270,6 +274,11 @@ pub fn call(lua: &Lua, index: usize, args: MultiValue) -> mlua::Result<MultiValu
                         if bytes.contains(&0) {
                             return Err(bad("a string without NUL"));
                         }
+                        // It goes on the engine thread's stack, which has
+                        // no room for megabytes (no native takes them).
+                        if bytes.len() > MAX_STRING {
+                            return Err(bad(&format!("a string of at most {} KB", MAX_STRING >> 10)));
+                        }
                         let at = alloc(bytes.len() as u64 + 1)?;
                         mem.bytes_mut(at, bytes.len()).copy_from_slice(&bytes);
                         mem.set_u64(target, at);
@@ -292,7 +301,13 @@ pub fn call(lua: &Lua, index: usize, args: MultiValue) -> mlua::Result<MultiValu
                     };
                     // DOES_ENTITY_EXIST and the like are how a mod checks one.
                     let checks = n.name.starts_with("DOES_") && n.name.ends_with("_EXIST");
-                    if h.is_entity() && p.dir == D::In && !checks {
+                    // One passed by reference (DELETE_ENTITY, ..._AS_NO_LONGER_NEEDED)
+                    // that is gone already: nothing to do (the engine would
+                    // trap on a handle past its pool).
+                    if h.is_entity() && p.dir == D::InOut && entity_type(mem, id).is_none() {
+                        return Ok(MultiValue::new());
+                    }
+                    if h.is_entity() && p.dir != D::Out && !checks {
                         let want = match h {
                             H::Vehicle => Some(3),
                             H::Ped => Some(4),

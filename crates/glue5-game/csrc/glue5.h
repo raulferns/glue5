@@ -7,6 +7,15 @@
 
 #include "wasm-rt.h"
 
+/* Trap targets without the signal mask: no signal handler ever jumps to
+ * one (bounds are checked in the code, no guard pages), and saving it is a
+ * system call at every entry into wasm (natives, hooks calling the engine:
+ * ~170 ns each). siglongjmp takes a buffer saved either way. */
+#ifndef _WIN32
+#undef WASM_RT_SETJMP_TRAP_SETBUF
+#define WASM_RT_SETJMP_TRAP_SETBUF(buf) sigsetjmp(buf, 0)
+#endif
+
 /* One per wasm instance, i.e. per engine thread. Every import and hook
  * receives it. Mirrored by `glue5_game::Env`. */
 struct w2c_env {
@@ -37,17 +46,25 @@ struct w2c_wasi__snapshot__preview1 {
 #define GLUE5_LONGJMP(b, v) _longjmp(b, v)
 #endif
 
-/* Run `stmt` (a call into wasm) and return the trap code (0 = none). Nested
- * calls (wasm -> host -> wasm) keep the outer trap target intact. */
-#define GLUE5_TRY(stmt)                                       \
-  do {                                                        \
-    wasm_rt_jmp_buf glue5_saved_ = g_wasm_rt_jmp_buf;         \
-    wasm_rt_trap_t glue5_trap_ = wasm_rt_impl_try();          \
-    if (glue5_trap_ == WASM_RT_TRAP_NONE) {                   \
-      stmt;                                                   \
-    }                                                         \
-    g_wasm_rt_jmp_buf = glue5_saved_;                         \
-    return (uint32_t)glue5_trap_;                             \
+/* Run `stmt` (a call into wasm through `env`) and return the trap code
+ * (0 = none). Nested calls (wasm -> host -> wasm) keep the outer trap
+ * target intact; after a trap the wasm stack pointer and the innermost
+ * setjmp frame are put back (the frames skipped never popped theirs: a
+ * caller that goes on would otherwise longjmp into a dead frame). */
+#define GLUE5_TRY(stmt)                                                   \
+  do {                                                                    \
+    uint64_t glue5_sp_ = env->instance->w2c_0x5F_stack_pointer;           \
+    void* glue5_longjmp_target_ = env->longjmp_target;                    \
+    wasm_rt_jmp_buf glue5_saved_ = g_wasm_rt_jmp_buf;                     \
+    wasm_rt_trap_t glue5_trap_ = wasm_rt_impl_try();                      \
+    if (glue5_trap_ == WASM_RT_TRAP_NONE) {                               \
+      stmt;                                                               \
+    } else {                                                              \
+      env->instance->w2c_0x5F_stack_pointer = glue5_sp_;                  \
+      env->longjmp_target = glue5_longjmp_target_;                        \
+    }                                                                     \
+    g_wasm_rt_jmp_buf = glue5_saved_;                                     \
+    return (uint32_t)glue5_trap_;                                         \
   } while (0)
 
 /* memory.atomic.wait/notify, provided by the host (see futex.rs). */

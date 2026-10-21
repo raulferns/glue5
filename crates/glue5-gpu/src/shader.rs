@@ -5,7 +5,9 @@
 //! The translator's conventions: group 0 is the vertex (or compute) stage,
 //! group 1 the pixel stage; binding = D3D register + 0 (constant buffers,
 //! `b15` = the special-constant table of `<hash>.consts.json`), 16
-//! (samplers), 32 (SRVs), 160 (UAVs), 176 (UAV counters).
+//! (samplers), 32 (SRVs), 160 (UAVs), 176 (UAV counters). The constant
+//! buffers move to groups of their own, two above their stage's (see
+//! [`pack_uniforms`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,11 @@ impl Stage {
         if self == Stage::Pixel { 1 } else { 0 }
     }
 
+    /// The group of the stage's constant buffers.
+    pub fn constants_group(self) -> u32 {
+        self.group() + CONSTANTS_GROUPS
+    }
+
     fn visibility(self) -> wgpu::ShaderStages {
         match self {
             Stage::Vertex => wgpu::ShaderStages::VERTEX,
@@ -47,6 +54,11 @@ impl Stage {
         }
     }
 }
+
+/// The constant buffers' groups are this many above their stage's: their
+/// bind groups, made of the uniform ring's buffers, are not those of the
+/// textures, which then do not depend on where the constants went.
+pub const CONSTANTS_GROUPS: u32 = 2;
 
 /// Binding numbers.
 pub const PACKED_CBUFFERS: u32 = 0;
@@ -83,9 +95,10 @@ impl Binding {
     pub fn layout_entry(&self, stage: Stage) -> wgpu::BindGroupLayoutEntry {
         use wgpu::{BindingType, BufferBindingType, TextureSampleType};
         let ty = match &self.kind {
+            // The constant table (the others are in the constants group).
             Kind::Uniform => BindingType::Buffer {
                 ty: BufferBindingType::Uniform,
-                has_dynamic_offset: self.binding != CONSTANT_TABLE,
+                has_dynamic_offset: false,
                 min_binding_size: None,
             },
             Kind::Storage { read_only } => BindingType::Buffer {
@@ -114,19 +127,37 @@ impl Binding {
 }
 
 /// The constant buffers a stage reads, merged into one uniform struct at
-/// binding 0 (one dynamic offset per stage instead of up to 14 bindings).
+/// binding 0 (one dynamic offset per stage instead of up to 14 bindings),
+/// but for the largest (the bones, lighting, shadows): those keep their own
+/// binding (at their slot), copied once per version instead of into each
+/// draw's pack. All in the stage's constants group.
 #[derive(Clone, Debug)]
 pub struct Pack {
     /// (D3D slot, size, offset), by slot.
     pub members: Vec<PackMember>,
     pub size: u32,
+    /// Bound on their own (offset unused), by slot.
+    pub own: Vec<PackMember>,
 }
+
+/// Constant buffers this large get a binding of their own, at most this
+/// many a stage (a pipeline has two stages: its dynamic uniform buffers,
+/// with the packs, stay within the 8 every GPU has).
+pub const OWN_SIZE: u32 = 512;
+pub const OWN_MAX: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PackMember {
     pub slot: u32,
     pub size: u32,
     pub offset: u32,
+}
+
+impl Pack {
+    /// The constants group's bindings, in binding order: (binding, size).
+    pub fn bindings(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        std::iter::once((PACKED_CBUFFERS, self.size)).chain(self.own.iter().map(|m| (m.slot, m.size)))
+    }
 }
 
 /// One translated shader, ready to use.
@@ -143,9 +174,11 @@ pub struct Program {
     pub modules: Arc<Modules>,
     /// The stage's bindings, by binding number.
     pub bindings: Vec<Binding>,
-    /// Layout of the stage's group (compute: per pipeline, see compute.rs).
+    /// Layout of the stage's group (compute: per pipeline, see ops.rs).
     pub layout: Option<wgpu::BindGroupLayout>,
     pub pack: Option<Pack>,
+    /// Layout of its constants group (with a pack).
+    pub constants: Option<wgpu::BindGroupLayout>,
     /// The special-constant table (binding 15).
     pub consts: Option<wgpu::Buffer>,
     /// Pixel shader: colour outputs written (bit per location).
@@ -160,6 +193,8 @@ pub struct Program {
     pub frag_depth: bool,
     /// Indices into `bindings` of the sampled textures.
     pub textures: Vec<usize>,
+    /// The same as bits by SRV slot, by how they are read.
+    pub sampled: Sampled,
     /// Inter-stage locations (vertex outputs / pixel inputs).
     pub locations: Vec<u32>,
     /// (texture binding, sampler binding) sampled together.
@@ -228,9 +263,10 @@ impl Modules {
     pub fn take_idle(&self, idle: u64, max: usize, out: &mut Vec<wgpu::ShaderModule>) {
         let now = now_secs();
         let mut map = self.0.lock().unwrap();
+        // (A module may have been used after `now`, while this waited.)
         let idle_keys: Vec<String> = map
             .iter()
-            .filter(|(_, (module, used))| module.is_some() && now - *used >= idle)
+            .filter(|(_, (module, used))| module.is_some() && now.saturating_sub(*used) >= idle)
             .map(|(k, _)| k.clone())
             .take(max.saturating_sub(out.len()))
             .collect();
@@ -249,6 +285,9 @@ pub struct Library {
     /// Programs by hash: prepared once, shared by every shader object with
     /// that hash. `None`: not usable.
     programs: Mutex<HashMap<u64, Arc<OnceLock<Option<Arc<Program>>>>>>,
+    /// Hashes of the programs asked for by name (a scan of the index each
+    /// time otherwise: the pause map asks at every draw).
+    names: Mutex<HashMap<String, Option<u64>>>,
 }
 
 struct Entry {
@@ -281,7 +320,7 @@ impl Library {
             );
         }
         log::info!("gpu: {} translated shaders in {}", index.len(), dir.display());
-        Ok(Library { dir: dir.to_owned(), index, programs: Mutex::default() })
+        Ok(Library { dir: dir.to_owned(), index, programs: Mutex::default(), names: Mutex::default() })
     }
 
     pub fn label(&self, hash: u64) -> String {
@@ -290,7 +329,16 @@ impl Library {
 
     /// A named translated program, prepared once like engine-created shaders.
     pub fn named(&self, device: &wgpu::Device, label: &str, stage: Stage) -> Option<Arc<Program>> {
-        let hash = *self.index.iter().find(|(_, e)| e.label == label)?.0;
+        let mut names = self.names.lock().unwrap();
+        let hash = match names.get(label) {
+            Some(&hash) => hash,
+            None => {
+                let hash = self.index.iter().find(|(_, e)| e.label == label).map(|(h, _)| *h);
+                names.insert(label.to_owned(), hash);
+                hash
+            }
+        }?;
+        drop(names);
         self.slot(hash).get_or_init(|| self.prepare(device, hash, stage)).clone()
     }
 
@@ -337,19 +385,25 @@ impl Library {
         };
         let source = match stage {
             Stage::Pixel => with_opaque_sample_inputs(&source).unwrap_or(source),
+            Stage::Compute if device.features().contains(wgpu::Features::SUBGROUP) => {
+                with_subgroup_reduction(&source).unwrap_or(source)
+            }
             _ => source,
         };
-        let (text, pack) = pack_uniforms(&source);
+        // Two stages a pipeline, each with its pack and own buffers.
+        let dynamic = device.limits().max_dynamic_uniform_buffers_per_pipeline_layout as usize;
+        let (text, pack) = pack_uniforms_owning(&source, OWN_MAX.min((dynamic / 2).saturating_sub(1)));
         let clip_distances = text.contains("@builtin(clip_distances)");
         let text = if clip_distances && !device.features().contains(wgpu::Features::CLIP_DISTANCES) {
             without_clip_distances(&text).context("unexpected clip distances output")?
         } else {
             text
         };
-        if let Some(pack) = &pack
-            && pack.size > device.limits().max_uniform_buffer_binding_size as u32
-        {
-            bail!("constant buffers total {} bytes, over the uniform binding limit", pack.size);
+        if let Some(pack) = &pack {
+            let limit = device.limits().max_uniform_buffer_binding_size as u32;
+            if pack.size > limit || pack.own.iter().any(|m| m.size > limit) {
+                bail!("constant buffers of {} bytes, over the uniform binding limit", pack.size);
+            }
         }
         // Validated now, made again when a pipeline needs it: the engine
         // creates all its shaders (thousands) while loading.
@@ -373,12 +427,7 @@ impl Library {
         };
 
         let bindings = stage_bindings(&text, stage);
-        let textures = bindings
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| matches!(b.kind, Kind::Texture { .. }))
-            .map(|(i, _)| i)
-            .collect();
+        let (textures, sampled) = sampled_textures(&bindings);
         let (outputs, interpolation, locations) = match stage {
             Stage::Pixel => (fragment_outputs(&text), interpolations(&text), ps_input_locations(&text)),
             Stage::Vertex => (0, Vec::new(), vs_output_locations(&text)),
@@ -393,6 +442,7 @@ impl Library {
             bindings,
             layout: None,
             pack,
+            constants: None,
             consts,
             outputs,
             interpolation,
@@ -401,6 +451,7 @@ impl Library {
             clip_distances,
             frag_depth: text.contains("@builtin(frag_depth)"),
             textures,
+            sampled,
             locations,
             pairs: sampling_pairs(&text),
             unfiltered: 0,
@@ -411,8 +462,39 @@ impl Library {
             text: Wgsl::new(&text),
         };
         program.layout = program.make_layout(device);
+        program.constants = program.make_constants_layout(device);
         Ok(program)
     }
+}
+
+/// A program's sampled textures, bits by SRV slot (binding - SRVS).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sampled {
+    /// Read as floats, single-sampled.
+    pub float: u128,
+    /// Read as colours (floats or integers).
+    pub color: u128,
+    /// Read as depth.
+    pub depth: u128,
+}
+
+/// The sampled textures among `bindings`: their indices, and as bits.
+fn sampled_textures(bindings: &[Binding]) -> (Vec<usize>, Sampled) {
+    let (mut textures, mut sampled) = (Vec::new(), Sampled::default());
+    for (i, b) in bindings.iter().enumerate() {
+        let Kind::Texture { sample, multisampled, .. } = b.kind else { continue };
+        textures.push(i);
+        let bit = 1u128 << (b.binding - SRVS);
+        if sample == Sample::Depth {
+            sampled.depth |= bit;
+        } else {
+            sampled.color |= bit;
+        }
+        if sample == Sample::Float && !multisampled {
+            sampled.float |= bit;
+        }
+    }
+    (textures, sampled)
 }
 
 /// A stage's resource bindings (its group), by binding number.
@@ -461,6 +543,7 @@ impl Program {
             bindings: self.bindings.clone(),
             layout: self.layout.clone(),
             pack: self.pack.clone(),
+            constants: self.constants.clone(),
             consts: self.consts.clone(),
             outputs: self.outputs,
             interpolation: self.interpolation.clone(),
@@ -469,6 +552,7 @@ impl Program {
             clip_distances: self.clip_distances,
             frag_depth: self.frag_depth,
             textures: self.textures.clone(),
+            sampled: self.sampled,
             locations: self.locations.clone(),
             pairs: self.pairs.clone(),
             unfiltered: self.unfiltered,
@@ -490,13 +574,7 @@ impl Program {
                 p.hud_mask = true;
                 p.pack = pack;
                 p.bindings = stage_bindings(&text, p.stage);
-                p.textures = p
-                    .bindings
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| matches!(b.kind, Kind::Texture { .. }))
-                    .map(|(i, _)| i)
-                    .collect();
+                (p.textures, p.sampled) = sampled_textures(&p.bindings);
                 p.pairs = sampling_pairs(&text);
                 p.locations = ps_input_locations(&text);
                 p.interpolation = interpolations(&text);
@@ -505,6 +583,7 @@ impl Program {
                 p.text = Wgsl::new(&text);
                 p.modules = Arc::new(Modules::with(module));
                 p.layout = p.make_layout(device);
+                p.constants = p.make_constants_layout(device);
                 Some(Arc::new(p))
             })
             .clone()
@@ -536,6 +615,26 @@ impl Program {
                 entry
             })
             .collect()
+    }
+
+    /// The constants group's layout: dynamic offsets, sizes as bound.
+    fn make_constants_layout(&self, device: &wgpu::Device) -> Option<wgpu::BindGroupLayout> {
+        let entries: Vec<_> = self
+            .pack
+            .as_ref()?
+            .bindings()
+            .map(|(binding, _)| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: self.stage.visibility(),
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        Some(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries }))
     }
 
     /// The group's layout (compute: per pipeline, see ops.rs).
@@ -571,13 +670,7 @@ impl Program {
             match module {
                 Ok((text, module)) => {
                     p.bindings = stage_bindings(&text, self.stage);
-                    p.textures = p
-                        .bindings
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, b)| matches!(b.kind, Kind::Texture { .. }))
-                        .map(|(i, _)| i)
-                        .collect();
+                    (p.textures, p.sampled) = sampled_textures(&p.bindings);
                     p.text = Wgsl::new(&text);
                     p.modules = Arc::new(Modules::with(module));
                     p.depth = depth;
@@ -690,26 +783,58 @@ fn struct_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 
 /// Merges the constant buffers (every `var<uniform>` but the constant table)
 /// into one struct at binding 0; members keep their names, 16-byte aligned,
-/// in slot order. The runtime copies the bound buffers back to back.
+/// in slot order. The runtime copies the bound buffers back to back. The
+/// largest keep their own declaration ([`Pack::own`]); at least one is
+/// packed. They go to the stage's constants group ([`CONSTANTS_GROUPS`]
+/// above its own).
 pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
+    pack_uniforms_owning(text, OWN_MAX)
+}
+
+/// [`pack_uniforms`] with at most `own_max` constant buffers on their own.
+pub fn pack_uniforms_owning(text: &str, own_max: usize) -> (String, Option<Pack>) {
     let mut members = Vec::new();
     let mut group = 0;
     let mut names = Vec::new();
+    let rows = |ty: &str| {
+        struct_body(text, ty).and_then(|b| RE_ARRAY_LEN.captures(b)).map_or(1, |a| a[1].parse::<u32>().unwrap())
+    };
+    // The largest, slot 0 (the pack's binding) aside.
+    let mut sizes: Vec<(u32, u32)> = RE_UNIFORM
+        .captures_iter(text)
+        .filter_map(|c| {
+            let slot: u32 = c[2].parse().unwrap();
+            (slot != CONSTANT_TABLE).then(|| (rows(&c[4]) * 16, slot))
+        })
+        .collect();
+    sizes.sort_by(|a, b| b.cmp(a));
+    let own: Vec<(u32, u32)> = sizes
+        .iter()
+        .copied()
+        // Not `rage_matrices` (slot 1): the jitter goes into each vertex
+        // stage's copy (see `scene.rs`).
+        .filter(|&(size, slot)| size >= OWN_SIZE && slot != PACKED_CBUFFERS && slot != 1)
+        .take(own_max.min(sizes.len().saturating_sub(1)))
+        .collect();
     let out = RE_UNIFORM.replace_all(text, |c: &regex::Captures| {
         let slot: u32 = c[2].parse().unwrap();
+        group = c[1].parse().unwrap();
         if slot == CONSTANT_TABLE {
             return c[0].to_owned();
         }
-        group = c[1].parse().unwrap();
+        if own.iter().any(|o| o.1 == slot) {
+            let (name, ty, group) = (&c[3], &c[4], group + CONSTANTS_GROUPS);
+            return format!("@group({group}u) @binding({slot}u) var<uniform> {name} : {ty};");
+        }
         let ty = &c[4];
-        let rows =
-            struct_body(text, ty).and_then(|b| RE_ARRAY_LEN.captures(b)).map_or(1, |a| a[1].parse::<u32>().unwrap());
-        members.push((slot, c[3].to_owned(), ty.to_owned(), rows * 16));
+        members.push((slot, c[3].to_owned(), ty.to_owned(), rows(ty) * 16));
         String::new()
     });
     if members.is_empty() {
         return (text.to_owned(), None);
     }
+    let mut own: Vec<PackMember> = own.into_iter().map(|(size, slot)| PackMember { slot, size, offset: 0 }).collect();
+    own.sort_by_key(|m| m.slot);
     members.sort_by_key(|m| m.0);
     let mut out = out.into_owned();
     for (_, name, _, _) in &members {
@@ -725,13 +850,14 @@ pub fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
         pack.push(PackMember { slot: *slot, size: *size, offset });
         offset += size;
     }
+    let group = group + CONSTANTS_GROUPS;
     decl += &format!("}}\n@group({group}u) @binding({PACKED_CBUFFERS}u) var<uniform> cbpack_v : cbpack_t;\n");
     // After the member types, before the first function or entry point.
     match RE_FIRST_ITEM.find(&out).map(|m| m.start()) {
         Some(at) => out.insert_str(at, &format!("\n{decl}")),
         None => out.push_str(&decl),
     }
-    (out, Some(Pack { members: pack, size: offset }))
+    (out, Some(Pack { members: pack, size: offset, own }))
 }
 
 fn view_dim(name: &str) -> Option<wgpu::TextureViewDimension> {
@@ -860,6 +986,20 @@ fn ps_input_locations(text: &str) -> Vec<u32> {
     RE_PS_MAIN
         .captures(text)
         .map_or_else(Vec::new, |c| RE_LOCATION.captures_iter(&c[2]).map(|c| c[1].parse().unwrap()).collect())
+}
+
+/// Tiled lighting's depth downsample (`DepthDownsampleCS_Default` and
+/// `_B`, exactly as translated: their text's FNV-1a) with its reduction made
+/// of subgroup operations (see `depth_downsample.wgsl`): the same results.
+fn with_subgroup_reduction(text: &str) -> Option<String> {
+    const TRANSLATED: [(u64, u32); 2] = [(0x48e4fc2565a175b7, 16), (0x3231d97411b0d134, 8)];
+    let fnv = text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let &(_, tile) = TRANSLATED.iter().find(|(h, _)| *h == fnv)?;
+    Some(
+        include_str!("depth_downsample.wgsl")
+            .replace("@TILE@", &tile.to_string())
+            .replace("@THREADS@", &(tile * tile).to_string()),
+    )
 }
 
 /// The radar's geometry shader supplies three edge distances at location 5.
@@ -1245,9 +1385,191 @@ fn main(@location(0u) v0 : vec2<f32>) -> tint_symbol_1 {
         assert_eq!((pack.members[0].slot, pack.members[0].offset), (2, 0));
         assert_eq!((pack.members[1].slot, pack.members[1].offset), (7, 48));
         assert!(text.contains("cbpack_v.cb7_7.tint_symbol[9u]"));
-        assert!(text.contains("@group(0u) @binding(0u) var<uniform> cbpack_v : cbpack_t;"));
+        assert!(text.contains("@group(2u) @binding(0u) var<uniform> cbpack_v : cbpack_t;"));
         assert!(!text.contains("@binding(7u)"));
         naga::front::wgsl::parse_str(&text).unwrap();
+    }
+
+    /// The depth downsample with subgroup operations gives the translation's
+    /// results, bit for bit, on random depths and tiles past the edges
+    /// (GLUE5_GAME_DIR, a GPU with subgroups).
+    #[test]
+    #[ignore]
+    fn subgroup_depth_downsample_matches_the_translation() {
+        let game = std::env::var_os("GLUE5_GAME_DIR").expect("GLUE5_GAME_DIR");
+        let dir = glue5_runtime::layout::shader_dir(Path::new(&game));
+        let gpu = crate::Device::open(&crate::instance(), None).unwrap();
+        assert!(gpu.device.features().contains(wgpu::Features::SUBGROUP), "no subgroups here");
+        for name in ["23a7a3c1c0d38f46", "09596507b8362aed"] {
+            let original = std::fs::read_to_string(dir.join(format!("{name}.wgsl"))).unwrap();
+            let consts: Vec<u64> =
+                serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.consts.json"))).unwrap()).unwrap();
+            let replaced = with_subgroup_reduction(&original).expect("the translation as it was");
+            let tile = if name.starts_with("23") { 16 } else { 8 };
+            let a = run_downsample(&gpu, &original, &consts, tile);
+            let b = run_downsample(&gpu, &replaced, &consts, tile);
+            assert!(a.chunks(16).any(|t| t != &a[..16]), "{name}: the same everywhere, nothing compared");
+            assert_eq!(a.len(), b.len());
+            assert!(a == b, "{name}: results differ");
+        }
+    }
+
+    /// Runs a depth downsample over 1000x600 random depths: its output's bits.
+    fn run_downsample(gpu: &crate::Device, text: &str, consts: &[u64], tile: u32) -> Vec<u8> {
+        let (device, queue) = (&gpu.device, &gpu.queue);
+        let (w, h) = (1000u32, 600u32);
+        let (gw, gh) = (w.div_ceil(tile), h.div_ceil(tile));
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (text, pack) = pack_uniforms(text);
+        let module = create_module(device, "downsample", &text).unwrap();
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Constant buffers: slot 10 row 3 the depth's size (as integers),
+        // slot 11 row 17 the projection terms.
+        let pack = pack.unwrap();
+        let mut cb = vec![0u8; pack.size as usize];
+        for m in &pack.members {
+            let rows: Vec<[u32; 4]> = match m.slot {
+                10 => vec![[0; 4], [0; 4], [0; 4], [w, h, 0, 0]],
+                _ => (0..18).map(|_| [0.5f32, 1.0, 0.1, 0.002].map(f32::to_bits)).collect(),
+            };
+            let bytes: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            let n = bytes.len().min(m.size as usize);
+            cb[m.offset as usize..m.offset as usize + n].copy_from_slice(&bytes[..n]);
+        }
+        let mut table = vec![0u32; consts.len() * 4];
+        for (i, v) in consts.iter().enumerate() {
+            table[i * 4] = *v as u32;
+        }
+        use wgpu::util::DeviceExt;
+        let uniform = |data: &[u8]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: data,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        };
+        let (cb, table) = (uniform(&cb), uniform(&table.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()));
+        let texture = |format, texels: Vec<u8>, (tw, th): (u32, u32), usage| {
+            device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                },
+                Default::default(),
+                &texels,
+            )
+        };
+        // Depths, a quarter of them far (1: the sky), and four channels of
+        // anything.
+        let depth: Vec<u8> = (0..w * h)
+            .flat_map(|_| {
+                let r = random();
+                let d = if r % 4 == 0 { 1.0 } else { (r >> 40) as f32 / (1u64 << 24) as f32 };
+                half::f16::from_f32(d).to_le_bytes()
+            })
+            .collect();
+        let other: Vec<u8> = (0..w * h * 4).flat_map(|_| half::f16::from_f32((random() >> 40) as f32 / 1e3).to_le_bytes()).collect();
+        let sampled = wgpu::TextureUsages::TEXTURE_BINDING;
+        let t7 = texture(wgpu::TextureFormat::R16Float, depth, (w, h), sampled);
+        let t8 = texture(wgpu::TextureFormat::Rgba16Float, other, (w, h), sampled);
+        let out = texture(
+            wgpu::TextureFormat::Rgba32Float,
+            vec![0; (gw * gh * 16) as usize],
+            (gw, gh),
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        );
+        let views = [&t7, &t8, &out].map(|t| t.create_view(&Default::default()));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 15, resource: table.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 39, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                wgpu::BindGroupEntry { binding: 40, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                wgpu::BindGroupEntry { binding: 161, resource: wgpu::BindingResource::TextureView(&views[2]) },
+            ],
+        });
+        let constants = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(Stage::Compute.constants_group()),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: cb.as_entire_binding() }],
+        });
+        let bpr = (gw * 16).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (bpr * gh) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(Stage::Compute.constants_group(), &constants, &[]);
+            pass.dispatch_workgroups(gw, gh, 1);
+        }
+        encoder.copy_texture_to_buffer(
+            out.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(gh) },
+            },
+            out.size(),
+        );
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = readback.slice(..).get_mapped_range().unwrap();
+        (0..gh).flat_map(|y| data[(y * bpr) as usize..(y * bpr + gw * 16) as usize].to_vec()).collect()
+    }
+
+    #[test]
+    fn large_constant_buffers_keep_their_own_binding() {
+        let decl = |slot: u32, rows: u32| {
+            format!(
+                "struct cb{slot}_struct {{\n  tint_symbol : array<vec4<f32>, {rows}u>,\n}}\n\n\
+                 @group(0u) @binding({slot}u) var<uniform> cb{slot}_{slot} : cb{slot}_struct;\n\n"
+            )
+        };
+        // The matrices (256 B), lighting (960 B), the bones (12,240 B).
+        let text = format!(
+            "{}{}{}@vertex\nfn main() -> @builtin(position) vec4<f32> {{\n  return cb1_1.tint_symbol[0u] + \
+             cb3_3.tint_symbol[0u] + cb4_4.tint_symbol[0u];\n}}\n",
+            decl(1, 16),
+            decl(3, 60),
+            decl(4, 765)
+        );
+        let (out, pack) = pack_uniforms(&text);
+        let pack = pack.unwrap();
+        assert_eq!(pack.own.iter().map(|m| (m.slot, m.size)).collect::<Vec<_>>(), [(3, 960), (4, 12240)]);
+        assert_eq!((pack.members.len(), pack.size), (1, 256));
+        assert!(out.contains("@group(2u) @binding(4u) var<uniform> cb4_4 : cb4_struct;"));
+        assert!(out.contains("cbpack_v.cb1_1.tint_symbol[0u]") && out.contains("cb4_4.tint_symbol[0u]"));
+        naga::front::wgsl::parse_str(&out).unwrap();
+        // Never all of them, nor more than asked.
+        assert!(pack_uniforms(&format!("{}@vertex fn main() -> @builtin(position) vec4<f32> {{ return cb4_4.tint_symbol[0u]; }}", decl(4, 765))).1.unwrap().own.is_empty());
+        assert_eq!(pack_uniforms_owning(&text, 1).1.unwrap().own.len(), 1);
     }
 
     /// Every translated shader of the game (GLUE5_GAME_DIR) still validates
@@ -1478,7 +1800,8 @@ fn main(@location(1u) v1 : vec4<f32>, @location(5u) v5 : vec4<f32>) -> @location
         let pack = pack.unwrap();
         assert_eq!(pack.size, 64);
         assert_eq!((pack.members[0].slot, pack.members[0].offset), (5, 0));
-        assert_eq!(stage_bindings(&text, Stage::Pixel).iter().map(|b| b.binding).collect::<Vec<_>>(), [0, 18, 34]);
+        assert_eq!(stage_bindings(&text, Stage::Pixel).iter().map(|b| b.binding).collect::<Vec<_>>(), [18, 34]);
+        assert!(text.contains("@group(3u) @binding(0u) var<uniform> cbpack_v : cbpack_t;"));
         assert_eq!(ps_input_locations(&text), [1, 2]);
         let module = naga::front::wgsl::parse_str(&text).unwrap();
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
@@ -1518,7 +1841,7 @@ fn main(@location(1u) v1 : vec4<f32>, @location(5u) v5 : vec4<f32>) -> @location
         let compiler = Compiler::new(gpu.device.clone(), crate::format::Caps::new(&gpu.adapter, gpu.features), None);
         assert!(compiler.compile(&vs, Some(&ps), &recipe).is_some());
         let pause = library.named(&gpu.device, "im::VS_TransformUnlit_IM", Stage::Vertex).unwrap();
-        assert!(!pause.bindings.is_empty(), "world-space map keeps its transform constants");
+        assert!(pause.pack.is_some(), "world-space map keeps its transform constants");
         assert!(compiler.compile(&pause, Some(&original), &recipe).is_some());
     }
 

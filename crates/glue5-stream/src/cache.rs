@@ -22,7 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use anyhow::Result;
 
@@ -57,7 +57,50 @@ pub struct Cache {
     dirty: Mutex<Vec<u32>>,
     changed: AtomicBool,
     saving: Mutex<()>,
+    /// Held while the copy is open: another process on it (two instances
+    /// on a desktop) would evict, punch and save over this one's index.
+    _lock: Arc<File>,
 }
+
+/// The copy in `root` taken by this process, or an error if another
+/// process has it. Shared by this process's copies of it (a stream started
+/// again opens it while the stopped one still exists).
+fn lock(root: &Path) -> io::Result<Arc<File>> {
+    static LOCKS: Mutex<Option<HashMap<PathBuf, Weak<File>>>> = Mutex::new(None);
+    let key = root.canonicalize()?;
+    let mut locks = LOCKS.lock().unwrap();
+    let locks = locks.get_or_insert_default();
+    if let Some(f) = locks.get(&key).and_then(Weak::upgrade) {
+        return Ok(f);
+    }
+    let f = OpenOptions::new().create(true).write(true).truncate(false).open(root.join(LOCK))?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(io::Error::other("the copy is in use by another Glue 5 (only one can use it at a time)"));
+        }
+        // A file system without locks (some network shares): unlocked.
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc_enolck()) => {
+            log::warn!("stream cache: {} cannot be locked ({e}): other instances are not kept off it", root.display());
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+    }
+    let f = Arc::new(f);
+    locks.retain(|_, w| w.strong_count() > 0);
+    locks.insert(key, Arc::downgrade(&f));
+    Ok(f)
+}
+
+/// ENOLCK, where there is one (no locks on the file system).
+fn libc_enolck() -> i32 {
+    #[cfg(unix)]
+    return libc::ENOLCK;
+    #[cfg(not(unix))]
+    return -1;
+}
+
+/// The lock file's name in a copy.
+const LOCK: &str = ".glue5-lock";
 
 struct Slot {
     path: String,
@@ -95,8 +138,14 @@ impl Cache {
     /// The copy in `root` of the files of `catalog`.
     pub fn open(root: &Path, catalog: &Catalog) -> Result<Cache> {
         fs::create_dir_all(root)?;
+        let lock = lock(root)?;
         sys::raise_open_file_limit();
-        let old = load_index(&root.join("index")).unwrap_or_default();
+        let index = load_index(&root.join("index"));
+        // A partial copy from before (its marker is written below): what it
+        // holds that its index does not vouch for is counted nowhere, so
+        // eviction could never take it back.
+        let (partial, lost) = (root.join(MARKER).exists(), index.is_none());
+        let old = index.unwrap_or_default();
         let session = old.session.wrapping_add(1);
         let (mut kept, mut used) = (0usize, 0u64);
         let mut slots = Vec::with_capacity(catalog.entries.len());
@@ -113,6 +162,8 @@ impl Cache {
                 present = o.bits.iter().map(|&w| AtomicU64::new(w)).collect();
                 last_used = o.last_used;
                 kept += 1;
+            } else if partial && (lost || old.files.contains_key(&e.path)) && crate::catalog::safe_path(&e.path) {
+                let _ = fs::remove_file(root.join(&e.path));
             }
             let slot = Slot {
                 path: e.path.clone(),
@@ -156,6 +207,7 @@ impl Cache {
             dirty: Mutex::new(Vec::new()),
             changed: AtomicBool::new(true),
             saving: Mutex::new(()),
+            _lock: lock,
         };
         if cache.all_here() {
             cache.finish()?;
@@ -221,6 +273,22 @@ impl Cache {
     /// How many of the blocks `first..=last` of file `id` are here.
     pub fn count(&self, id: u32, first: u64, last: u64) -> u64 {
         count_set(&self.slots[id as usize].present, first, last)
+    }
+
+    /// The first block of `first..=last` of file `id` not here (`last + 1`:
+    /// none), a word of the bitmap at a time.
+    pub fn first_missing(&self, id: u32, first: u64, last: u64) -> u64 {
+        let bits = &self.slots[id as usize].present;
+        let mut b = first;
+        while b <= last {
+            let Some(word) = bits.get((b / 64) as usize) else { break };
+            let ones = (word.load(Ordering::Acquire) >> (b % 64)).trailing_ones() as u64;
+            if ones < 64 - b % 64 {
+                return (b + ones).min(last + 1);
+            }
+            b = (b / 64 + 1) * 64;
+        }
+        last + 1
     }
 
     pub fn has_block(&self, id: u32, block: u64) -> bool {
@@ -332,6 +400,11 @@ impl Cache {
             return Ok(Handle::Kept(f));
         }
         let f = self.open_file(id)?;
+        // A pack's member is read whole, once: no room kept for it (the
+        // budget is for the archives read thousands of times).
+        if s.pack {
+            return Ok(Handle::Once(f));
+        }
         if self.kept.fetch_add(1, Ordering::Relaxed) < self.keep_at_most {
             Ok(Handle::Kept(s.file.get_or_init(|| f)))
         } else {
@@ -344,10 +417,18 @@ impl Cache {
     fn open_file(&self, id: u32) -> io::Result<File> {
         let s = &self.slots[id as usize];
         let path = self.root.join(&s.path);
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+        let open = || OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path);
+        // Its folder made only when missing (two system calls less for each
+        // of the thousands of files opened).
+        let f = match open() {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+                open()?
+            }
+            f => f?,
+        };
         if f.metadata()?.len() != s.size {
             sys::make_sparse(&f);
             f.set_len(s.size)?;
@@ -412,6 +493,11 @@ impl Cache {
         })?;
         #[cfg(target_vendor = "apple")]
         for &id in dirty {
+            // Not one being emptied (evict holds it from clearing its bits
+            // to truncating it): its bits went after `index` was taken,
+            // which still claims them, and its holes would be read as data
+            // if this index were the last one written.
+            let Ok(_g) = self.slots[id as usize].guard.try_read() else { continue };
             if let Err(e) = self.keep_sparse(id) {
                 log::debug!("stream cache: {}: {e}", self.slots[id as usize].path);
             }
@@ -585,6 +671,10 @@ impl std::ops::Deref for Handle<'_> {
 
 /// Deletes the copy in `root`.
 pub fn clear(root: &Path) -> io::Result<()> {
+    // Not a copy another process uses.
+    if root.is_dir() {
+        let _taken = lock(root)?;
+    }
     match fs::remove_dir_all(root) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),

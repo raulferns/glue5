@@ -81,6 +81,57 @@ fn android_external_dir() -> Option<PathBuf> {
     (!p.is_null()).then(|| PathBuf::from(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()))
 }
 
+/// The mods' folder. On phones it is beside the game's (`Documents/mods`
+/// on iOS, where the Files app and the Finder reach it; the external
+/// folder on Android), elsewhere in the user directory. A folder from
+/// before (in the user directory) is moved there once.
+pub fn mods_dir(user_dir: &Path) -> PathBuf {
+    let old = user_dir.join("mods");
+    let dir = beside_game().map_or_else(|| old.clone(), |d| d.join("mods"));
+    if dir != old && old.is_dir() && !dir.exists() {
+        // The same volume on iOS: a rename; on Android a copy.
+        if std::fs::rename(&old, &dir).is_err() {
+            match copy_dir(&old, &dir) {
+                Ok(()) => {
+                    let _ = std::fs::remove_dir_all(&old);
+                }
+                Err(e) => {
+                    log::warn!("mods: moving {} to {}: {e}", old.display(), dir.display());
+                    // A partial copy would pass for the moved folder next time.
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return old;
+                }
+            }
+        }
+        log::info!("mods: moved to {}", dir.display());
+    }
+    dir
+}
+
+/// Where a phone keeps the game's folder (its parent).
+fn beside_game() -> Option<PathBuf> {
+    #[cfg(target_os = "ios")]
+    return sdl3::filesystem::get_user_folder(sdl3::filesystem::Folder::DOCUMENTS).ok().map(Path::to_path_buf);
+    #[cfg(target_os = "android")]
+    return android_external_dir();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    None
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// The app's cache folder: what can be fetched again (the stream's copy of
 /// the game, the packs this computer shares). iOS and tvOS may empty it
 /// while the app is not running; the stream then fetches again.
@@ -160,6 +211,24 @@ pub fn or_stream() -> &'static str {
 /// What the game folder holds.
 pub fn game_layout() -> String {
     format!("game/\n  b/{}/shaders/\n  data/", glue5_runtime::GAME_BUILD)
+}
+
+/// Keeps `dir` (the game's folder, tens of GB) out of the device's iCloud
+/// and computer backups, which take Documents whole by default. Set again
+/// each time: the mark goes with the folder when it is copied in anew (one
+/// not made yet is marked the next time).
+pub fn keep_out_of_backups(dir: &Path) {
+    #[cfg(target_os = "ios")]
+    if dir.is_dir() {
+        use objc2_foundation::{NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey};
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
+        // SAFETY: the key takes an NSNumber holding a BOOL.
+        if let Err(e) = unsafe { url.setResourceValue_forKey_error(Some(&NSNumber::numberWithBool(true)), NSURLIsExcludedFromBackupKey) } {
+            log::warn!("{}: still in the backups: {e}", dir.display());
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = dir;
 }
 
 pub fn canonical(dir: &Path) -> Result<PathBuf> {

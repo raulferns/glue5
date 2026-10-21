@@ -41,8 +41,19 @@ pub(crate) fn connect(s: S) {
         let opened = opened.clone();
         let on_open = Closure::<dyn FnMut()>::new(move || {
             opened.set(true);
+            // Back after a break: open files the game changed meanwhile follow.
+            let again = PAIRED.with(Cell::get);
+            PAIRED.with(|p| p.set(true));
             s.connected.set(true);
             s.pairing.set(Pairing::Paired);
+            s.pair_failed.set(false);
+            if again {
+                // The game sends again the log it keeps: not shown twice.
+                s.rows.update(|r| r.retain(|(_, row)| !matches!(row, Row::Log(_))));
+                for path in s.tabs.with_untracked(|t| t.iter().filter(|t| !t.dirty).map(|t| t.path.clone()).collect::<Vec<_>>()) {
+                    reload(s, &path);
+                }
+            }
             if let Some(st) = storage() {
                 let _ = st.set_item("glue5-token", &TOKEN.with(|t| t.borrow().clone()));
             }
@@ -65,10 +76,20 @@ pub(crate) fn connect(s: S) {
         match msg["method"].as_str() {
             Some("hello") => s.hello.set(msg["params"].clone()),
             Some("mods") => {
+                if !s.listed.get_untracked() {
+                    s.listed.set(true);
+                }
                 if let Ok(mods) = serde_json::from_value::<Vec<ModInfo>>(msg["params"].clone())
                     && s.mods.with_untracked(|m| *m != mods)
                 {
+                    // Mods deleted elsewhere (Claude Code, the files): their tabs go.
+                    let gone: Vec<String> = s.mods.with_untracked(|old| {
+                        old.iter().filter(|o| !mods.iter().any(|m| m.name == o.name)).map(|o| o.name.clone()).collect()
+                    });
                     s.mods.set(mods);
+                    for name in gone {
+                        crate::actions::close_mod(s, &name);
+                    }
                 }
             }
             Some("menus") => {
@@ -104,10 +125,17 @@ pub(crate) fn connect(s: S) {
         if opened.get() {
             // The game went away (or the network did): try again.
             set_timeout(move || connect(s), std::time::Duration::from_secs(2));
+        } else if PAIRED.with(Cell::get) {
+            // Paired before: a game away and a changed code look the same
+            // here; the server says which.
+            check_code(move |answer| match answer {
+                Some(false) => needed(s),
+                _ => {
+                    set_timeout(move || connect(s), std::time::Duration::from_secs(3));
+                }
+            });
         } else {
-            // A new code is needed: the editor stops trying the old one too.
-            with_editor(|e| e.pause());
-            s.pairing.set(Pairing::Needed);
+            needed(s);
         }
     });
     ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -115,11 +143,47 @@ pub(crate) fn connect(s: S) {
     SOCKET.with(|sock| *sock.borrow_mut() = Some(ws));
 }
 
+/// A new code is needed: the editor stops trying the old one too.
+fn needed(s: S) {
+    PAIRED.with(|p| p.set(false));
+    with_editor(|e| e.pause());
+    // A code was typed and did not work: the page says so.
+    s.pair_failed.set(s.pairing.get_untracked() == Pairing::Connecting);
+    s.pairing.set(Pairing::Needed);
+}
+
+/// Whether the page's code is the game's: `Some(true)`, `Some(false)`, or
+/// `None` when the game does not answer.
+fn check_code(then: impl FnOnce(Option<bool>) + 'static) {
+    let Some(window) = web_sys::window() else { return };
+    let token = TOKEN.with(|t| t.borrow().clone());
+    let then = std::rc::Rc::new(RefCell::new(Some(then)));
+    let (ok_then, err_then) = (then.clone(), then);
+    let on_response = Closure::<dyn FnMut(JsValue)>::new(move |resp: JsValue| {
+        let status = js_sys::Reflect::get(&resp, &"status".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+        if let Some(f) = ok_then.borrow_mut().take() {
+            f(match status {
+                200 => Some(true),
+                401 => Some(false),
+                _ => None,
+            });
+        }
+    });
+    let on_error = Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
+        if let Some(f) = err_then.borrow_mut().take() {
+            f(None);
+        }
+    });
+    let _ = window.fetch_with_str(&format!("/check?token={token}")).then2(&on_response, &on_error);
+    on_response.forget();
+    on_error.forget();
+}
+
 /// A file changed in the game's folder: an open, unchanged tab follows it.
 pub(crate) fn reload(s: S, path: &str) {
     let tab = s.tabs.with_untracked(|t| t.iter().find(|t| t.path == path).cloned());
     let Some(tab) = tab else { return };
-    if tab.read_only {
+    if tab.read_only || mod_page(path).is_some() {
         return;
     }
     if tab.dirty {

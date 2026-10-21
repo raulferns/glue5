@@ -11,4 +11,10 @@
     // online stand-ins, the cloud's files).
     ("builtin_malloc", "emscripten_builtin_malloc"),
     ("builtin_free", "emscripten_builtin_free"),
+    // libc++'s nothrow operator new (std::stable_sort's buffers: cutscenes'
+    // load events, HUD markers), whose blocks rage's operator delete frees:
+    // made in rage's heap, through zlib's default allocator (operator new;
+    // a hook on operator new itself would be checked at every allocation).
+    ("nothrow_new", "operator_new_impl(unsigned long)"),
+    ("zcalloc", "zcalloc(void*, unsigned int, unsigned int)"),
 ]

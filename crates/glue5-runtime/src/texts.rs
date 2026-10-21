@@ -78,7 +78,10 @@ pub(crate) unsafe extern "C" fn text_get_internal(env: *mut Env, hash: u32) -> u
     if text != 0 {
         return text;
     }
-    let Some((_, ours)) = TEXTS.iter().find(|(label, _)| label_hash(label) == hash) else { return 0 };
+    // Labels' hashes once: misses come every frame (labels the data lacks).
+    static HASHES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| TEXTS.iter().map(|(label, _)| label_hash(label)).collect());
+    let Some((_, ours)) = TEXTS.iter().zip(hashes).find(|(_, h)| **h == hash).map(|(t, _)| t) else { return 0 };
     let mut placed = PLACED.lock().unwrap();
     let placed = placed.get_or_insert_default();
     if let Some(&at) = placed.get(&hash) {

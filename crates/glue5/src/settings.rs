@@ -76,6 +76,9 @@ pub struct Settings {
     pub studio: bool,
     /// Other devices on the network may open the Studio (with its code).
     pub studio_lan: bool,
+    /// The Studio's pairing code: kept, so that a browser paired once stays
+    /// paired when the game starts again (the Mods page makes a new one).
+    pub studio_code: String,
     /// Settings saved before the render scale: the back buffer's height.
     #[serde(skip_serializing)]
     render_height: Option<u32>,
@@ -234,6 +237,7 @@ impl Default for Settings {
             studio: true,
             // A phone's own browser is no place to write mods.
             studio_lan: crate::paths::MOBILE,
+            studio_code: String::new(),
             render_height: None,
             metalfx: None,
             metal_hud: None,
@@ -278,7 +282,11 @@ impl Settings {
 
     pub fn save(&self, user_dir: &Path) {
         let json = serde_json::to_vec_pretty(self).expect("settings serialise");
-        if let Err(e) = std::fs::write(Self::file(user_dir), json) {
+        // Through a copy: a write cut short (disk full, the app killed)
+        // leaves the old file, not one that loads as the defaults.
+        let file = Self::file(user_dir);
+        let tmp = file.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
             log::warn!("cannot save settings: {e}");
         }
     }

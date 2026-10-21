@@ -63,6 +63,8 @@ mod imp {
     thread_local! {
         /// `None` until the first rumble, and after an error (it starts over).
         static RUMBLE: RefCell<Option<Rumble>> = const { RefCell::new(None) };
+        /// No engine could be started (an iPad has none): when to try again.
+        static RETRY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
         static TAP: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
     }
 
@@ -100,9 +102,14 @@ mod imp {
             }
             let r = match state {
                 Some(r) => r,
+                None if RETRY.get().is_some_and(|t| Instant::now() < t) => return,
                 None => match start() {
                     Some(r) => state.insert(r),
-                    None => return,
+                    // Not at every frame of a rumble: once a second.
+                    None => {
+                        RETRY.set(Some(Instant::now() + Duration::from_secs(1)));
+                        return;
+                    }
                 },
             };
             if update(r, intensity, sharpness).is_none() {

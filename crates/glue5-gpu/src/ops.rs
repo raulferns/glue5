@@ -2,6 +2,7 @@
 //! resources, resolves, mipmaps, UAV clears and counters, readbacks, queries.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use glue5_runtime::gpu::{Command, query};
 use rustc_hash::FxHashMap;
@@ -11,6 +12,7 @@ use crate::done::{Copy, OcclusionResult, Work};
 use crate::exec::Gpu;
 use crate::format;
 use crate::objects::{Proxy, Tex};
+use crate::pipeline::Compiler;
 use crate::shader::{self, Kind, Program, Sample};
 
 const FULLSCREEN_VS: &str = "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }\n";
@@ -24,7 +26,8 @@ pub struct ComputePipe {
 type ComputeKey = (u32, Vec<(u32, TextureFormat, TextureFormat)>);
 
 /// Compute pipelines, shared with the compile threads (which build each
-/// compute shader's pipeline when the engine creates it).
+/// compute shader's pipeline when the engine creates it); those of the
+/// recipes known are made before the game starts (see `prepare.rs`).
 #[derive(Default)]
 pub struct Computes {
     cells: std::sync::Mutex<FxHashMap<ComputeKey, Arc<std::sync::OnceLock<Option<Arc<ComputePipe>>>>>>,
@@ -32,15 +35,17 @@ pub struct Computes {
 
 impl Computes {
     /// The pipeline for `cs` with storage textures in the formats bound
-    /// (`subs`: binding, declared format, bound format).
+    /// (`subs`: binding, declared format, bound format), and whether it was
+    /// not made yet (made now, or waited for while a compile thread makes it).
     pub fn get(
         &self,
-        device: &wgpu::Device,
+        compiler: &Compiler,
         cs: &Arc<Program>,
         subs: &[(u32, TextureFormat, TextureFormat)],
-    ) -> Option<Arc<ComputePipe>> {
+    ) -> (Option<Arc<ComputePipe>>, bool) {
         let cell = self.cells.lock().unwrap().entry((cs.id, subs.to_vec())).or_default().clone();
-        cell.get_or_init(|| build_compute(device, cs, subs)).clone()
+        let late = cell.get().is_none();
+        (cell.get_or_init(|| build_compute(compiler, cs, subs)).clone(), late)
     }
 
     /// Takes out the idle shader modules of the programs compute pipelines
@@ -53,11 +58,24 @@ impl Computes {
     }
 }
 
+/// Builds a compute pipeline (any thread), counted with the others.
 fn build_compute(
-    device: &wgpu::Device,
+    compiler: &Compiler,
     cs: &Arc<Program>,
     subs: &[(u32, TextureFormat, TextureFormat)],
 ) -> Option<Arc<ComputePipe>> {
+    let t0 = Instant::now();
+    let pipe = make_compute(compiler, cs, subs);
+    compiler.count(t0, pipe.is_some());
+    pipe
+}
+
+fn make_compute(
+    compiler: &Compiler,
+    cs: &Arc<Program>,
+    subs: &[(u32, TextureFormat, TextureFormat)],
+) -> Option<Arc<ComputePipe>> {
+    let device = &compiler.device;
     let program = if subs.is_empty() {
         cs.clone()
     } else {
@@ -72,9 +90,10 @@ fn build_compute(
     let layout = device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &program.layout_entries() });
     let module = program.module(device)?;
+    // Its constants in group 2, as a vertex stage's.
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[Some(&layout)],
+        bind_group_layouts: &[Some(&layout), None, program.constants.as_ref()],
         immediate_size: 0,
     });
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -87,7 +106,7 @@ fn build_compute(
             constants: &[],
             zero_initialize_workgroup_memory: false,
         },
-        cache: None,
+        cache: compiler.cache.as_ref(),
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
         log::warn!("gpu: compute pipeline {} failed: {e}", program.label);
@@ -96,8 +115,8 @@ fn build_compute(
     Some(Arc::new(ComputePipe { pipeline, layout, program }))
 }
 
-/// Helper pipelines, made on first use.
-#[derive(Default)]
+/// The renderer's own pipelines: depth copies made before the game starts,
+/// mipmaps by format on first use.
 pub struct Blits {
     proxies: [Option<wgpu::RenderPipeline>; 3],
     mips: FxHashMap<TextureFormat, Option<wgpu::RenderPipeline>>,
@@ -106,15 +125,20 @@ pub struct Blits {
 }
 
 fn fullscreen_pipeline(
-    device: &wgpu::Device,
+    compiler: &Compiler,
     label: &str,
     fs: &str,
     target: Option<TextureFormat>,
     depth: Option<TextureFormat>,
 ) -> Option<wgpu::RenderPipeline> {
-    let module = shader::create_module(device, label, &format!("{FULLSCREEN_VS}{fs}")).ok()?;
+    let t0 = Instant::now();
+    let device = &compiler.device;
+    let Ok(module) = shader::create_module(device, label, &format!("{FULLSCREEN_VS}{fs}")) else {
+        compiler.count(t0, false);
+        return None;
+    };
     let targets = [target.map(wgpu::ColorTargetState::from)];
-    Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: None,
         vertex: wgpu::VertexState {
@@ -139,54 +163,55 @@ fn fullscreen_pipeline(
             targets: if target.is_some() { &targets } else { &[] },
         }),
         multiview_mask: None,
-        cache: None,
-    }))
+        cache: compiler.cache.as_ref(),
+    });
+    compiler.count(t0, true);
+    Some(pipeline)
 }
 
 impl Blits {
-    /// 0: depth -> r32float, 1: stencil -> rg8uint, 2: float -> depth32float.
+    /// Makes the depth copies' pipelines: 0: depth -> r32float, 1: stencil
+    /// -> rg8uint, 2: float -> depth32float.
     ///
     /// A D3D stencil SRV (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT)
     /// reads the stencil in green, and the game's shaders test `.y` (the
     /// interior bit, 8, decides which local lights and which ambient light
     /// a pixel gets); WebGPU's stencil view has it in red. The copy has it
     /// in both.
-    fn proxy(&mut self, device: &wgpu::Device, kind: usize) -> Option<wgpu::RenderPipeline> {
-        if self.proxies[kind].is_none() {
-            self.proxies[kind] = match kind {
-                0 => fullscreen_pipeline(
-                    device,
-                    "depth as float",
-                    "@group(0) @binding(0) var src: texture_depth_2d;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(p.xy), 0), 0, 0, 1); }",
-                    Some(TextureFormat::R32Float),
-                    None,
-                ),
-                1 => fullscreen_pipeline(
-                    device,
-                    "stencil as uint",
-                    "@group(0) @binding(0) var src: texture_2d<u32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(p.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }",
-                    Some(TextureFormat::Rg8Uint),
-                    None,
-                ),
-                _ => fullscreen_pipeline(
-                    device,
-                    "float as depth",
-                    "@group(0) @binding(0) var src: texture_2d<f32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @builtin(frag_depth) f32 { return textureLoad(src, vec2i(p.xy), 0).x; }",
-                    None,
-                    Some(TextureFormat::Depth32Float),
-                ),
-            };
-        }
-        self.proxies[kind].clone()
+    pub fn new(compiler: &Compiler) -> Blits {
+        let proxies = [
+            fullscreen_pipeline(
+                compiler,
+                "depth as float",
+                "@group(0) @binding(0) var src: texture_depth_2d;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(p.xy), 0), 0, 0, 1); }",
+                Some(TextureFormat::R32Float),
+                None,
+            ),
+            fullscreen_pipeline(
+                compiler,
+                "stencil as uint",
+                "@group(0) @binding(0) var src: texture_2d<u32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(p.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }",
+                Some(TextureFormat::Rg8Uint),
+                None,
+            ),
+            fullscreen_pipeline(
+                compiler,
+                "float as depth",
+                "@group(0) @binding(0) var src: texture_2d<f32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @builtin(frag_depth) f32 { return textureLoad(src, vec2i(p.xy), 0).x; }",
+                None,
+                Some(TextureFormat::Depth32Float),
+            ),
+        ];
+        Blits { proxies, mips: FxHashMap::default(), zeros: None, scratch: None }
     }
 
     /// A 2x2 box filter of the previous mip (textureLoad: any float format).
-    fn mip(&mut self, device: &wgpu::Device, format: TextureFormat) -> Option<wgpu::RenderPipeline> {
+    fn mip(&mut self, compiler: &Compiler, format: TextureFormat) -> Option<wgpu::RenderPipeline> {
         self.mips
             .entry(format)
             .or_insert_with(|| {
                 fullscreen_pipeline(
-                    device,
+                    compiler,
                     "mip",
                     "@group(0) @binding(0) var src: texture_2d<f32>;
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
@@ -262,13 +287,20 @@ impl Gpu {
     // ---- textures read through copies ---------------------------------------------
 
     /// Refreshes the copies the program's textures are read through.
-    pub fn prepare_proxies(&mut self, prog: &Program) {
+    /// `slots`: the texture slots that may need one (see `proxy_slots`).
+    pub fn prepare_proxies(&mut self, prog: &Program, slots: u128) {
+        if slots == 0 {
+            return;
+        }
         let st = prog.stage as usize;
         for &i in &prog.textures {
             let b = &prog.bindings[i];
             let Kind::Texture { sample, .. } = b.kind else {
                 continue;
             };
+            if slots & 1 << (b.binding - shader::SRVS) == 0 {
+                continue;
+            }
             let Some(res) = self
                 .objs
                 .srv(self.s.srv[st][(b.binding - shader::SRVS) as usize])
@@ -287,7 +319,7 @@ impl Gpu {
                 _ => continue,
             };
             if t.samples > 1 {
-                crate::log_once(&format!("msproxy{}", prog.label), || {
+                crate::log_once_for("msproxy", u64::from(prog.id), || {
                     format!("{}: multisampled depth read as float: not supported", prog.label)
                 });
                 continue;
@@ -302,7 +334,7 @@ impl Gpu {
         if self.clears.iter().any(|c| c.tex == id) {
             self.flush_clears();
         }
-        let Some(pipeline) = self.blits.proxy(&self.device, kind) else {
+        let Some(pipeline) = self.blits.proxies[kind].clone() else {
             return;
         };
         self.end_pass();
@@ -446,7 +478,7 @@ impl Gpu {
         let (dst, dst_sub, dx, dy, dz, src, src_sub, has_box) =
             (c.w(0), c.w(1), c.w(2), c.w(3), c.w(4), c.w(5), c.w(6), c.w(7) != 0);
         let bx = [c.w(8), c.w(9), c.w(10), c.w(11), c.w(12), c.w(13)]; // left top front right bottom back
-        self.flush_clears();
+        self.flush_clears_of(&[src, dst]);
         let epoch = self.epoch;
         if let (Some(s), Some(d)) = (self.objs.buf(src), self.objs.buf(dst)) {
             let (Some(sg), Some(dg)) = (s.gpu.clone(), d.gpu.clone()) else {
@@ -563,7 +595,7 @@ impl Gpu {
     }
 
     pub fn copy_resource(&mut self, dst: u32, src: u32) {
-        self.flush_clears();
+        self.flush_clears_of(&[src, dst]);
         let epoch = self.epoch;
         if let (Some(s), Some(d)) = (self.objs.buf(src), self.objs.buf(dst)) {
             if let (Some(sg), Some(dg)) = (s.gpu.clone(), d.gpu.clone()) {
@@ -617,7 +649,7 @@ impl Gpu {
     }
 
     pub fn resolve(&mut self, dst: u32, dst_sub: u32, src: u32, src_sub: u32) {
-        self.flush_clears();
+        self.flush_clears_of(&[src, dst]);
         let epoch = self.epoch;
         let (Some(s), Some(d)) = (self.objs.tex(src), self.objs.tex(dst)) else {
             return;
@@ -661,15 +693,15 @@ impl Gpu {
     }
 
     pub fn generate_mips(&mut self, srv: u32) {
-        self.flush_clears();
         let Some(id) = self.objs.srv(srv).map(|v| v.res) else {
             return;
         };
+        self.flush_clears_of(&[id]);
         let Some(t) = self.objs.tex(id) else { return };
         if t.mips < 2 || format::is_depth(t.format) || t.format.is_compressed() || t.is_3d() || t.samples > 1 {
             return;
         }
-        let Some(pipeline) = self.blits.mip(&self.device, t.format) else {
+        let Some(pipeline) = self.blits.mip(&self.compiler, t.format) else {
             return;
         };
         let device = self.device.clone();
@@ -731,12 +763,12 @@ impl Gpu {
     // ---- UAVs ------------------------------------------------------------------------------
 
     pub fn clear_uav(&mut self, id: u32, values: [u32; 4]) {
-        self.flush_clears();
         let zero = values == [0; 4];
         let Some(view) = self.objs.uav(id) else {
             return;
         };
         let (res, mip, is_buffer) = (view.res, view.a, view.is_buffer);
+        self.flush_clears_of(&[res]);
         let epoch = self.epoch;
         if is_buffer {
             let Some(b) = self.objs.buf(res) else { return };
@@ -881,7 +913,7 @@ impl Gpu {
         let bx = [c.w(3), c.w(4), c.w(5), c.w(6), c.w(7), c.w(8)];
         let (to, row_pitch, slice_pitch, is_buffer, size, flag) =
             (c.addr(9), c.w(11), c.w(12), c.w(13) != 0, c.w(14), c.addr(15));
-        self.flush_clears();
+        self.flush_clears_of(&[src]);
         self.waited_on = true;
         let epoch = self.epoch;
         let done = |flag: u64| Work::Store { at: flag, value: 0 };
@@ -895,13 +927,14 @@ impl Gpu {
             let from = if has_box { bx[0] as u64 } else { 0 };
             let len =
                 if has_box { (bx[3] - bx[0]) as u64 } else { (size as u64).min(bytes) }.min(bytes.saturating_sub(from));
-            let staging = self.staging.get(&self.device, len.next_multiple_of(4).max(4));
+            // Copies go 4 bytes at a time: from the word the box starts in.
+            let skip = from & 3;
+            let copied = (skip + len).next_multiple_of(4).max(4);
+            let staging = self.staging.get(&self.device, copied);
             self.objs.buf(src).unwrap().used.set(epoch);
-            self.encoder().copy_buffer_to_buffer(&g, base + (from & !3), &staging, 0, len.next_multiple_of(4).max(4));
-            self.maps.push((
-                staging,
-                Box::new(move |s| Work::Readback { staging: s, copy: Copy::Bytes { to, len: len as usize }, flag }),
-            ));
+            self.encoder().copy_buffer_to_buffer(&g, base + (from - skip), &staging, 0, copied);
+            let (skip, len) = (skip as usize, len as usize);
+            self.maps.push((staging, Box::new(move |s| Work::Readback { staging: s, copy: Copy::Bytes { to, skip, len }, flag })));
             return;
         }
         let Some(t) = self.objs.tex(src) else {
@@ -916,6 +949,13 @@ impl Gpu {
         let pick = match t.upload {
             format::Upload::Direct => None,
             format::Upload::A8 => Some(3),
+            format::Upload::Unorm16 => {
+                crate::log_once("rb-unorm16", || "readback of 16-bit normalized texels kept as half floats skipped".into());
+                if flag != 0 {
+                    self.works.push(done(flag));
+                }
+                return;
+            }
             format::Upload::Bc(_) => {
                 crate::log_once("rb-bc", || "readback of a decoded BC texture skipped".into());
                 if flag != 0 {
@@ -1087,6 +1127,26 @@ impl Gpu {
 }
 
 impl Program {
+    /// A compute program's storage textures whose format bound (`bound`, by
+    /// binding) is not the one declared: (binding, declared, bound). The
+    /// translation guesses formats from the component count.
+    pub fn storage_formats(
+        &self,
+        bound: impl Fn(u32) -> Option<TextureFormat>,
+    ) -> Vec<(u32, TextureFormat, TextureFormat)> {
+        let declared = |b: &shader::Binding| match b.kind {
+            Kind::StorageTexture { format, .. } => Some(format),
+            _ => None,
+        };
+        self.bindings
+            .iter()
+            .filter_map(|b| {
+                let declared = declared(b)?;
+                bound(b.binding).filter(|f| *f != declared).map(|f| (b.binding, declared, f))
+            })
+            .collect()
+    }
+
     /// The same program compiled from other text (same bindings layout).
     pub fn with_text(&self, device: &wgpu::Device, text: &str, what: &str) -> anyhow::Result<Program> {
         let module = shader::create_module(device, &format!("{} [{what}]", self.label), text)?;

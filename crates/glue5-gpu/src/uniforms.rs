@@ -4,8 +4,9 @@
 //! each submit.
 //!
 //! Two sets of chunks alternate by frame, so a frame's constants never wait
-//! for the GPU to finish reading the previous frame's; bind groups name a
-//! chunk's buffer, so each (program, resources) pair needs one per chunk.
+//! for the GPU to finish reading the previous frame's. The constants' bind
+//! groups name a chunk's buffer: a few per program layout and chunk (those
+//! of the textures do not depend on the chunks).
 
 pub const CHUNK: u32 = 4 << 20;
 

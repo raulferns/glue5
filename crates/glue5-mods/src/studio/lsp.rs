@@ -5,6 +5,7 @@
 //! for the checker while they are open.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -15,12 +16,42 @@ use crate::checker::Checker;
 /// again (`isIncomplete`), so a short list keeps phones quick.
 const MAX_ITEMS: usize = 150;
 
-pub fn run(mut ws: Socket) -> std::io::Result<()> {
+/// An editor that only listens is pinged this often, and taken for gone
+/// (a phone out of range, a laptop shut: no close comes) after hearing
+/// nothing for `SILENT`; else its thread and the checker would stay.
+const PING: Duration = Duration::from_secs(20);
+const SILENT: Duration = Duration::from_secs(70);
+
+/// Serves one editor until it goes or `stop` (see session::run).
+pub fn run(mut ws: Socket, stop: &std::sync::atomic::AtomicBool) -> std::io::Result<()> {
     let mut docs: HashMap<String, String> = HashMap::new();
+    let (mut heard, mut pinged) = (Instant::now(), Instant::now());
+    // Only the stop and the ping to look after between messages: no need
+    // to wake 20 times a second as a session does.
+    let _ = ws.get_ref().set_read_timeout(Some(Duration::from_secs(1)));
     loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = ws.close(None);
+            let _ = ws.flush();
+            break;
+        }
         let text = match receive(&mut ws) {
-            Ok(Some(t)) => t,
-            Ok(None) => continue,
+            Ok(Some(t)) => {
+                heard = Instant::now();
+                t
+            }
+            Ok(None) => {
+                if heard.elapsed() > SILENT {
+                    break;
+                }
+                if pinged.elapsed() >= PING {
+                    pinged = Instant::now();
+                    if ws.send(tungstenite::Message::Ping(Default::default())).is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
             Err(()) => break,
         };
         let Ok(msg) = serde_json::from_str::<Value>(&text) else { continue };
@@ -38,6 +69,10 @@ pub fn run(mut ws: Socket) -> std::io::Result<()> {
                 "serverInfo": { "name": "glue5-luau", "version": env!("CARGO_PKG_VERSION") },
             })),
             "textDocument/didOpen" => {
+                // An editor has a handful open; this one is not an editor.
+                if docs.len() >= 64 && !docs.contains_key(&uri) {
+                    break;
+                }
                 docs.insert(uri.clone(), p["textDocument"]["text"].as_str().unwrap_or("").to_string());
                 publish(&mut ws, &uri, &docs)?;
                 None
@@ -59,7 +94,7 @@ pub fn run(mut ws: Socket) -> std::io::Result<()> {
             }
             "textDocument/completion" => Some(completion(&uri, p, &docs)),
             "textDocument/hover" => Some(hover(&uri, p, &docs)),
-            "textDocument/signatureHelp" => Some(signature(&uri, p)),
+            "textDocument/signatureHelp" => Some(signature(&uri, p, &docs)),
             "shutdown" => Some(Value::Null),
             "exit" => break,
             _ => {
@@ -90,26 +125,60 @@ fn module(uri: &str) -> String {
     path.to_string()
 }
 
-fn position(p: &Value) -> (u32, u32) {
-    (p["position"]["line"].as_u64().unwrap_or(0) as u32, p["position"]["character"].as_u64().unwrap_or(0) as u32)
+/// Line `line` of `text`, as Luau counts them.
+fn line_of(text: &str, line: u64) -> &str {
+    text.split('\n').nth(line as usize).unwrap_or("")
 }
 
-fn lsp_range(r: &Value) -> Value {
+/// LSP counts a line's columns in UTF-16 units, Luau in bytes: the same
+/// only up to the first character past ASCII.
+fn to_bytes(line: &str, utf16: u64) -> u64 {
+    let mut units = 0;
+    for (at, c) in line.char_indices() {
+        if units >= utf16 {
+            return at as u64;
+        }
+        units += c.len_utf16() as u64;
+    }
+    line.len() as u64 + utf16.saturating_sub(units)
+}
+
+fn to_utf16(line: &str, bytes: u64) -> u64 {
+    let mut end = (bytes as usize).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].encode_utf16().count() as u64 + bytes.saturating_sub(line.len() as u64)
+}
+
+/// The request's position, as the checker counts (`text`: the document).
+fn position(p: &Value, text: Option<&str>) -> (u32, u32) {
+    let line = p["position"]["line"].as_u64().unwrap_or(0);
+    let character = p["position"]["character"].as_u64().unwrap_or(0);
+    let character = text.map_or(character, |t| to_bytes(line_of(t, line), character));
+    (line as u32, character as u32)
+}
+
+/// A checker's range (`[line, column, line, column]`) as LSP's.
+fn lsp_range(r: &Value, text: Option<&str>) -> Value {
     let n = |i: usize| r.get(i).and_then(Value::as_u64).unwrap_or(0);
-    json!({ "start": { "line": n(0), "character": n(1) }, "end": { "line": n(2), "character": n(3) } })
+    let column = |l: u64, c: u64| text.map_or(c, |t| to_utf16(line_of(t, l), c));
+    let (l0, l1) = (n(0), n(2));
+    json!({ "start": { "line": l0, "character": column(l0, n(1)) }, "end": { "line": l1, "character": column(l1, n(3)) } })
 }
 
 /// Checks the document and sends its diagnostics.
 fn publish(ws: &mut Socket, uri: &str, docs: &HashMap<String, String>) -> std::io::Result<()> {
     let module = module(uri);
-    let found = api::diagnostics(&module, docs.get(uri).map(String::as_str));
+    let text = docs.get(uri).map(String::as_str);
+    let found = api::diagnostics(&module, text);
     let diagnostics: Vec<Value> = found
         .as_array()
         .map(|a| {
             a.iter()
                 .map(|d| {
                     json!({
-                        "range": lsp_range(&d["range"]),
+                        "range": lsp_range(&d["range"], text),
                         "severity": if d["severity"] == "warning" { 2 } else { 1 },
                         "code": d["code"],
                         "source": "luau",
@@ -127,10 +196,10 @@ fn publish(ws: &mut Socket, uri: &str, docs: &HashMap<String, String>) -> std::i
     send(ws, &note).map_err(|()| std::io::Error::other("closed"))
 }
 
-/// The identifier being typed before the cursor.
+/// The identifier being typed before the cursor (`character` in bytes).
 fn prefix(text: &str, line: u32, character: u32) -> String {
-    let Some(l) = text.lines().nth(line as usize) else { return String::new() };
-    let before: String = l.chars().take(character as usize).collect();
+    let l = line_of(text, line.into());
+    let before = l.get(..character as usize).unwrap_or(l);
     before.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect()
 }
 
@@ -139,7 +208,7 @@ fn completion(uri: &str, p: &Value, docs: &HashMap<String, String>) -> Value {
     if !module.ends_with(".luau") {
         return json!({ "isIncomplete": false, "items": [] });
     }
-    let (line, character) = position(p);
+    let (line, character) = position(p, docs.get(uri).map(String::as_str));
     let typed = docs.get(uri).map(|t| prefix(t, line, character)).unwrap_or_default().to_ascii_lowercase();
     let items = Checker::with(|c| c.complete(&module, line, character)).unwrap_or(Value::Null);
     let mut items: Vec<&Value> = items
@@ -186,8 +255,21 @@ fn completion(uri: &str, p: &Value, docs: &HashMap<String, String>) -> Value {
                 "sortText": format!("{rank:04}"),
                 "deprecated": i["deprecated"],
             });
-            if let Some(doc) = i["doc"].as_str().filter(|d| !d.is_empty()).and_then(api::documentation) {
-                item["documentation"] = json!({ "kind": "markdown", "value": doc });
+            // The details beside the list: the whole signature (the list cuts
+            // it), then the notes.
+            let doc = i["doc"].as_str().filter(|d| !d.is_empty()).and_then(api::documentation);
+            if !detail.is_empty() || doc.is_some() {
+                let mut value = String::new();
+                // (Not a namespace's whole table.)
+                if !detail.is_empty() && detail.len() <= 600 {
+                    let sep = if detail.starts_with('(') { "" } else { ": " };
+                    value.push_str(&format!("```luau\n{label}{sep}{detail}\n```"));
+                }
+                if let Some(doc) = doc {
+                    value.push_str("\n\n");
+                    value.push_str(&doc);
+                }
+                item["documentation"] = json!({ "kind": "markdown", "value": value });
             }
             item
         })
@@ -195,12 +277,13 @@ fn completion(uri: &str, p: &Value, docs: &HashMap<String, String>) -> Value {
     json!({ "isIncomplete": incomplete, "items": items })
 }
 
-fn hover(uri: &str, p: &Value, _docs: &HashMap<String, String>) -> Value {
+fn hover(uri: &str, p: &Value, docs: &HashMap<String, String>) -> Value {
     let module = module(uri);
     if !module.ends_with(".luau") {
         return Value::Null;
     }
-    let (line, character) = position(p);
+    let text = docs.get(uri).map(String::as_str);
+    let (line, character) = position(p, text);
     let h = Checker::with(|c| c.hover(&module, line, character)).unwrap_or(Value::Null);
     let Some(ty) = h["type"].as_str() else { return Value::Null };
     let mut value = format!("```luau\n{}\n```", crate::world::shorten(ty));
@@ -208,16 +291,16 @@ fn hover(uri: &str, p: &Value, _docs: &HashMap<String, String>) -> Value {
         value.push_str("\n\n");
         value.push_str(&doc);
     }
-    json!({ "contents": { "kind": "markdown", "value": value }, "range": lsp_range(&h["range"]) })
+    json!({ "contents": { "kind": "markdown", "value": value }, "range": lsp_range(&h["range"], text) })
 }
 
 /// The parameters of the call being typed, the current one marked.
-fn signature(uri: &str, p: &Value) -> Value {
+fn signature(uri: &str, p: &Value, docs: &HashMap<String, String>) -> Value {
     let module = module(uri);
     if !module.ends_with(".luau") {
         return Value::Null;
     }
-    let (line, character) = position(p);
+    let (line, character) = position(p, docs.get(uri).map(String::as_str));
     let sig = Checker::with(|c| c.signature(&module, line, character)).unwrap_or(Value::Null);
     let Some(params) = sig["params"].as_array() else { return Value::Null };
     // The label with the catalog's names short; each parameter by its offsets
@@ -241,4 +324,21 @@ fn signature(uri: &str, p: &Value) -> Value {
     }
     let active = sig["active"].as_u64().unwrap_or(0).min(params.len().saturating_sub(1) as u64);
     json!({ "signatures": [signature], "activeSignature": 0, "activeParameter": active })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn columns() {
+        // "à" is 2 bytes, 1 UTF-16 unit; "😀" 4 bytes, 2 units.
+        let line = "x = \"à😀\" .. y";
+        assert_eq!(super::to_bytes(line, 5), 5);
+        assert_eq!(super::to_bytes(line, 6), 7);
+        assert_eq!(super::to_bytes(line, 8), 11);
+        assert_eq!(super::to_utf16(line, 11), 8);
+        assert_eq!(super::to_utf16(line, 7), 6);
+        // Past the end (a range ending after the last character).
+        assert_eq!(super::to_utf16(line, line.len() as u64 + 1), line.encode_utf16().count() as u64 + 1);
+        assert_eq!(super::to_bytes(line, line.encode_utf16().count() as u64 + 1), line.len() as u64 + 1);
+    }
 }

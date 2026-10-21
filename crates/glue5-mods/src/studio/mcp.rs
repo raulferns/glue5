@@ -85,7 +85,7 @@ fn tools() -> Value {
         tool("list_mods", "The mods: name, state (running, stopped, error), the error, time per frame, files.", json!({}), &[]),
         tool("create_mod", "Creates a mod folder with a main.luau to start from.", json!({ "name": string("lowercase letters, digits, - and _") }), &["name"]),
         tool("read_file", "Reads a mod's file.", json!({ "path": string("<mod>/<file>, e.g. trainer/main.luau") }), &["path"]),
-        tool("write_file", "Writes a mod's file whole, and answers with the type checker's diagnostics for .luau files (none: it checks).", json!({ "path": string("<mod>/<file>"), "content": string("the whole file") }), &["path", "content"]),
+        tool("write_file", "Writes a mod's file whole, and answers with the type checker's diagnostics for .luau files (none: it checks). A running mod restarts with it when its mod.json says restartOnSave (the default); the answer then has its state and first log lines.", json!({ "path": string("<mod>/<file>"), "content": string("the whole file") }), &["path", "content"]),
         tool("delete_file", "Deletes a mod's file.", json!({ "path": string("<mod>/<file>") }), &["path"]),
         tool("check", "The type checker's diagnostics for a .luau file, as saved.", json!({ "path": string("<mod>/<file>.luau") }), &["path"]),
         tool("start_mod", "Starts a mod, and answers with its state and log after about a second.", json!({ "name": string("the mod") }), &["name"]),
@@ -115,18 +115,27 @@ fn call(name: &str, a: &Value) -> Value {
             "read_file" => Value::String(files::read(s("path")?)?),
             "write_file" => {
                 let path = s("path")?;
+                let (_, cursor) = crate::logs(u64::MAX);
                 files::write(path, s("content")?)?;
+                let mut out = json!({ "written": path });
                 if path.ends_with(".luau") || path.ends_with(".json") {
-                    json!({ "written": path, "diagnostics": api::diagnostics(path, None) })
-                } else {
-                    json!({ "written": path })
+                    out["diagnostics"] = api::diagnostics(path, None);
+                    super::checker_used_by_agent();
                 }
+                // A running mod restarts with it, as from the Studio.
+                if crate::saved(path) {
+                    out["restarted"] = settle(path.split('/').next().unwrap_or(""), cursor);
+                }
+                out
             }
             "delete_file" => {
                 files::delete(s("path")?)?;
                 json!({ "deleted": s("path")? })
             }
-            "check" => api::diagnostics(s("path")?, None),
+            "check" => {
+                super::checker_used_by_agent();
+                api::diagnostics(s("path")?, None)
+            }
             "start_mod" | "restart_mod" => {
                 let mod_name = s("name")?;
                 if !crate::mods().iter().any(|m| m.name == mod_name) {

@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -44,6 +45,7 @@ std::string range(const Luau::Location& l) {
 
 char* owned(const std::string& s) {
   char* p = static_cast<char*>(malloc(s.size() + 1));
+  if (!p) abort();
   memcpy(p, s.c_str(), s.size() + 1);
   return p;
 }
@@ -99,7 +101,8 @@ extern "C" {
 // null with `*error` set when they do not load.
 Glue5Checker* glue5_checker_new(const char* definitions, size_t len, char** error) {
   try {
-    auto* c = new Glue5Checker();
+    // Freed if loading the definitions throws.
+    std::unique_ptr<Glue5Checker> c(new Glue5Checker());
     std::string_view source(definitions, len);
     Luau::registerBuiltinGlobals(c->frontend, c->frontend.globals, false);
     Luau::registerBuiltinGlobals(c->frontend, c->frontend.globalsForAutocomplete, true);
@@ -118,12 +121,11 @@ Glue5Checker* glue5_checker_new(const char* definitions, size_t len, char** erro
         }
       }
       *error = owned(message);
-      delete c;
       return nullptr;
     }
     Luau::freeze(c->frontend.globals.globalTypes);
     Luau::freeze(c->frontend.globalsForAutocomplete.globalTypes);
-    return c;
+    return c.release();
   } catch (const std::exception& e) {
     *error = owned(e.what());
     return nullptr;
@@ -136,12 +138,17 @@ void glue5_string_free(char* s) { free(s); }
 
 // Sets (or, with a null source, removes) a file.
 void glue5_checker_set(Glue5Checker* c, const char* name, const char* source, size_t len) {
-  if (source) {
-    c->files.sources[name] = std::string(source, len);
-  } else {
-    c->files.sources.erase(name);
+  // No exception into Rust (it would abort the game): out of memory, the
+  // file is left as it was.
+  try {
+    if (source) {
+      c->files.sources[name] = std::string(source, len);
+    } else {
+      c->files.sources.erase(name);
+    }
+    c->frontend.markDirty(name);
+  } catch (...) {
   }
-  c->frontend.markDirty(name);
 }
 
 // [{"range":[l0,c0,l1,c1],"severity":"error"|"warning","code":"...","message":"..."}]
