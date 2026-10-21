@@ -10,6 +10,7 @@ publish.workspace = true
 glue5-game.workspace = true
 glue5-runtime.workspace = true
 log.workspace = true
+serde = "1"
 serde_json.workspace = true
 mlua = { version = "0.12", features = ["luau"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

@@ -21,6 +21,16 @@ pub fn resolve_hooks(module: &Module, list: &[(&str, &str)], called_only: &[&str
     if let Some(field) = called_only.iter().find(|&&f| !list.iter().any(|&(field, _)| field == f)) {
         bail!("`{field}` is called only, but is no hook");
     }
+    // One entry per field and per function: a function under two fields
+    // (one taken over, one called only, say) would be renamed for one of
+    // them only.
+    let (mut fields, mut functions) = (std::collections::HashSet::new(), std::collections::HashMap::new());
+    for &(field, name) in list {
+        ensure!(fields.insert(field), "hook field `{field}` is listed twice");
+        if let Some(other) = functions.insert(name, field) {
+            bail!("`{name}` is listed as both `{other}` and `{field}`");
+        }
+    }
     list.iter()
         .map(|&(field, name)| {
             ensure!(is_ident(field), "hook field `{field}` is not an identifier");

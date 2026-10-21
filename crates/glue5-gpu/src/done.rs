@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use glue5_runtime::gpu::{OCCLUSION_VISIBLE_COUNT, store_query};
 use glue5_runtime::memory::Mem;
@@ -45,10 +46,12 @@ pub enum Work {
         period: f32,
     },
     /// A frame's heartbeat: `value`, which the GPU wrote into `staging`
-    /// with the frame if it ran it ([`Done::heartbeat`]).
+    /// with the frame if it ran it ([`Done::heartbeat`]); `moves`: the
+    /// app's moves to the background and back when it was submitted.
     Heartbeat {
         staging: Staging,
         value: u64,
+        moves: u32,
     },
     Screenshot {
         staging: Staging,
@@ -167,16 +170,16 @@ impl Done {
     }
 
     /// A small buffer the GPU writes `value` into first thing in the next
-    /// submission; map it after that submit, as [`Work::Heartbeat`].
+    /// submission; its work ([`Beat::work`]) follows that submit.
     ///
     /// A driver can lose the GPU's context without saying so: after a GPU
     /// page fault, Mali on MediaTek has the kernel terminate the context,
     /// and its submissions go on "completing" without running. The picture
     /// then stops for good while the game runs on; the heartbeats show it.
-    pub fn heartbeat(&self, device: &wgpu::Device, queue: &wgpu::Queue, value: u64) -> wgpu::Buffer {
+    pub fn heartbeat(&self, device: &wgpu::Device, queue: &wgpu::Queue, value: u64) -> Beat {
         let buffer = self.pool.get(device, 8);
         queue.write_buffer(&buffer, 0, &value.to_le_bytes());
-        buffer
+        Beat { buffer, value, moves: MOVES.load(Ordering::Acquire) }
     }
 
     /// Runs `work` once `submission` has completed.
@@ -187,21 +190,64 @@ impl Done {
     }
 }
 
+/// A frame's heartbeat on its way to the GPU ([`Done::heartbeat`]).
+pub struct Beat {
+    buffer: wgpu::Buffer,
+    value: u64,
+    moves: u32,
+}
+
+impl Beat {
+    /// What reads it back, once the submission that writes it is made.
+    pub fn work(self) -> Work {
+        Work::Heartbeat { staging: Staging::map(self.buffer), value: self.value, moves: self.moves }
+    }
+}
+
 fn run(device: wgpu::Device, mem: Mem, pool: Arc<StagingPool>, rx: Receiver<(wgpu::SubmissionIndex, Vec<Work>)>) {
     // The engine paces its frames on what this thread completes.
     glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
     while let Ok((submission, works)) = rx.recv() {
-        let done = match device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }) {
-            Ok(_) => true,
-            Err(e) => {
-                log::error!("gpu: waiting for a submission: {e}");
-                false
-            }
-        };
+        let done = wait(&device, submission);
         for work in works {
             finish(mem, &pool, work, done);
         }
     }
+}
+
+/// One wait for the GPU, and how many in a row may end without the
+/// submission done before the GPU counts as hung: 20 s at least. Drivers
+/// end a GPU's work that runs for seconds themselves (Windows after 2 s,
+/// Linux's after up to 10, Apple's and phones' likewise), reporting the
+/// device lost; a submission is one frame's work or its uploads, behind a
+/// couple of frames at most, and what takes long before the game (making
+/// pipelines, loading) is the CPU's. Counted in waits, not in time: a
+/// process stopped meanwhile (a debugger, iOS suspending the app) ends one
+/// wait late, and the next finds the GPU done.
+const WAIT: Duration = Duration::from_secs(1);
+const HUNG_AFTER: u32 = 20;
+
+/// Waits until the GPU has finished `submission`: false if it never will.
+/// A GPU that stops working without the driver saying so (no device lost)
+/// would otherwise hold the game still for good: it ends with the reason.
+pub(crate) fn wait(device: &wgpu::Device, submission: wgpu::SubmissionIndex) -> bool {
+    let start = Instant::now();
+    for _ in 0..HUNG_AFTER {
+        let poll = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(WAIT) };
+        match device.poll(poll) {
+            Ok(_) => return true,
+            Err(wgpu::PollError::Timeout) => {}
+            Err(e) => {
+                log::error!("gpu: waiting for a submission: {e}");
+                return false;
+            }
+        }
+    }
+    glue5_runtime::exit::fail(format!(
+        "the GPU has not finished the game's work in {} s: it no longer runs it, and the driver says nothing",
+        start.elapsed().as_secs()
+    ));
+    false
 }
 
 /// The mapped contents of a staging buffer, or `None` if mapping failed.
@@ -293,22 +339,26 @@ fn finish(mem: Mem, pool: &StagingPool, work: Work, done: bool) {
             }
             release(pool, staging);
         }
-        Work::Heartbeat { mut staging, value } => {
+        Work::Heartbeat { mut staging, value, moves } => {
             let got = mapped(&mut staging, done).map(|data| u64::from_le_bytes(data[..8].try_into().unwrap()));
             release(pool, staging);
-            heartbeat(got, value);
+            heartbeat(got, value, moves);
         }
         Work::Screenshot { mut staging, width, height, bpr, format, path } => {
             let pixels = mapped(&mut staging, done).map(|data| data.to_vec());
             release(pool, staging);
             // Encoding takes tens of milliseconds: not on this thread.
             if let Some(pixels) = pixels {
-                std::thread::spawn(move || {
+                use glue5_runtime::qos::{Qos, spawn};
+                let encoded = spawn("gpu screenshot", Qos::Utility, move || {
                     match crate::present::write_png(&path, &pixels, width, height, bpr, format) {
                         Ok(()) => log::info!("gpu: screenshot {}", path.display()),
                         Err(e) => log::warn!("gpu: screenshot {}: {e:#}", path.display()),
                     }
                 });
+                if let Err(e) = encoded {
+                    log::warn!("gpu: no thread for a screenshot: {e}");
+                }
             }
         }
     }
@@ -318,16 +368,32 @@ fn finish(mem: Mem, pool: &StagingPool, work: Work, done: bool) {
 static MISSED: AtomicU32 = AtomicU32::new(0);
 
 /// Frames in a row without their heartbeat that make the GPU lost: more
-/// than a few, which a phone suspending the app with frames in flight may
-/// drop (iOS fails command buffers in the background).
+/// than a few, which a phone may fail as it sends the app to the background
+/// before the app learns of it.
 const MISSED_MAX: u32 = 30;
 
+/// The app's moves to the background and back, counted: odd while it is
+/// there ([`set_background`]).
+static MOVES: AtomicU32 = AtomicU32::new(0);
+
+/// The app went to the background, or came back.
+pub(crate) fn set_background(on: bool) {
+    let _ = MOVES.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (on != (n % 2 == 1)).then_some(n + 1));
+}
+
 /// A frame's heartbeat back: `got` read where the GPU was to write `value`
-/// (None: not mapped, which a device lost reports on its own).
-fn heartbeat(got: Option<u64>, value: u64) {
+/// (None: not mapped, which a device lost reports on its own), for a frame
+/// submitted after `moves` moves to the background and back.
+fn heartbeat(got: Option<u64>, value: u64, moves: u32) {
     let Some(got) = got else { return };
     if got == value {
         MISSED.store(0, Ordering::Relaxed);
+        return;
+    }
+    // iOS fails the GPU work of an app in the background, and wgpu counts it
+    // finished: a frame submitted there, or still in flight as the app went
+    // there or came back, says nothing of the GPU.
+    if moves % 2 == 1 || moves != MOVES.load(Ordering::Acquire) {
         return;
     }
     if MISSED.fetch_add(1, Ordering::Relaxed) + 1 == MISSED_MAX {

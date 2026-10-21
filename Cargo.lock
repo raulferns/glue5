@@ -1014,6 +1014,7 @@ dependencies = [
  "httparse",
  "log",
  "mlua",
+ "serde",
  "serde_json",
  "sha2",
  "tungstenite",
@@ -1021,12 +1022,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "glue5-qos"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "glue5-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake2",
  "getrandom 0.4.3",
  "glue5-game",
+ "glue5-qos",
  "glue5-stream",
  "jiff",
  "libc",
@@ -1046,6 +1057,7 @@ dependencies = [
  "anyhow",
  "crc32fast",
  "env_logger",
+ "glue5-qos",
  "libc",
  "log",
  "serde_json",

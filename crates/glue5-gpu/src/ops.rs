@@ -13,7 +13,7 @@ use crate::exec::Gpu;
 use crate::format;
 use crate::objects::{Proxy, Tex};
 use crate::pipeline::Compiler;
-use crate::shader::{self, Kind, Program, Sample};
+use crate::shader::{self, Kind, Program};
 
 const FULLSCREEN_VS: &str = "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }\n";
 
@@ -312,11 +312,8 @@ impl Gpu {
             let Some(t) = self.objs.tex(res) else {
                 continue;
             };
-            let kind = match (format::is_depth(t.format), sample) {
-                (true, Sample::Uint) => 1,
-                (true, Sample::Float | Sample::Sint) => 0,
-                (false, Sample::Depth) => 2,
-                _ => continue,
+            let Some(kind) = crate::draw::proxy_kind(t.format, sample) else {
+                continue;
             };
             if t.samples > 1 {
                 crate::log_once_for("msproxy", u64::from(prog.id), || {

@@ -468,7 +468,10 @@ fn index(root: &Path, rel: &str, out: &mut HashMap<String, String>) -> io::Resul
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
         out.insert(path.to_ascii_lowercase(), path.clone());
-        if entry.file_type()?.is_dir() {
+        // A link to a folder is followed, as the catalog's listing does (a
+        // part of the game kept elsewhere); one to nothing is a name only.
+        let kind = entry.file_type()?;
+        if kind.is_dir() || kind.is_symlink() && fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
             index(root, &path, out)?;
         }
     }
@@ -596,6 +599,22 @@ fn game_dates() {
     assert_eq!(vfs.fstat(fd).unwrap().mtime, listed);
     // Another size than listed: its own date.
     assert_ne!(epoch(vfs.stat("/game/b.xml", true).unwrap().mtime).0, 5);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Folders linked into the game are looked up in any case too.
+#[cfg(unix)]
+#[test]
+fn linked_folders() {
+    let dir = std::env::temp_dir().join(format!("glue5-vfs-links-{}", std::process::id()));
+    fs::create_dir_all(dir.join("elsewhere/X64")).unwrap();
+    fs::create_dir_all(dir.join("game")).unwrap();
+    fs::write(dir.join("elsewhere/X64/A.rpf"), b"abc").unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("game/Linked")).unwrap();
+    std::os::unix::fs::symlink(dir.join("none"), dir.join("game/broken")).unwrap();
+    let vfs = Vfs::new(Some(dir.join("game")), dir.join("user")).unwrap();
+    assert_eq!(vfs.game_index.get("linked/x64/a.rpf").map(String::as_str), Some("Linked/X64/A.rpf"));
+    assert!(vfs.game_index.contains_key("broken"));
     let _ = fs::remove_dir_all(dir);
 }
 

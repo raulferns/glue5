@@ -330,6 +330,22 @@ pub fn call(lua: &Lua, index: usize, args: MultiValue) -> mlua::Result<MultiValu
             }
             slot += if p.kind == K::Vec3 && p.dir == D::In { 24 } else { 8 };
         }
+        // A mod's script thread is ended by its mod, not by a native
+        // (engine.rs); the game's own threads may be.
+        let mods_thread = match n.name {
+            "TERMINATE_THREAD" => crate::engine::is_mod_thread(mem.u32(params)),
+            // By name, as the engine compares them (case aside).
+            "TERMINATE_ALL_SCRIPTS_WITH_THIS_NAME" => {
+                mem.str(mem.u64(params)).to_ascii_lowercase().starts_with(crate::engine::PREFIX)
+            }
+            _ => false,
+        };
+        if mods_thread {
+            return Err(mlua::Error::runtime(format!(
+                "{}: that is a mod's script thread; a mod ends when its code returns, or from the Mods page",
+                qualified(n)
+            )));
+        }
         // The engine fails when a pool is full: refused before that
         // (CREATE_PED, CLONE_PED, CREATE_VEHICLE...).
         if n.name.starts_with("CREATE_") || n.name.starts_with("CLONE_") {

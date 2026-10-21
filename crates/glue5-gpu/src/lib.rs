@@ -98,14 +98,21 @@ pub unsafe fn enable_metal_hud() {
     };
 }
 
-/// Has the renderer free, at its next frame, what it keeps only to be faster
-/// and can make again: the system is short of memory (iOS's memory warning,
+/// Has the renderer free, at its next frame or pause, what it keeps only to
+/// be faster and can make again: the system is short of memory (iOS's memory warning,
 /// Android's `onTrimMemory`). Callable from any thread.
 pub fn trim() {
     TRIM.store(true, Ordering::Relaxed);
 }
 
 static TRIM: AtomicBool = AtomicBool::new(false);
+
+/// The app went to the background (did, not only inactive), or came back:
+/// there iOS fails the GPU's work, which then says nothing of the GPU (see
+/// `done.rs`'s heartbeat). Callable from any thread.
+pub fn set_background(on: bool) {
+    done::set_background(on);
+}
 
 /// [`trim`] was asked for since the last call.
 pub(crate) fn take_trim() -> bool {
@@ -238,9 +245,8 @@ impl Screen {
             let shader_dir = settings.shader_dir.clone();
             let progress = Arc::new(prepare::Progress::default());
             let shared = progress.clone();
-            let thread = std::thread::Builder::new()
-                .name("gpu prepare".into())
-                .spawn(move || prepare::prepare(&gpu, &settings, &shared))
+            let prepare = move || prepare::prepare(&gpu, &settings, &shared);
+            let thread = glue5_runtime::qos::spawn("gpu prepare", glue5_runtime::qos::Qos::Initiated, prepare)
                 .expect("spawning the prepare thread");
             self.preparing = Some(Preparing { shader_dir, progress, thread });
         }

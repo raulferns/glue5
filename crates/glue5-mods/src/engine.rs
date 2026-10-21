@@ -103,6 +103,20 @@ struct Engine {
 
 thread_local! {
     static ENGINE: RefCell<Engine> = RefCell::default();
+    /// The ids of the mods' script threads (ENGINE is borrowed while a mod
+    /// runs; natives.rs asks).
+    static THREADS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What the names of the mods' programs and threads start with.
+pub(crate) const PREFIX: &str = "glue5:";
+
+/// Whether script thread `id` is a mod's. A mod's thread is ended by the
+/// hook, from outside it: a native that ended it from inside (the mod
+/// itself, through TERMINATE_THREAD) would leave the hook going on in a
+/// dead thread.
+pub(crate) fn is_mod_thread(id: u32) -> bool {
+    THREADS.with_borrow(|t| t.contains(&id))
 }
 
 unsafe extern "C" fn script_wait(env: *mut Env, info: u64) {
@@ -194,6 +208,7 @@ impl Engine {
                 }
                 crate::menus::remove_instance(r.vm.instance());
                 let r = self.running.remove(i);
+                THREADS.with_borrow_mut(|t| t.retain(|&id| id != r.thread_id));
                 // Snippets still queued get an answer (unless a new console
                 // started meanwhile: they are its own).
                 if r.name == REPL && !self.running.iter().any(|x| x.name == REPL && !x.ending) {
@@ -319,6 +334,7 @@ impl Engine {
         if thread == 0 {
             return Err("its script thread is gone".into());
         }
+        THREADS.with_borrow_mut(|t| t.push(thread_id));
         self.running.push(Running {
             name: name.to_string(),
             thread_id,
@@ -366,7 +382,7 @@ impl Engine {
         if u64::from(mem.u8(PROGRAMS_FREE)) >= PROGRAM_SLOTS {
             return Err("the game's program registry is full".into());
         }
-        let id = natives::joaat(&format!("glue5:{name}"));
+        let id = natives::joaat(&format!("{PREFIX}{name}"));
         let program = unsafe { malloc(env, PROGRAM_SIZE)? };
         // A program of its own from nothing but the class (the template's
         // vtable): none of the loaded one's resource (its page map at +8,
@@ -382,7 +398,7 @@ impl Engine {
         mem.set_u32(program + 72, 0);
         mem.set_u32(program + 88, id);
         mem.set_u32(program + 92, 1 << 24); // references: never released
-        mem.set_u64(program + 96, unsafe { wasm_string(env, &format!("glue5:{name}")) });
+        mem.set_u64(program + 96, unsafe { wasm_string(env, &format!("{PREFIX}{name}")) });
         mem.set_u64(program + 104, 0); // strings
         mem.set_u32(program + 112, 0);
         unsafe { orig::script_insert_program(env, program) };

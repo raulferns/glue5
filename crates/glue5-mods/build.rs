@@ -119,6 +119,24 @@ const NEVER_NONE: &[&str] = &["PLAYER_PED_ID", "GET_PLAYER_PED", "GET_PLAYER_PED
 /// thread only waits through `wait`, and ends through `mod`).
 const RESERVED: &[&str] = &["WAIT", "TERMINATE_THIS_THREAD"];
 
+/// Natives that keep the pointer they are given past the call: a mod's
+/// arguments are on the stack only while the native runs. Save blocks
+/// (their ends too: nothing a mod can open), variables shared over the
+/// network, variables the anti-cheat watches.
+fn keeps_pointer(name: &str) -> bool {
+    name.starts_with("START_SAVE_")
+        || name.starts_with("STOP_SAVE_")
+        || name.ends_with("_TO_SAVE")
+        || (name.starts_with("NETWORK_REGISTER_") && name.ends_with("_BROADCAST_VARIABLES"))
+        || name == "REGISTER_SCRIPT_VARIABLE"
+        || name == "UNREGISTER_SCRIPT_VARIABLE"
+}
+
+/// Natives that read a structure through what the database calls an
+/// `int*` (`CTaskScriptedAnimation::ScriptInitSlotData`): one value would
+/// leave them reading past it.
+const STRUCTURES: &[&str] = &["TASK_SCRIPTED_ANIMATION", "PLAY_ENTITY_SCRIPTED_ANIM"];
+
 fn run() -> Result<()> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let root = manifest.parent().and_then(Path::parent).context("workspace root")?.to_path_buf();
@@ -177,12 +195,28 @@ fn run() -> Result<()> {
             *skipped.entry("reserved").or_default() += 1;
             continue;
         }
+        if keeps_pointer(&b.name) || STRUCTURES.contains(&b.name.as_str()) {
+            *skipped.entry("pointers kept or structures").or_default() += 1;
+            continue;
+        }
         let entry = by_name.get(&b.name).map(|(_, e)| *e);
         let from_db = entry.map(|e| db_params(e, &b.name)).transpose()?;
         let from_binary = b.command.as_ref().map(|c| binary_params(c, &b.name));
+        // A pointer the database cannot type (`Any*`: a structure, an array,
+        // a gamer handle) where the binary takes an `int&`, which is also
+        // how the commands take the scripts' structures: its size is
+        // unknown, so a buffer of one value could be written past
+        // (COPY_SCRIPT_STRUCT, GET_EVENT_DATA, NETWORK_HANDLE_FROM_PLAYER).
+        // A `float&` or a `Vector3&` is one value; where the binary takes a
+        // value, the database is wrong and the binary is right (ADD_ROPE).
+        let untyped = entry.is_some_and(untyped_pointer);
         let params = match (from_db, from_binary) {
             (Some(Some(db)), Some(Some(bin))) => merge(db, &bin),
             (Some(Some(db)), _) => db,
+            (_, Some(Some(bin))) if untyped && bin.iter().any(|p| p.dir != Dir::In && p.kind == Kind::Int) => {
+                *skipped.entry("untyped pointers").or_default() += 1;
+                continue;
+            }
             (_, Some(Some(bin))) => bin,
             _ => {
                 *skipped.entry(if b.unused { "unused, untyped" } else { "untyped" }).or_default() += 1;
@@ -486,6 +520,17 @@ fn db_params(entry: &Value, native: &str) -> Result<Option<Vec<Param>>> {
     Ok(Some(params))
 }
 
+/// Whether one of the database's parameters is a pointer to something
+/// the mods cannot pass (`Any*`, `char*`, a structure).
+fn untyped_pointer(entry: &Value) -> bool {
+    entry["params"].as_array().is_some_and(|params| {
+        params.iter().filter_map(|p| p["type"].as_str()).any(|t| {
+            t != "const char*"
+                && t.strip_suffix('*').is_some_and(|inner| !value_kind(inner).is_some_and(|k| !matches!(k, Kind::Any | Kind::Str)))
+        })
+    })
+}
+
 /// The typed command's C++ parameters.
 fn binary_params(command: &[String], native: &str) -> Option<Vec<Param>> {
     command
@@ -758,6 +803,7 @@ declare world: {
 declare json: {
 	-- The value as JSON text: a table with keys 1..n (or none) is an array, another an object
 	-- (string keys; number keys written as strings); a vector is [x, y, z]. `pretty` indents it.
+	-- Text over 1 MB (what storage keeps), or tables nested over 64 deep (a table that holds itself), is an error.
 	encode: (value: any, pretty: boolean?) -> string,
 	-- JSON text as Luau values; null is nil.
 	decode: (text: string) -> any,
@@ -776,7 +822,7 @@ declare storage: {
 
 declare ui: {
 	-- A menu the app shows (the Mods page's MENUS: F7, or the button beside the settings
-	-- button on touch screens); a mod with one stays running.
+	-- button on touch screens); a mod with one stays running. 16 menus of 64 items at most.
 	menu: (title: string) -> Menu,
 	-- A notification over the game.
 	notify: (text: string) -> (),

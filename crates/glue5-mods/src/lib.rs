@@ -144,6 +144,9 @@ static SHARED: Shared = Shared {
 };
 
 const LOG_LINES: usize = 2000;
+/// The longest log line kept (a mod may print megabytes): past it the
+/// line is cut.
+const LOG_LINE: usize = 8 << 10;
 
 /// The mod whose turn it is (empty between turns), for the failure note.
 static RUNNING_MOD: Mutex<String> = Mutex::new(String::new());
@@ -555,6 +558,14 @@ pub fn tainted() -> bool {
 }
 
 pub(crate) fn log_line(module: &str, level: LogLevel, text: &str) {
+    let cut;
+    let text = if text.len() > LOG_LINE {
+        let head = &text[..text.floor_char_boundary(LOG_LINE)];
+        cut = format!("{head}… ({} bytes more)", text.len() - head.len());
+        &cut
+    } else {
+        text
+    };
     match level {
         LogLevel::Info => log::info!("mod {module}: {text}"),
         LogLevel::Error => log::error!("mod {module}: {text}"),
@@ -566,4 +577,20 @@ pub(crate) fn log_line(module: &str, level: LogLevel, text: &str) {
     let seq = s.next_seq;
     s.next_seq += 1;
     s.log.push_back(LogLine { seq, time: SystemTime::now(), module: module.to_string(), level, text: text.to_string() });
+}
+
+#[cfg(test)]
+mod tests {
+    /// A mod that prints megabytes leaves a line of 8 KB and a note of how
+    /// much was cut.
+    #[test]
+    fn long_log_lines_are_cut() {
+        let text = format!("{}tail", "é".repeat(10_000));
+        super::log_line("log-test", super::LogLevel::Info, &text);
+        let line = super::recent_logs(super::LOG_LINES).into_iter().rev().find(|l| l.module == "log-test").unwrap();
+        assert!(line.text.len() < super::LOG_LINE + 64, "{}", line.text.len());
+        assert!(line.text.ends_with(&format!("… ({} bytes more)", text.len() - super::LOG_LINE)), "{}", &line.text[line.text.len() - 40..]);
+        super::log_line("log-test", super::LogLevel::Info, "short");
+        assert_eq!(super::recent_logs(super::LOG_LINES).into_iter().rev().find(|l| l.module == "log-test").unwrap().text, "short");
+    }
 }

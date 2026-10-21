@@ -30,9 +30,10 @@ const INTERVALS: u64 = 19447080;
 /// What the limiter lets a frame take when it is off: 1/256 s.
 const UNLIMITED: f32 = 1.0 / 256.0;
 
-/// 1 while the app is in the background where the system lets it run
-/// (Android): the render thread stops at the end of its frame, and with it
-/// the game, as iOS suspends it.
+/// 1 while the app is in the background (phones): the render thread stops
+/// at the end of its frame, and with it the game. Android lets the app run
+/// there; iOS runs it for a while before suspending it, failing its GPU
+/// work meanwhile.
 static BACKGROUND: AtomicU32 = AtomicU32::new(0);
 
 /// The app went to the background, or came back.

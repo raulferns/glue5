@@ -161,7 +161,7 @@ impl Vm {
             let values: Vec<Value> = args.collect();
             if let Some(sender) = waiting.borrow_mut().remove(&id) {
                 let _ = sender.send(if ok {
-                    Ok(values.iter().map(describe).collect::<Vec<_>>().join(", "))
+                    Ok(describe_list(values.iter(), ", ", true))
                 } else {
                     Err(values.first().map_or_else(|| "error".into(), describe_plain))
                 });
@@ -347,7 +347,7 @@ fn base(name: &str, log: Rc<dyn Fn(&str)>, sched: &Sched) -> mlua::Result<(Lua, 
     g.set(
         "print",
         lua.create_function(move |_, args: MultiValue| {
-            let line = args.iter().map(describe_plain).collect::<Vec<_>>().join(" ");
+            let line = describe_list(args.iter(), " ", false);
             log(&line);
             Ok(())
         })?,
@@ -501,43 +501,122 @@ pub fn error_text(e: &mlua::Error) -> String {
     }
 }
 
-/// A value as the REPL shows it.
-pub fn describe(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("{:?}", s.to_string_lossy()),
-        other => describe_plain(other),
-    }
-}
+/// What `print` and the console show at most, tables' contents included,
+/// a log line: past it, `…`.
+const DESCRIBE_TEXT: usize = 8 << 10;
+/// Tables nested deeper show as `{…}`.
+const DESCRIBE_DEPTH: usize = 8;
+/// Entries shown of each table.
+const DESCRIBE_ENTRIES: usize = 16;
 
 /// A value as `print` shows it: strings as they are.
 fn describe_plain(v: &Value) -> String {
-    match v {
-        Value::Nil => "nil".into(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{n:.0}"),
-        Value::Number(n) => format!("{n}"),
-        Value::Vector(v) => format!("vector({}, {}, {})", short(v.x()), short(v.y()), short(v.z())),
-        Value::String(s) => s.to_string_lossy(),
-        Value::Table(t) => {
-            let mut parts = Vec::new();
-            for (i, pair) in t.pairs::<Value, Value>().enumerate() {
-                if i == 16 {
-                    parts.push("…".to_string());
-                    break;
-                }
-                if let Ok((k, v)) = pair {
-                    parts.push(match k {
-                        Value::Integer(_) => describe(&v),
-                        k => format!("{} = {}", describe_plain(&k), describe(&v)),
-                    });
-                }
-            }
-            format!("{{{}}}", parts.join(", "))
+    describe_list(std::slice::from_ref(v), "", false)
+}
+
+/// Values one after the other (`print`'s arguments, the REPL's results),
+/// within the one limit.
+fn describe_list<'a>(values: impl IntoIterator<Item = &'a Value>, separator: &str, quoted: bool) -> String {
+    let mut d = Describe::default();
+    for (i, v) in values.into_iter().enumerate() {
+        if i > 0 {
+            d.push(separator);
         }
-        Value::Function(_) => "function".into(),
-        Value::Error(e) => error_text(e),
-        other => other.type_name().into(),
+        d.value(v, quoted);
+    }
+    if d.full {
+        d.out.push('…');
+    }
+    d.out
+}
+
+/// Writes a value as text within [`DESCRIBE_TEXT`]: the work ends with the
+/// text, whatever the tables hold (themselves, the same table many times).
+#[derive(Default)]
+struct Describe {
+    out: String,
+    /// The tables being written, outermost first (one inside itself is a
+    /// cycle).
+    path: Vec<*const std::ffi::c_void>,
+    full: bool,
+}
+
+impl Describe {
+    /// Adds `text`, or what fits of it with the `…` that says it was cut.
+    fn push(&mut self, text: &str) {
+        if self.full {
+            return;
+        }
+        let room = (DESCRIBE_TEXT - '…'.len_utf8()).saturating_sub(self.out.len());
+        if text.len() <= room {
+            self.out.push_str(text);
+        } else {
+            self.out.push_str(&text[..text.floor_char_boundary(room)]);
+            self.full = true;
+        }
+    }
+
+    fn value(&mut self, v: &Value, quoted: bool) {
+        if self.full {
+            return;
+        }
+        match v {
+            Value::String(s) => {
+                // Only what can be shown is copied out of the VM.
+                let bytes = s.as_bytes();
+                let head = String::from_utf8_lossy(&bytes[..bytes.len().min(DESCRIBE_TEXT + 1)]);
+                let cut = head.len() < bytes.len();
+                if quoted {
+                    self.push(&format!("{head:?}"));
+                } else {
+                    self.push(&head);
+                }
+                self.full |= cut;
+            }
+            Value::Table(t) => self.table(t),
+            Value::Nil => self.push("nil"),
+            Value::Boolean(b) => self.push(&b.to_string()),
+            Value::Integer(i) => self.push(&i.to_string()),
+            Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => self.push(&format!("{n:.0}")),
+            Value::Number(n) => self.push(&format!("{n}")),
+            Value::Vector(v) => self.push(&format!("vector({}, {}, {})", short(v.x()), short(v.y()), short(v.z()))),
+            Value::Function(_) => self.push("function"),
+            Value::Error(e) => self.push(&error_text(e)),
+            other => self.push(other.type_name()),
+        }
+    }
+
+    fn table(&mut self, t: &Table) {
+        let at = t.to_pointer();
+        if self.path.contains(&at) {
+            return self.push("<cycle>");
+        }
+        if self.path.len() >= DESCRIBE_DEPTH {
+            return self.push("{…}");
+        }
+        self.path.push(at);
+        self.push("{");
+        for (i, pair) in t.pairs::<Value, Value>().enumerate() {
+            if self.full {
+                break;
+            }
+            if i > 0 {
+                self.push(", ");
+            }
+            if i == DESCRIBE_ENTRIES {
+                self.push("…");
+                break;
+            }
+            if let Ok((k, v)) = pair {
+                if !matches!(k, Value::Integer(_)) {
+                    self.value(&k, false);
+                    self.push(" = ");
+                }
+                self.value(&v, true);
+            }
+        }
+        self.push("}");
+        self.path.pop();
     }
 }
 
@@ -581,5 +660,58 @@ impl Drop for Vm {
         if let Some(storage) = &self.storage {
             storage.flush(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Lua, Value};
+
+    use super::{DESCRIBE_TEXT, describe_list, describe_plain};
+
+    /// A value as the REPL shows it.
+    fn describe(v: &Value) -> String {
+        describe_list(std::slice::from_ref(v), "", true)
+    }
+
+    fn value(lua: &Lua, code: &str) -> Value {
+        lua.load(code).eval().unwrap()
+    }
+
+    #[test]
+    fn describe_values() {
+        let lua = Lua::new();
+        assert_eq!(describe(&value(&lua, "'a'")), r#""a""#);
+        assert_eq!(describe_plain(&value(&lua, "'a'")), "a");
+        assert_eq!(describe(&value(&lua, "{1, 'x', {true}}")), r#"{1, "x", {true}}"#);
+        assert_eq!(describe(&value(&lua, "{k = 2.5}")), "{k = 2.5}");
+        let wide = describe(&value(&lua, "local t = {} for i = 1, 40 do t[i] = i end return t"));
+        assert!(wide.ends_with(", 16, …}"), "{wide}");
+    }
+
+    /// A table inside itself, one held many times over, one nested deep,
+    /// a long string: bounded text, quickly.
+    #[test]
+    fn describe_bounded() {
+        let lua = Lua::new();
+        let cycle = describe(&value(&lua, "local a, b = {}, {} a.b = b b.a = a return a"));
+        assert_eq!(cycle, "{b = {a = <cycle>}}");
+        let start = std::time::Instant::now();
+        // 16^12 tables if written out.
+        let dag = describe(&value(
+            &lua,
+            "local t = {} for _ = 1, 12 do local u = {} for i = 1, 16 do u[i] = t end t = u end return t",
+        ));
+        assert!(dag.len() <= DESCRIBE_TEXT, "{}", dag.len());
+        let deep = describe(&value(&lua, "local t = {} for _ = 1, 100000 do t = {t} end return t"));
+        assert!(deep.contains("{…}") && deep.len() < 64, "{deep}");
+        let long = describe_plain(&value(&lua, "string.rep('é', 1000000)"));
+        assert!(long.len() <= DESCRIBE_TEXT && long.ends_with('…'));
+        let quoted = describe(&value(&lua, "{string.rep('x', 100000)}"));
+        assert!(quoted.len() <= DESCRIBE_TEXT && quoted.ends_with('…'));
+        let many: mlua::MultiValue = lua.load("local t = {} for i = 1, 5000 do t[i] = string.rep('x', 100) end return unpack(t)").eval().unwrap();
+        let many = describe_list(many.iter(), ", ", true);
+        assert!(many.len() <= DESCRIBE_TEXT && many.ends_with('…'));
+        assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
     }
 }

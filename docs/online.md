@@ -45,6 +45,8 @@ To add a friend:
   enough to answer for them.
 - Like any player in the same session, a friend sees your Internet
   address.
+- A device keeps and answers in full only someone who shows it receives
+  at its address: nobody can use the players to flood someone else's.
 - Your key, code and friends are in `friends.json` in the user folder,
   readable by you only.
 

@@ -32,7 +32,8 @@ mod online;
 pub mod overlay;
 mod p2p;
 pub mod prompts;
-pub mod qos;
+/// Thread priorities (a crate of their own: the stream's threads have them too).
+pub use glue5_qos as qos;
 mod readback;
 mod scenario;
 mod shader_settings;

@@ -21,6 +21,7 @@ glue5-gpu = { path = "crates/glue5-gpu" }
 glue5 = { path = "crates/glue5" }
 glue5-stream = { path = "crates/glue5-stream" }
 glue5-mods = { path = "crates/glue5-mods" }
+glue5-qos = { path = "crates/glue5-qos" }
 
 anyhow = "1"
 log = "0.4"

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::{MOBILE, TV};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The game directory, once found or chosen.
@@ -261,9 +261,15 @@ impl Settings {
     }
 
     pub fn load(user_dir: &Path) -> Settings {
-        let mut settings = match std::fs::read(Self::file(user_dir)) {
+        let file = Self::file(user_dir);
+        let mut settings = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                log::warn!("ignoring unreadable settings: {e}");
+                // Kept aside (the defaults are saved over it soon), not lost.
+                let aside = file.with_extension("json.bad");
+                match std::fs::rename(&file, &aside) {
+                    Ok(()) => log::warn!("settings unreadable ({e}): kept as {}, the defaults instead", aside.display()),
+                    Err(r) => log::warn!("settings unreadable ({e}), not kept aside ({r}): the defaults instead"),
+                }
                 Settings::default()
             }),
             Err(_) => Settings::default(),
@@ -352,6 +358,20 @@ mod tests {
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::MetalHud);
         std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": false}"#).unwrap();
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::Off);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Settings that cannot be read are kept aside, not saved over.
+    #[test]
+    fn unreadable_settings_kept_aside() {
+        let dir = std::env::temp_dir().join(format!("glue5-settings-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("glue5.json"), b"{\"online\": tru").unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!(s.online, Settings::default().online);
+        s.save(&dir);
+        assert_eq!(std::fs::read(dir.join("glue5.json.bad")).unwrap(), b"{\"online\": tru");
+        assert!(serde_json::from_slice::<Settings>(&std::fs::read(dir.join("glue5.json")).unwrap()).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

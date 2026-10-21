@@ -596,25 +596,26 @@ impl Program {
 
     /// The layout entries of the stage's group.
     pub fn layout_entries(&self) -> Vec<wgpu::BindGroupLayoutEntry> {
+        self.bindings.iter().map(|b| self.layout_entry(b)).collect()
+    }
+
+    /// The layout entry of `b`, one of its bindings: as declared, with the
+    /// textures and samplers this copy does not filter.
+    pub fn layout_entry(&self, b: &Binding) -> wgpu::BindGroupLayoutEntry {
         use wgpu::{BindingType, SamplerBindingType, TextureSampleType};
-        self.bindings
-            .iter()
-            .map(|b| {
-                let mut entry = b.layout_entry(self.stage);
-                match &mut entry.ty {
-                    BindingType::Texture { sample_type: TextureSampleType::Float { filterable }, .. }
-                        if self.unfiltered >> (b.binding - SRVS) & 1 != 0 =>
-                    {
-                        *filterable = false
-                    }
-                    BindingType::Sampler(ty @ SamplerBindingType::Filtering) if self.nonfiltering(b.binding) => {
-                        *ty = SamplerBindingType::NonFiltering
-                    }
-                    _ => {}
-                }
-                entry
-            })
-            .collect()
+        let mut entry = b.layout_entry(self.stage);
+        match &mut entry.ty {
+            BindingType::Texture { sample_type: TextureSampleType::Float { filterable }, .. }
+                if self.unfiltered >> (b.binding - SRVS) & 1 != 0 =>
+            {
+                *filterable = false
+            }
+            BindingType::Sampler(ty @ SamplerBindingType::Filtering) if self.nonfiltering(b.binding) => {
+                *ty = SamplerBindingType::NonFiltering
+            }
+            _ => {}
+        }
+        entry
     }
 
     /// The constants group's layout: dynamic offsets, sizes as bound.

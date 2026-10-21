@@ -67,6 +67,14 @@ pub fn is_panic_recoverable() -> bool {
     RECOVERABLE.get()
 }
 
+/// Ends the process with `code`: every way out goes here, so that what
+/// must stop before the system's libraries go does (Android's performance
+/// hints, see [`crate::qos::end`]).
+pub fn process(code: i32) -> ! {
+    crate::qos::end();
+    std::process::exit(code)
+}
+
 /// Records why the game has stopped (the first reason: what follows may be
 /// its consequence).
 pub fn fail(why: impl Into<String>) {

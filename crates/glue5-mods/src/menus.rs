@@ -12,6 +12,11 @@ use mlua::{Function, Lua, MultiValue, Table, Value};
 
 use crate::{Menu, MenuInput, MenuItem, MenuKind, SHARED};
 
+/// The menus a run of a mod may have (they are the app's to keep and draw).
+const MENUS: usize = 16;
+/// The longest note an item shows, in characters.
+const NOTE: usize = 200;
+
 /// A mod's items, by id: the Lua object (its `value`) and its callback.
 pub type Handlers = Rc<RefCell<HashMap<u32, (Table, Option<Function>)>>>;
 
@@ -92,13 +97,13 @@ pub fn install(lua: &Lua, module: &str, instance: u64, handlers: Handlers) -> ml
         "menu",
         lua.create_function(move |lua, title: String| {
             let id = next_id();
-            crate::lock(&SHARED.state).menus.push(Menu {
-                module: m.clone(),
-                instance,
-                id,
-                title: title.chars().take(40).collect(),
-                items: Vec::new(),
-            });
+            {
+                let mut s = crate::lock(&SHARED.state);
+                if s.menus.iter().filter(|m| m.instance == instance).count() >= MENUS {
+                    return Err(mlua::Error::runtime(format!("ui.menu: a mod has {MENUS} menus at most (menu:remove() one)")));
+                }
+                s.menus.push(Menu { module: m.clone(), instance, id, title: title.chars().take(40).collect(), items: Vec::new() });
+            }
             changed();
             menu_table(lua, &m, id, handlers.clone())
         })?,
@@ -118,6 +123,7 @@ fn menu_table(lua: &Lua, module: &str, menu: u32, handlers: Handlers) -> mlua::R
         Rc::new(
             move |lua: &Lua, label: String, note: Option<String>, kind: MenuKind, callback: Option<Function>| -> mlua::Result<Table> {
                 let id = next_id();
+                let note = note.map(|n| n.chars().take(NOTE).collect());
                 let item = MenuItem { id, label: label.chars().take(60).collect(), note, kind: kind.clone() };
                 {
                     let mut s = crate::lock(&SHARED.state);
@@ -284,4 +290,41 @@ pub fn apply(lua: &Lua, handlers: &Handlers, item: u32, input: MenuInput) -> mlu
         MenuInput::Press => MultiValue::new(),
     };
     Ok(cb.map(|f| (f, args)))
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::Lua;
+
+    /// What a mod holds in the app's menus is bounded: menus per run,
+    /// notes' length.
+    #[test]
+    fn bounded() {
+        let lua = Lua::new();
+        let instance = super::next_instance();
+        super::install(&lua, "menus-test", instance, super::Handlers::default()).unwrap();
+        let err: String = lua
+            .load(
+                r#"
+                for i = 1, 16 do ui.menu("m" .. i) end
+                local m = ui.menu("one more")
+                "#,
+            )
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("16 menus at most"), "{err}");
+        lua.load(r#"local m = ui.menu("x")"#).exec().unwrap_err();
+        let menus = crate::menus().into_iter().filter(|m| m.instance == instance).collect::<Vec<_>>();
+        assert_eq!(menus.len(), 16);
+        super::remove_instance(instance);
+
+        let instance = super::next_instance();
+        super::install(&lua, "menus-test", instance, super::Handlers::default()).unwrap();
+        lua.load(r#"ui.menu("notes"):button("b", string.rep("é", 100000))"#).exec().unwrap();
+        let menus = crate::menus();
+        let note = menus.iter().find(|m| m.instance == instance).and_then(|m| m.items[0].note.clone()).unwrap();
+        assert_eq!(note.chars().count(), super::NOTE);
+        super::remove_instance(instance);
+    }
 }

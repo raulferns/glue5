@@ -41,6 +41,15 @@ pub struct Catalog {
 /// game files.
 const NOT_GAME: [&str; 3] = ["manifest.json", "bootset.json", "bootset_low.json"];
 
+/// What a catalog from elsewhere (a server, which any device on the
+/// network can pretend to be; a copy's file) may hold, far above the
+/// game's 12,500 files and 21 GB: the copy makes every file's entry and
+/// bitmap of blocks before it reads any.
+const MAX_FILES: usize = 200_000;
+const MAX_BYTES: u64 = 1 << 40;
+/// A path's length (the copy's index keeps it in 16 bits).
+const MAX_PATH: usize = 1024;
+
 impl Catalog {
     /// The game folder `game` (`data/` and `b/<build>/shaders/`).
     pub fn scan(game: &Path, build: &str) -> Result<Catalog> {
@@ -65,7 +74,11 @@ impl Catalog {
             .map(|e| date(&game, e.path.strip_prefix("data/").unwrap_or(&e.path), e.size).unwrap_or(e.mtime))
             .collect();
         data.extend(shaders);
-        Ok(Catalog { dates, ..Catalog::new(build.to_string(), data, data_files) })
+        let catalog = Catalog { dates, ..Catalog::new(build.to_string(), data, data_files) };
+        if let Some((a, b)) = catalog.same_but_case() {
+            bail!("{a} and {b} differ only in case: one file where the game plays (rename or remove one)");
+        }
+        Ok(catalog)
     }
 
     pub fn new(build: String, entries: Vec<Entry>, data_files: usize) -> Catalog {
@@ -82,6 +95,20 @@ impl Catalog {
         Catalog { build, entries, data_files, hash, dates: Vec::new(), lookup }
     }
 
+    /// Two of its paths the same but for case: one file on the volumes
+    /// that ignore case (Apple's, Windows'), and to the engine, which
+    /// looks paths up in any case.
+    fn same_but_case(&self) -> Option<(&str, &str)> {
+        if self.lookup.len() == self.entries.len() {
+            return None;
+        }
+        // (The lookup has the last of them.)
+        self.entries.iter().enumerate().find_map(|(i, e)| {
+            let last = self.lookup[&e.path.to_ascii_lowercase()] as usize;
+            (last != i).then(|| (e.path.as_str(), self.entries[last].path.as_str()))
+        })
+    }
+
     /// The id of the file at `path` (relative to the game folder, any case).
     pub fn find(&self, path: &str) -> Option<u32> {
         self.lookup.get(&path.to_ascii_lowercase()).copied()
@@ -95,22 +122,41 @@ impl Catalog {
         .expect("catalog json")
     }
 
+    /// A catalog as [`Catalog::to_json`] wrote it, from elsewhere: only
+    /// what [`Catalog::scan`] could list, within [`MAX_FILES`] and
+    /// [`MAX_BYTES`].
     pub fn from_json(bytes: &[u8]) -> Result<Catalog> {
         let v: serde_json::Value = serde_json::from_slice(bytes).context("parsing the catalog")?;
         let build = v["build"].as_str().context("catalog without build")?.to_string();
-        let data_files = v["data_files"].as_u64().context("catalog without data_files")? as usize;
-        let mut entries = Vec::new();
-        for f in v["files"].as_array().context("catalog without files")? {
+        let data_files = v["data_files"].as_u64().context("catalog without data_files")?;
+        let files = v["files"].as_array().context("catalog without files")?;
+        if files.len() > MAX_FILES || data_files > files.len() as u64 {
+            bail!("catalog: {} files, {data_files} of them data", files.len());
+        }
+        let data_files = data_files as usize;
+        let shaders = format!("b/{build}/shaders/");
+        let (mut entries, mut total) = (Vec::with_capacity(files.len()), 0u64);
+        for (i, f) in files.iter().enumerate() {
             let (Some(path), Some(size), Some(mtime)) = (f[0].as_str(), f[1].as_u64(), f[2].as_u64()) else {
                 bail!("bad catalog entry {f}");
             };
-            if !safe_path(path) {
+            if !safe_path(path) || path.len() > MAX_PATH {
                 bail!("catalog path {path:?} leaves the game folder");
             }
+            // The engine's files, then the shaders: nothing else of the
+            // copy's folder (its own files) is a catalog's.
+            let listed = match path.strip_prefix("data/") {
+                Some(rel) => i < data_files && !NOT_GAME.contains(&rel),
+                None => i >= data_files && path.starts_with(&shaders),
+            };
+            if !listed {
+                bail!("catalog path {path:?} is not a game file's");
+            }
+            total = total.checked_add(size).filter(|&t| t <= MAX_BYTES).context("catalog: too many bytes")?;
+            if mtime > LAST_DATE {
+                bail!("catalog: {path} dated {mtime}");
+            }
             entries.push(Entry { path: path.to_string(), size, mtime });
-        }
-        if data_files > entries.len() {
-            bail!("catalog: {data_files} data files of {}", entries.len());
         }
         // (A catalog of an earlier version has none.)
         let dates: Vec<u64> =
@@ -118,7 +164,14 @@ impl Catalog {
         if !dates.is_empty() && dates.len() != data_files {
             bail!("catalog: {} dates for {data_files} data files", dates.len());
         }
-        Ok(Catalog { dates, ..Catalog::new(build, entries, data_files) })
+        if let Some(t) = dates.iter().find(|&&t| t > LAST_DATE) {
+            bail!("catalog: a file dated {t}");
+        }
+        let catalog = Catalog { dates, ..Catalog::new(build, entries, data_files) };
+        if let Some((a, b)) = catalog.same_but_case() {
+            bail!("catalog: {a} and {b} differ only in case");
+        }
+        Ok(catalog)
     }
 
     /// The manifest the engine reads (`wasm_httpfs_manifest_js`), in the
@@ -141,7 +194,8 @@ impl Catalog {
 /// (`data/manifest.json`, `files` of [path, size, date]). The engine's map
 /// caches (`common/data/gta5_cache_*.dat`) hold these dates: told others
 /// (a copy's), it builds the cache again at every start (seconds) and
-/// cannot save it. Empty without a manifest.
+/// cannot save it. Empty without a manifest; a date past [`LAST_DATE`] is
+/// no date.
 pub fn game_dates(data: &Path) -> HashMap<String, (u64, u64)> {
     let Ok(bytes) = fs::read(data.join("manifest.json")) else { return HashMap::new() };
     let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -149,8 +203,17 @@ pub fn game_dates(data: &Path) -> HashMap<String, (u64, u64)> {
         return HashMap::new();
     };
     let files = manifest["files"].as_array().map_or(&[][..], Vec::as_slice);
-    files.iter().filter_map(|f| Some((f[0].as_str()?.to_ascii_lowercase(), (f[1].as_u64()?, f[2].as_u64()?)))).collect()
+    files
+        .iter()
+        .filter_map(|f| Some((f[0].as_str()?.to_ascii_lowercase(), (f[1].as_u64()?, f[2].as_u64()?))))
+        .filter(|(_, (_, date))| *date <= LAST_DATE)
+        .collect()
 }
+
+/// The last date a file can have: 9999-12-31 (seconds since the epoch).
+/// A later one is a damaged value, which the system's times (and the
+/// engine's) may not hold.
+pub const LAST_DATE: u64 = 253_402_300_799;
 
 /// The date of the file at `rel` (under `data/`) of `size` bytes, if the
 /// manifest lists it so: a file changed since is not the one it lists.
@@ -193,10 +256,12 @@ pub fn hex(bytes: &[u8]) -> String {
 fn manifest_dates() {
     let dir = std::env::temp_dir().join(format!("glue5-catalog-dates-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("manifest.json"), br#"{"mount":"/game/","files":[["x64/A.rpf",10,1790644442],["b.xml",3,9]]}"#)
-        .unwrap();
+    let manifest = br#"{"mount":"/game/","files":[["x64/A.rpf",10,1790644442],["b.xml",3,9],["c.rpf",1,18446744073709551615]]}"#;
+    fs::write(dir.join("manifest.json"), manifest).unwrap();
     let dates = game_dates(&dir);
     assert_eq!(date(&dates, "x64/a.rpf", 10), Some(1790644442));
+    // Past any date a file can have.
+    assert_eq!(date(&dates, "c.rpf", 1), None);
     // Changed since (another size), or not listed.
     assert_eq!(date(&dates, "b.xml", 4), None);
     assert_eq!(date(&dates, "c.xml", 3), None);
@@ -226,4 +291,53 @@ fn round_trip() {
     let m: serde_json::Value = serde_json::from_slice(&dated.engine_manifest()).unwrap();
     assert_eq!(m["files"][0][2], 5);
     assert!(!safe_path("data/../x") && !safe_path("/etc") && !safe_path("c:/x") && safe_path("data/x"));
+}
+
+/// A catalog from elsewhere holds only what a game folder's could, within
+/// bounds a device can hold.
+#[test]
+fn untrusted_catalogs() {
+    let json = |files: serde_json::Value, data_files: usize| {
+        serde_json::to_vec(&serde_json::json!({ "build": "x", "data_files": data_files, "files": files })).unwrap()
+    };
+    let ok = serde_json::json!([["data/a.rpf", 1, 2], ["b/x/shaders/index.json", 3, 4]]);
+    assert!(Catalog::from_json(&json(ok, 1)).is_ok());
+    let refused = |files, data_files| Catalog::from_json(&json(files, data_files)).is_err();
+    // Sizes past what any volume holds, or adding up past it.
+    assert!(refused(serde_json::json!([["data/a.rpf", u64::MAX, 2]]), 1));
+    assert!(refused(serde_json::json!([["data/a.rpf", 1u64 << 39, 2], ["data/b.rpf", 1u64 << 39, 2], ["data/c", 1, 2]]), 3));
+    // More files than a catalog may list.
+    let many: Vec<_> = (0..=MAX_FILES).map(|i| serde_json::json!([format!("data/{i}"), 0, 0])).collect();
+    assert!(refused(serde_json::Value::Array(many), MAX_FILES + 1));
+    // The copy's own files, files of no game folder, a server's manifest.
+    assert!(refused(serde_json::json!([["index", 1, 2]]), 0));
+    assert!(refused(serde_json::json!([["catalog.json", 1, 2]]), 0));
+    assert!(refused(serde_json::json!([["data/manifest.json", 1, 2]]), 1));
+    assert!(refused(serde_json::json!([["b/x/shaders/a", 1, 2]]), 1));
+    assert!(refused(serde_json::json!([["data/a", 1, 2]]), 0));
+    // A date past any a file can have.
+    assert!(refused(serde_json::json!([["data/a", 1, u64::MAX]]), 1));
+    // One file on many a device.
+    assert!(refused(serde_json::json!([["data/A.rpf", 1, 2], ["data/a.rpf", 1, 2]]), 2));
+    assert!(refused(serde_json::json!([["data/a.rpf", 1, 2], ["data/a.rpf", 1, 2]]), 2));
+}
+
+/// A game folder with two paths the same but for case (a case-sensitive
+/// volume's) is not served.
+#[test]
+fn refuses_paths_the_same_but_for_case() {
+    let dir = std::env::temp_dir().join(format!("glue5-catalog-case-{}", std::process::id()));
+    fs::create_dir_all(dir.join("data/x64")).unwrap();
+    fs::create_dir_all(dir.join("b/x/shaders")).unwrap();
+    fs::write(dir.join("b/x/shaders/index.json"), b"{}").unwrap();
+    fs::write(dir.join("data/x64/a.rpf"), b"a").unwrap();
+    assert!(Catalog::scan(&dir, "x").is_ok());
+    fs::create_dir_all(dir.join("data/X64")).unwrap();
+    fs::write(dir.join("data/X64/a.rpf"), b"b").unwrap();
+    // (Not on a volume that ignores case: one folder.)
+    if fs::read_dir(dir.join("data")).unwrap().count() == 2 {
+        let e = Catalog::scan(&dir, "x").err().unwrap().to_string();
+        assert!(e.contains("differ only in case"), "{e}");
+    }
+    let _ = fs::remove_dir_all(dir);
 }

@@ -172,6 +172,7 @@ Windows' clang-cl).
 | `crates/glue5-runtime` | The engine's host: its imports, threads, files, input, audio, online and friends, the GPU command ring. |
 | `crates/glue5-gpu` | The renderer: the engine's D3D11-style commands on wgpu (Metal on Apple devices, Vulkan elsewhere). |
 | `crates/glue5-stream` | Streaming the game's files: `glue5-serve`, the client and its local copy, discovery on the network. |
+| `crates/glue5-qos` | Thread priorities on each platform (the runtime's `qos`, the stream's threads too). |
 | `crates/glue5-mods` | Mods: Luau in the game's script threads, its natives' table, and the Studio's server. |
 | `crates/glue5-studio` | GLUE 5 Studio's page: Leptos (wasm) around CodeMirror. |
 | `crates/glue5` | The app (SDL3), the same on every platform: window, input, audio, settings, touch controls (egui). Its `headless` example runs the game without a window. |

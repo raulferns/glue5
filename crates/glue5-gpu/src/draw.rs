@@ -70,6 +70,12 @@ impl BindCache {
     pub fn age(&mut self) -> BindGroups {
         std::mem::replace(&mut self.old, std::mem::take(&mut self.current))
     }
+
+    /// The groups no draw took since the generation began (memory is
+    /// short), to free elsewhere; the generation goes on.
+    pub fn take_old(&mut self) -> BindGroups {
+        std::mem::take(&mut self.old)
+    }
 }
 
 /// Identity of the constant buffers a pack reads: (buffer id, version, first
@@ -249,6 +255,59 @@ impl SrvSlots {
             }
         }
     }
+}
+
+/// Which copy of a texture of `format` a slot reading it as `sample` takes
+/// (an index into its `proxies`): depth read as float (0), stencil as uint
+/// (1), a float colour as depth (2). None: the texture itself (which may
+/// not fit the slot, see [`misfit`]).
+pub fn proxy_kind(format: TextureFormat, sample: Sample) -> Option<usize> {
+    match (format::is_depth(format), sample) {
+        (true, Sample::Float) => Some(0),
+        (true, Sample::Uint) if format.has_stencil_aspect() => Some(1),
+        (false, Sample::Depth) if matches!(format.sample_type(None, None), Some(wgpu::TextureSampleType::Float { .. })) => {
+            Some(2)
+        }
+        _ => None,
+    }
+}
+
+/// Why a view of `t` as `format` (of `aspect`) does not fit a texture slot
+/// of `dim` whose layout takes `slot` and `multisampled` textures, as wgpu
+/// checks views and bind groups; none if it fits. D3D11 reads zeros from a
+/// slot given a texture it cannot read, wgpu refuses the whole bind group
+/// (the draw would lose every texture): such a slot gets the empty one.
+fn misfit(
+    t: &crate::objects::Tex,
+    format: TextureFormat,
+    aspect: wgpu::TextureAspect,
+    dim: TextureViewDimension,
+    slot: wgpu::TextureSampleType,
+    multisampled: bool,
+    caps: &format::Caps,
+) -> Option<String> {
+    use wgpu::TextureSampleType as S;
+    if dim.compatible_texture_dimension() != t.dim {
+        return Some(format!("a {dim:?} texture slot was given a {:?} texture", t.dim));
+    }
+    if matches!(dim, TextureViewDimension::Cube | TextureViewDimension::CubeArray) && t.width != t.height {
+        return Some("a cube texture slot was given a texture that is not square".into());
+    }
+    if multisampled != (t.samples > 1) {
+        let kind = if multisampled { "multisampled" } else { "single-sampled" };
+        return Some(format!("a {kind} texture slot was given a texture of {} samples", t.samples));
+    }
+    let view = format.sample_type(Some(aspect), Some(caps.features));
+    let fits = match (slot, view) {
+        (S::Uint, Some(S::Uint)) | (S::Sint, Some(S::Sint)) | (S::Depth, Some(S::Depth)) => true,
+        (S::Float { filterable: false }, Some(S::Float { .. } | S::Depth)) => true,
+        // (Filterable where the GPU says so, as wgpu checks it.)
+        (S::Float { filterable: true }, Some(S::Float { filterable })) => {
+            filterable || format::is_float32(format) && caps.float32_filter
+        }
+        _ => false,
+    };
+    (!fits).then(|| format!("a {slot:?} texture slot was given a {format:?} view"))
 }
 
 /// What a bind group entry is built from.
@@ -702,7 +761,11 @@ impl Gpu {
                     let id = self.s.srv[st][(b.binding - shader::SRVS) as usize];
                     let target =
                         self.objs.srv(id).is_some_and(|v| self.is_target(v, *dim) || self.compares_depth_target(v, *sample, stage));
-                    match if target { None } else { self.srv_view(id, *dim, *sample) } {
+                    let slot = match prog.layout_entry(b).ty {
+                        wgpu::BindingType::Texture { sample_type, .. } => sample_type,
+                        _ => unreachable!("a texture's binding"),
+                    };
+                    match if target { None } else { self.srv_view(id, *dim, *sample, slot, *multisampled) } {
                         Some(v) => Res::View(v),
                         None => Res::View(self.dummies.texture(&self.device, *dim, *sample, *multisampled)),
                     }
@@ -900,8 +963,17 @@ impl Gpu {
         hit
     }
 
-    /// A view of an SRV's texture in the dimension the shader declares.
-    fn srv_view(&mut self, id: u32, dim: TextureViewDimension, sample: Sample) -> Option<wgpu::TextureView> {
+    /// A view of an SRV's texture for a slot of the dimension the shader
+    /// declares, read as `sample`, whose layout takes `slot` and
+    /// `multisampled` textures; none if the texture does not fit it.
+    fn srv_view(
+        &mut self,
+        id: u32,
+        dim: TextureViewDimension,
+        sample: Sample,
+        slot: wgpu::TextureSampleType,
+        multisampled: bool,
+    ) -> Option<wgpu::TextureView> {
         let caps = self.caps;
         let res = self.objs.srv(id)?.res;
         if res == id {
@@ -913,20 +985,35 @@ impl Gpu {
         };
         // Depth read as float (or stencil as uint) and float read as depth go
         // through copies (refreshed by prepare_proxies).
-        let proxy = match (format::is_depth(tex.format), sample) {
-            (true, Sample::Uint) => Some(1),
-            (true, Sample::Float | Sample::Sint) => Some(0),
-            (false, Sample::Depth) => Some(2),
-            _ => None,
-        };
-        let key = dim as u64 | (proxy.map_or(0, |p| p + 1) as u64) << 8;
-        if let Some((_, v)) = srv.views.iter().find(|(k, _)| *k == key) {
-            return Some(v.clone());
-        }
+        let proxy = proxy_kind(tex.format, sample);
         let t = match proxy {
             Some(p) => &tex.proxies[p].as_ref()?.tex,
             None => &**tex,
         };
+        let base = t.format;
+        let format =
+            if proxy.is_none() && !format::is_depth(base) { format::view(srv.format, base, &caps) } else { base };
+        let aspect = if proxy.is_none() && format::is_depth(base) {
+            if matches!(srv.format, 22 | 47) {
+                wgpu::TextureAspect::StencilOnly
+            } else {
+                wgpu::TextureAspect::DepthOnly
+            }
+        } else {
+            wgpu::TextureAspect::All
+        };
+        // A view of one aspect of a depth-stencil texture has that aspect's format.
+        let format = format.aspect_specific_format(aspect).unwrap_or(format);
+        if let Some(why) = misfit(t, format, aspect, dim, slot, multisampled, &caps) {
+            crate::log_once(&format!("srvfit {why}"), || {
+                format!("{why} ({}x{}x{}, {:?}): it reads as empty", t.width, t.height, t.layers, t.format)
+            });
+            return None;
+        }
+        let key = dim as u64 | (proxy.map_or(0, |p| p + 1) as u64) << 8;
+        if let Some((_, v)) = srv.views.iter().find(|(k, _)| *k == key) {
+            return Some(v.clone());
+        }
         let layers = t.layers;
         if matches!(dim, TextureViewDimension::Cube | TextureViewDimension::CubeArray)
             && layers.saturating_sub(srv.c) < 6
@@ -952,20 +1039,6 @@ impl Gpu {
                 (first, Some(count.max(1)))
             }
         };
-        let base = t.format;
-        let format =
-            if proxy.is_none() && !format::is_depth(base) { format::view(srv.format, base, &caps) } else { base };
-        let aspect = if proxy.is_none() && format::is_depth(base) {
-            if matches!(srv.format, 22 | 47) {
-                wgpu::TextureAspect::StencilOnly
-            } else {
-                wgpu::TextureAspect::DepthOnly
-            }
-        } else {
-            wgpu::TextureAspect::All
-        };
-        // A view of one aspect of a depth-stencil texture has that aspect's format.
-        let format = format.aspect_specific_format(aspect).unwrap_or(format);
         let view = t.tex.create_view(&wgpu::TextureViewDescriptor {
             label: None,
             format: Some(format),
@@ -1514,4 +1587,115 @@ fn copy_constants(src: Option<&[u8]>, first: u32, out: &mut [u8]) {
         None => 0,
     };
     out[copied..].fill(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::{TextureAspect, TextureDimension as Td, TextureFormat as F, TextureSampleType as S, TextureViewDimension as V};
+
+    /// `misfit` refuses exactly what wgpu refuses: each texture in each
+    /// kind of slot, its view and bind group made under an error scope.
+    /// Needs a GPU: `cargo test -p glue5-gpu -- --ignored misfit`.
+    #[test]
+    #[ignore]
+    fn misfit_is_what_wgpu_refuses() {
+        let adapter = pollster::block_on(crate::instance().request_adapter(&Default::default())).unwrap();
+        let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let caps = crate::format::Caps::new(&adapter, device.features());
+        // (format, dimension, width, height, layers, samples, aspect read)
+        let textures = [
+            (F::Rgba8Unorm, Td::D2, 4, 4, 1, 1, TextureAspect::All),
+            (F::R32Float, Td::D2, 4, 4, 1, 1, TextureAspect::All),
+            (F::Rgba8Uint, Td::D2, 4, 4, 1, 1, TextureAspect::All),
+            (F::Rgba8Sint, Td::D2, 4, 4, 1, 1, TextureAspect::All),
+            (F::Depth32Float, Td::D2, 4, 4, 1, 1, TextureAspect::DepthOnly),
+            (F::Depth24PlusStencil8, Td::D2, 4, 4, 1, 1, TextureAspect::StencilOnly),
+            (F::Rgba8Unorm, Td::D3, 4, 4, 4, 1, TextureAspect::All),
+            (F::Rgba8Unorm, Td::D2, 4, 4, 1, 4, TextureAspect::All),
+            (F::Depth32Float, Td::D2, 4, 4, 1, 4, TextureAspect::DepthOnly),
+            (F::Rgba8Unorm, Td::D2, 4, 4, 6, 1, TextureAspect::All),
+            (F::Rgba8Unorm, Td::D2, 4, 8, 6, 1, TextureAspect::All),
+        ];
+        let float = |filterable| S::Float { filterable };
+        let mut slots: Vec<(V, S, bool)> = [float(true), float(false), S::Uint, S::Sint, S::Depth]
+            .into_iter()
+            .flat_map(|s| [(V::D2, s, false), (V::D2Array, s, false), (V::D3, s, false), (V::Cube, s, false)])
+            .collect();
+        slots.extend([float(false), S::Uint, S::Depth].map(|s| (V::D2, s, true)));
+        for (format, dim, width, height, layers, samples, aspect) in textures {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: dim,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | if samples > 1 { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() },
+                view_formats: &[],
+            });
+            let t = crate::objects::Tex {
+                tex: tex.clone(),
+                format,
+                upload: crate::format::Upload::Direct,
+                dim,
+                width,
+                height,
+                layers,
+                mips: 1,
+                dropped: 0,
+                samples,
+                bytes: 0,
+                recycle: None,
+                views: Vec::new(),
+                used: Default::default(),
+                uploaded: Default::default(),
+                in_bind_group: Default::default(),
+                proxies: Default::default(),
+                mip_chain: None,
+                present: None,
+            };
+            let view_format = format.aspect_specific_format(aspect).unwrap_or(format);
+            for &(view_dim, slot, multisampled) in &slots {
+                // (srv_view refuses a cube of fewer than 6 layers before.)
+                if view_dim == V::Cube && layers < 6 {
+                    continue;
+                }
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(view_format),
+                    dimension: Some(view_dim),
+                    aspect,
+                    array_layer_count: match view_dim {
+                        V::D2 | V::D3 => Some(1),
+                        V::Cube => Some(6),
+                        _ => None,
+                    },
+                    ..Default::default()
+                });
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture { sample_type: slot, view_dimension: view_dim, multisampled },
+                        count: None,
+                    }],
+                });
+                let _group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+                });
+                let refused = pollster::block_on(scope.pop());
+                let why = super::misfit(&t, view_format, aspect, view_dim, slot, multisampled, &caps);
+                assert_eq!(
+                    why.is_some(),
+                    refused.is_some(),
+                    "{format:?} {dim:?} {width}x{height}x{layers} x{samples} in a {view_dim:?} {slot:?} slot \
+                     (multisampled {multisampled}): ours {why:?}, wgpu's {refused:?}"
+                );
+            }
+        }
+    }
 }

@@ -44,6 +44,21 @@ pub fn set(qos: Qos) {
     let _ = qos;
 }
 
+/// Starts a host thread named `name` in class `qos`. Without one a thread
+/// keeps its creator's: on Linux and Android a frame's thread's nice value
+/// and timer slack (or the display's, SDL's main thread on Android) for
+/// work that is not a frame's.
+pub fn spawn<T: Send + 'static>(
+    name: &str,
+    qos: Qos,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
+    std::thread::Builder::new().name(name.into()).spawn(move || {
+        set(qos);
+        f()
+    })
+}
+
 /// Linux's priorities: nice values, which weigh each thread's share of a
 /// busy core (not a strict order, as Apple's classes are). Android's own
 /// for each class: its audio threads' (SDL's included), the display's

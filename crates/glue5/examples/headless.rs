@@ -125,7 +125,7 @@ fn quit(stream: Option<&glue5_stream::Client>, code: i32) -> ! {
     if let Some(client) = stream {
         client.flush();
     }
-    std::process::exit(code)
+    glue5_runtime::exit::process(code)
 }
 
 fn parse_size(size: &str) -> Result<(u32, u32)> {

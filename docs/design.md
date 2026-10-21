@@ -782,7 +782,10 @@ The build generates two things:
   `vehicle.createVehicle(model, coords, ...)`, with handle types.
 
 Output parameters come back as extra return values, and a handle of 0 comes
-back as `nil`.
+back as `nil`. An output is one value: natives that take a structure or an
+array through a pointer (the database's `Any*` where the command takes an
+`int&`), or keep the pointer after the call (save blocks, broadcast
+variables), are left out.
 
 **Each mod runs in a script thread of its own**, as the game's scripts do.
 Its program is built in wasm memory: a copy of a loaded `scrProgram` with
@@ -818,6 +821,9 @@ playing.
   error in the mod, and the runtime is marked as possibly damaged.
 - A mod runs at most 2 ms before the interrupt suspends it until the next
   frame. One that runs 2 s without calling `wait` is stopped.
+- A mod's script thread is ended only by the hook, from outside it:
+  TERMINATE_THREAD and TERMINATE_ALL_SCRIPTS_WITH_THIS_NAME refuse the
+  mods' threads (ended from inside, the hook would go on in a dead one).
 
 ### Menus, tasks, the world, data
 
@@ -828,6 +834,9 @@ playing.
     `value` changes and its callback runs as a task.
   - `ui.notify` shows a notification over the game.
   - A mod with a menu stays running after its main code returns.
+  - The app keeps them, outside the mod's memory: a run of a mod has 16
+    menus of 64 items at most, and titles, labels, notes and options are
+    cut short; a log line is cut at 8 KB.
 - **Tasks**: a mod's coroutines are scheduled by game time
   (`GET_GAME_TIMER`, so they stop while the game is paused):
   - the main chunk;
@@ -851,7 +860,9 @@ playing.
   is a type error ("did you mean ...?"). The names come from the assets
   the game loaded, whatever their version; none is in the build.
 - **Data**: `json.encode`/`json.decode` (json.rs: arrays are tables with
-  keys 1..n or none, null is nil, functions and cycles are errors) and
+  keys 1..n or none, null is nil, functions and cycles are errors; the
+  text is written as the tables are walked and stops at 1 MB, so a table
+  held many times over cannot make it endless) and
   `storage` (storage.rs): a mod's values by key, JSON, 1 MB, written
   within two seconds and when it stops, in the mods folder's
   `.glue5/storage/<mod>.json`, so a mod handed on carries no player's

@@ -381,11 +381,17 @@ fn fit((sw, sh): (u32, u32), (dw, dh): (u32, u32)) -> (u32, u32, u32, u32) {
     ((dw - w) / 2, (dh - h) / 2, w, h)
 }
 
+/// How long a configuration the surface refused waits to be tried again
+/// (each try waits for the GPU to finish its work).
+const REFUSED_RETRY: Duration = Duration::from_secs(1);
+
 /// The window's surface.
 struct Display {
     surface: wgpu::Surface<'static>,
     /// Size and vsync it is configured with.
     configured: Option<(u32, u32, bool)>,
+    /// The last configuration the surface refused, and when.
+    refused: Option<((u32, u32, bool), Instant)>,
     /// The last configuration a suboptimal image had configured anew.
     #[cfg_attr(target_vendor = "apple", allow(dead_code))]
     suboptimal: Option<(u32, u32, bool)>,
@@ -398,7 +404,14 @@ struct Display {
 }
 
 impl Display {
-    fn configure(&mut self, caps: &wgpu::SurfaceCapabilities, device: &wgpu::Device, (w, h, vsync): (u32, u32, bool)) {
+    /// Configures the surface; false if it refused (wgpu reports that as an
+    /// error, having taken the old configuration away).
+    fn configure(
+        &mut self,
+        caps: &wgpu::SurfaceCapabilities,
+        device: &wgpu::Device,
+        (w, h, vsync): (u32, u32, bool),
+    ) -> bool {
         // The back buffer holds display-ready (gamma-encoded) values: a non-sRGB surface.
         let format = caps
             .formats
@@ -416,6 +429,8 @@ impl Display {
         };
         // (Waits for the GPU to finish what it has: a window being resized
         // pays it once per frame.)
+        let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         self.surface.configure(
             device,
             &wgpu::SurfaceConfiguration {
@@ -430,10 +445,28 @@ impl Display {
                 view_formats: if linear != format { vec![linear] } else { vec![] },
             },
         );
+        let out_of_memory = pollster::block_on(memory.pop());
+        if let Some(e) = pollster::block_on(invalid.pop()).or(out_of_memory) {
+            // Logged once per configuration, not at every try.
+            if self.refused.is_none_or(|(c, _)| c != (w, h, vsync)) {
+                log::warn!("gpu: the window's surface refused {w}x{h}: {e}");
+            }
+            self.refuse((w, h, vsync));
+            return false;
+        }
         self.surface_format = Some(format);
         self.format = Some(linear);
         self.configured = Some((w, h, vsync));
+        self.refused = None;
         log::debug!("gpu: surface {w}x{h} {format:?} {present_mode:?}");
+        true
+    }
+
+    /// The surface cannot give images with `config`: it is configured again,
+    /// after a while.
+    fn refuse(&mut self, config: (u32, u32, bool)) {
+        self.configured = None;
+        self.refused = Some((config, Instant::now()));
     }
 
     fn acquire(
@@ -447,11 +480,13 @@ impl Display {
             return None;
         }
         if self.configured != Some(wanted) {
-            let caps = self.surface.get_capabilities(adapter);
-            if caps.formats.is_empty() {
+            if self.refused.is_some_and(|(c, at)| c == wanted && at.elapsed() < REFUSED_RETRY) {
                 return None;
             }
-            self.configure(&caps, device, wanted);
+            let caps = self.surface.get_capabilities(adapter);
+            if caps.formats.is_empty() || !self.configure(&caps, device, wanted) {
+                return None;
+            }
         }
         self.next_image(device, metal_hud)
     }
@@ -475,6 +510,15 @@ impl Display {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.configured = None;
+                return None;
+            }
+            // An error, which the device's handler has logged: the surface
+            // is configured again, after a while (Timeout and Occluded:
+            // another image later).
+            wgpu::CurrentSurfaceTexture::Validation => {
+                if let Some(config) = self.configured {
+                    self.refuse(config);
+                }
                 return None;
             }
             _ => return None,
@@ -746,6 +790,7 @@ impl Output {
         let display = Display {
             surface: window.surface,
             configured: None,
+            refused: None,
             suboptimal: None,
             surface_format: None,
             format: None,
@@ -828,6 +873,7 @@ impl Output {
         if let Some(surface) = self.presentation.0.surface.lock().unwrap().take() {
             display.surface = surface;
             display.configured = None;
+            display.refused = None;
             display.suboptimal = None;
             log::debug!("gpu: presenting into the window's new surface");
         }
