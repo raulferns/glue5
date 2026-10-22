@@ -1389,6 +1389,12 @@ impl Gpu {
             a.silence.as_secs_f64() * 1000.0,
             a.underruns,
         );
+        let (waits, waited, longest) = glue5_runtime::input::take_control_waits();
+        log::info!(
+            "controls: frames waited for the game's control update {:.2} ms each ({waits} waits, longest {:.1} ms)",
+            waited.as_secs_f64() * 1000.0 / waits.max(1) as f64,
+            longest.as_secs_f64() * 1000.0,
+        );
         if let Some(p) = &self.profiler {
             log::info!("{}", crate::profile::report(&p.totals, frames));
         }

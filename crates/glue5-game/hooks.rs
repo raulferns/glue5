@@ -58,7 +58,7 @@ pub const CALLED_ONLY: &[&str] = &[
     "scan_for_vehicle_to_enter", "pause_menu_is_active", "pause_menu_in_map", "screen_faded_out",
     "loading_screens_active",
     // memory
-    "heap_size", "builtin_malloc", "builtin_free", "zcalloc",
+    "heap_size", "builtin_malloc", "builtin_free", "zcalloc", "buddy_block_size",
     // blips
     "blip_from_id", "blip_display",
     // shader_settings

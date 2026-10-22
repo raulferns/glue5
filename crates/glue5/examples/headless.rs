@@ -122,6 +122,10 @@ struct Args {
 /// Ends the run: the stream's index saved first (the next run starts from
 /// what this one received).
 fn quit(stream: Option<&glue5_stream::Client>, code: i32) -> ! {
+    // The last shots are still being encoded.
+    if !glue5_gpu::screenshots_written(std::time::Duration::from_secs(60)) {
+        log::warn!("screenshots: some were not written before the end");
+    }
     if let Some(client) = stream {
         client.flush();
     }

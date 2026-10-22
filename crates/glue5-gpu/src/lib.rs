@@ -114,6 +114,13 @@ pub fn set_background(on: bool) {
     done::set_background(on);
 }
 
+/// Waits, up to `timeout`, for the screenshots asked for so far to be in
+/// their files (before a run ends: they are written by threads of their own).
+/// False if some were not.
+pub fn screenshots_written(timeout: std::time::Duration) -> bool {
+    done::screenshots_written(timeout)
+}
+
 /// [`trim`] was asked for since the last call.
 pub(crate) fn take_trim() -> bool {
     TRIM.swap(false, Ordering::Relaxed)

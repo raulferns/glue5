@@ -109,12 +109,15 @@ impl Offsets {
     }
 }
 
-/// The last packs of a (program, stage): the same constants in the same
-/// frame reuse their copy.
+/// The last packs of a (program, stage) this frame: the same constants
+/// reuse their copy.
 #[derive(Default)]
 pub struct PackCache {
-    /// (frame, constants, jitter added to them, copy).
-    entries: Vec<(u64, PackIds, Option<[u32; 2]>, Alloc)>,
+    frame: u64,
+    /// (constants, jitter added to them, copy); the oldest replaced by the
+    /// next.
+    entries: ArrayVec<(PackIds, Option<[u32; 2]>, Alloc), 6>,
+    oldest: u8,
 }
 
 /// Bound in place of what the engine left unbound.
@@ -1515,25 +1518,32 @@ fn pack_constants(
         own[i] = Some(own_constants(objs, cbs[st].get(m.slot as usize).copied().unwrap_or_default(), uniforms, device, m.size));
     }
     let mut current: PackIds = [(0, 0, 0); 16];
+    let mut bufs = [None; 16];
     for (i, m) in pack.members.iter().enumerate().take(16) {
         let cb = cbs[st].get(m.slot as usize).copied().unwrap_or_default();
-        let version = objs.buf(cb.buf).map_or(u32::MAX, |b| b.version);
-        current[i] = (cb.buf, version, cb.first);
+        bufs[i] = objs.buf(cb.buf);
+        current[i] = (cb.buf, bufs[i].map_or(u32::MAX, |b| b.version), cb.first);
     }
     let jitter_key = jitter.map(|j| j.map(f32::to_bits));
     let cache = packs.entry((prog.id, st as u8)).or_default();
-    if let Some((_, _, _, alloc)) = cache
-        .entries
-        .iter()
-        .find(|(frame, ids, j, _)| *frame == uniforms.frame && *ids == current && *j == jitter_key)
+    if cache.frame != uniforms.frame {
+        cache.frame = uniforms.frame;
+        cache.entries.clear();
+        cache.oldest = 0;
+    }
+    // Newest first: draws repeat the constants of the draws just before.
+    let (n, len) = (pack.members.len().min(16), cache.entries.len());
+    if let Some((_, _, alloc)) = (1..=len)
+        .map(|k| &cache.entries[(cache.oldest as usize + len - k) % len])
+        .find(|(ids, j, _)| ids[..n] == current[..n] && *j == jitter_key)
     {
         return Constants { pack: *alloc, own };
     }
     let alloc = uniforms.alloc(device, pack.size);
     let dst = uniforms.bytes(alloc, pack.size);
-    for (m, &(buf, _, first)) in pack.members.iter().zip(&current) {
+    for ((m, &(_, _, first)), buf) in pack.members.iter().zip(&current).zip(bufs) {
         let out = &mut dst[m.offset as usize..(m.offset + m.size) as usize];
-        copy_constants(objs.buf(buf).and_then(|b| b.shadow.as_deref()), first, out);
+        copy_constants(buf.and_then(|b| b.shadow.as_deref()), first, out);
         // `rage_matrices`, with gWorldViewProj.
         if let Some(clip) = jitter
             && m.slot == 1
@@ -1542,10 +1552,13 @@ fn pack_constants(
             crate::scene::jitter_constants(out, clip);
         }
     }
-    if cache.entries.len() >= 6 {
-        cache.entries.remove(0);
+    let entry = (current, jitter_key, alloc);
+    if cache.entries.is_full() {
+        cache.entries[cache.oldest as usize] = entry;
+        cache.oldest = (cache.oldest + 1) % cache.entries.len() as u8;
+    } else {
+        cache.entries.push(entry);
     }
-    cache.entries.push((uniforms.frame, current, jitter_key, alloc));
     Constants { pack: alloc, own }
 }
 

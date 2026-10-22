@@ -15,6 +15,13 @@ use glue5_game::{Env, orig};
 
 use crate::memory::Mem;
 
+/// The frames' waits for the game's control update (on a thread of its
+/// own, see audio_update.rs) since the last call: how many, how long in
+/// all, the longest.
+pub fn take_control_waits() -> (u64, Duration, Duration) {
+    crate::audio_update::take_control_waits()
+}
+
 // ---- gamepads ----------------------------------------------------------------
 
 /// Pad buttons, with RAGE's bit values.

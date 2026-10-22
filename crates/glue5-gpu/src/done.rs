@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use glue5_runtime::gpu::{OCCLUSION_VISIBLE_COUNT, store_query};
@@ -60,7 +60,79 @@ pub enum Work {
         bpr: u32,
         format: wgpu::TextureFormat,
         path: PathBuf,
+        /// Counted until its file is written ([`screenshots_written`]).
+        pending: Shot,
     },
+}
+
+/// A screenshot asked for and not written yet: counted from the frame that
+/// takes it to its file, so a run can wait for its last ones before ending.
+pub(crate) struct Shot(());
+
+static SHOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl Shot {
+    pub(crate) fn new() -> Shot {
+        *SHOTS.0.lock().unwrap() += 1;
+        Shot(())
+    }
+}
+
+impl Drop for Shot {
+    fn drop(&mut self) {
+        *SHOTS.0.lock().unwrap() -= 1;
+        SHOTS.1.notify_all();
+    }
+}
+
+/// A screenshot's encoding, for [`encode`].
+type Encoding = Box<dyn FnOnce() + Send>;
+
+/// Encodes a screenshot on a few threads of its own, about half the cores.
+/// Their queue is short: runs taking a shot every few frames outpace them,
+/// and then wait here rather than hold every frame's pixels (megabytes
+/// each) for later.
+fn encode(job: Encoding) {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Encoding>>> = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        use glue5_runtime::qos::{Qos, spawn};
+        let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(2));
+        let (tx, rx) = sync_channel::<Encoding>(threads);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut started = 0;
+        for i in 0..threads {
+            let rx = rx.clone();
+            let thread = spawn(&format!("gpu screenshot {i}"), Qos::Utility, move || {
+                // The lock only while taking a job (a `while let` would
+                // keep it through the job, one encoding at a time).
+                loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok(job) = job else { break };
+                    job();
+                }
+            });
+            match thread {
+                Ok(_) => started += 1,
+                Err(e) => log::warn!("gpu: no thread for screenshots: {e}"),
+            }
+        }
+        (started > 0).then_some(tx)
+    });
+    match queue {
+        Some(tx) => {
+            let _ = tx.send(job);
+        }
+        None => job(),
+    }
+}
+
+/// Waits, up to `timeout`, for the screenshots asked for to be written
+/// (encoding takes tens of milliseconds each, on threads of their own).
+/// False if some were not.
+pub(crate) fn screenshots_written(timeout: Duration) -> bool {
+    let shots = SHOTS.0.lock().unwrap();
+    let (shots, _) = SHOTS.1.wait_timeout_while(shots, timeout, |n| *n > 0).unwrap();
+    *shots == 0
 }
 
 pub struct OcclusionResult {
@@ -344,21 +416,18 @@ fn finish(mem: Mem, pool: &StagingPool, work: Work, done: bool) {
             release(pool, staging);
             heartbeat(got, value, moves);
         }
-        Work::Screenshot { mut staging, width, height, bpr, format, path } => {
+        Work::Screenshot { mut staging, width, height, bpr, format, path, pending } => {
             let pixels = mapped(&mut staging, done).map(|data| data.to_vec());
             release(pool, staging);
             // Encoding takes tens of milliseconds: not on this thread.
             if let Some(pixels) = pixels {
-                use glue5_runtime::qos::{Qos, spawn};
-                let encoded = spawn("gpu screenshot", Qos::Utility, move || {
+                encode(Box::new(move || {
                     match crate::present::write_png(&path, &pixels, width, height, bpr, format) {
                         Ok(()) => log::info!("gpu: screenshot {}", path.display()),
                         Err(e) => log::warn!("gpu: screenshot {}: {e:#}", path.display()),
                     }
-                });
-                if let Err(e) = encoded {
-                    log::warn!("gpu: no thread for a screenshot: {e}");
-                }
+                    drop(pending);
+                }));
             }
         }
     }

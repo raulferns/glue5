@@ -50,6 +50,7 @@ pub(crate) unsafe extern "C" fn end_render(env: *mut Env) {
         futex::wait32(&BACKGROUND, 1, None);
     }
     let mem = unsafe { Mem::of(env) };
+    crate::memory::report_heaps(mem);
     let last = mem.atomic_u64(LAST_END).swap(0, Ordering::AcqRel);
     unsafe { orig::end_render(env) };
     // The engine's computation, as it would have made it (f32 included).

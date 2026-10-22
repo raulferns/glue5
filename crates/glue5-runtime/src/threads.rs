@@ -142,14 +142,15 @@ pub(crate) unsafe fn create(env: *mut Env, pthread: u64, start: u64, arg: u64) -
     // They take little (a third of an efficiency core). The game's audio
     // update is the frame's: the main thread starts it
     // (`audNorthAudioEngine::StartUpdate`) and waits for it at the end of
-    // every frame (`FinishUpdate`), one update a frame. The render thread
-    // is too, but not on Apple devices: there, above the workers, loading
-    // after a cutscene took 6-10 s. Linux's nice values only weigh the
-    // threads' shares of a core, and Android's hint session is for the
-    // threads every frame goes through.
+    // every frame (`FinishUpdate`), one update a frame; the controls'
+    // update the same way (`CControlMgr::StartUpdateThread`,
+    // `WaitForUpdateThread`). The render thread is too, but not on Apple
+    // devices: there, above the workers, loading after a cutscene took 6-10
+    // s. Linux's nice values only weigh the threads' shares of a core, and
+    // Android's hint session is for the threads every frame goes through.
     let qos = match name.as_deref() {
         Some(n) if n.starts_with("[RAGE Audio]") => Qos::Audio,
-        Some("North Audio Update") => Qos::Interactive,
+        Some("North Audio Update" | "[GTA] ControlMgr Update Thread") => Qos::Interactive,
         Some("[RAGE] RenderThread") if !cfg!(target_vendor = "apple") => Qos::Interactive,
         _ => Qos::Initiated,
     };

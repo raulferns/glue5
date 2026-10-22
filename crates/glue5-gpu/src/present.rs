@@ -1234,9 +1234,10 @@ impl Gpu {
             },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
+        let pending = crate::done::Shot::new();
         self.maps.push((
             staging,
-            Box::new(move |s| Work::Screenshot { staging: s, width: w, height: h, bpr, format, path }),
+            Box::new(move |s| Work::Screenshot { staging: s, width: w, height: h, bpr, format, path, pending }),
         ));
     }
 
@@ -1298,11 +1299,19 @@ pub fn write_png(path: &Path, data: &[u8], width: u32, height: u32, bpr: u32, fo
             rgba.extend_from_slice(&[r, px[1], b, 255]);
         }
     }
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut encoder = png::Encoder::new(file, width, height);
+    // Written beside it and renamed: never seen half written.
+    let part = path.with_extension("png.part");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
+    let mut encoder = png::Encoder::new(&mut file, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    // Fast compression: runs take a shot every few frames, and the files
+    // are read once (converted, compared).
+    encoder.set_compression(png::Compression::Fast);
     encoder.write_header()?.write_image_data(&rgba)?;
+    std::io::Write::flush(&mut file)?;
+    drop(file);
+    std::fs::rename(&part, path)?;
     Ok(())
 }
 
