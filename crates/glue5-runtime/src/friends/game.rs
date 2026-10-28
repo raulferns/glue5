@@ -6,7 +6,8 @@
 //!   the platform's list), loaded again as it changes; the browser build's
 //!   friends and players menus, made to fail, are mended (`MENU_PATCHES`,
 //!   `card_data_init`), and what they wait for from Rockstar (crews, stats)
-//!   comes at once, empty;
+//!   comes at once, empty; with no friend yet, a friends list says so, not
+//!   that the connection was lost (`player_list_empty`);
 //! - "Send Friend Request" on a player asks it (a player met, p2p.rs), and
 //!   "Join Friends" finds the friends' sessions in their presence, as
 //!   Social Club's presence queries did;
@@ -76,15 +77,26 @@ const JOIN_AGAIN: Duration = Duration::from_secs(30);
 const LIST_AGAIN: Duration = Duration::from_secs(10);
 
 /// The browser build has no friends: its friends menus (the pause menu's
-/// FRIENDS tab, the corona's invite list) ask a virtual method whether
-/// there is a system error, and theirs is a stub that answers yes (an
-/// identical-code-folded `return 1`), so they say "the internet connection
-/// has been lost". Their vtables get the base player list's (`return 0`):
-/// (slot's address, the stub's table index, the replacement's).
+/// FRIENDS tab, online and in the story, the corona's invite list) ask a
+/// virtual method whether there is a system error, and theirs is a stub
+/// that answers yes (an identical-code-folded `return 1`), so they say "the
+/// internet connection has been lost". Their vtables get the base player
+/// list's (`return 0`): (slot's address, the stub's table index, the
+/// replacement's).
 const MENU_PATCHES: &[(u64, u64, u64)] = &[
     (5042512, 34242, 34181), // CFriendsMenuMP
+    (5043128, 34263, 34181), // CFriendsMenuSP
     (5047456, 34242, 34181), // CCoronaFriendsInviteMenu
 ];
+
+/// The patched slot's offset in a friends menu's vtable (`MENU_PATCHES`).
+const SYSTEM_ERROR_SLOT: u64 = 264;
+
+/// Whether this menu is one of the friends menus (by its vtable).
+fn is_friends_menu(m: Mem, menu: u64) -> bool {
+    let vtable = m.u64(menu);
+    MENU_PATCHES.iter().any(|&(slot, _, _)| slot - SYSTEM_ERROR_SLOT == vtable)
+}
 
 fn patch_menus(m: Mem) {
     for &(at, stub, base) in MENU_PATCHES {
@@ -217,8 +229,9 @@ pub(crate) unsafe fn update(env: *mut Env) {
         }
     }
     // Friends' sessions the player chose to join: the game asks whether to
-    // leave this one (kept until it is in one).
-    if let Some((ours, _)) = state.session {
+    // leave this one, or the story (kept while it is between sessions).
+    let ours = state.session.map(|(id, _)| id).or_else(|| (!super::in_gta_online()).then_some(0));
+    if let Some(ours) = ours {
         for id in super::take_joins() {
             unsafe { join(env, ours, id, true, false) };
         }
@@ -452,7 +465,13 @@ thread_local! {
     static IN_PLAYER_MENUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn in_player_menus<R>(f: impl FnOnce() -> R) -> R {
+/// Whether the game is putting the pause menu's tabs together, or in its
+/// lists of players and friends.
+pub(crate) fn in_player_menus() -> bool {
+    IN_PLAYER_MENUS.get()
+}
+
+fn with_player_menus<R>(f: impl FnOnce() -> R) -> R {
     // The pause menu's update runs its lists' within it.
     let outer = IN_PLAYER_MENUS.replace(true);
     let r = f();
@@ -463,30 +482,75 @@ fn in_player_menus<R>(f: impl FnOnce() -> R) -> R {
 /// Hook for `CPauseMenu::SetCurrentMenuVersion(unsigned int, bool)`: the
 /// pause menu's tabs, put together as it opens (see `social_club_connected`).
 pub(crate) unsafe extern "C" fn pause_menu_version(env: *mut Env, version: u32, a: u32) -> u32 {
-    in_player_menus(|| unsafe { orig::pause_menu_version(env, version, a) })
+    with_player_menus(|| unsafe { orig::pause_menu_version(env, version, a) })
 }
 
 /// Hook for `CPauseMenu::Update()`: it tells the menu's movie whether the
 /// player is signed in to Social Club, which shows the friends only then.
 pub(crate) unsafe extern "C" fn pause_menu_update(env: *mut Env) {
-    in_player_menus(|| unsafe { orig::pause_menu_update(env) });
+    with_player_menus(|| unsafe { orig::pause_menu_update(env) });
 }
 
 /// Hooks for `CPlayerListMenu::Update()` and `UpdateInput(int)`: the
 /// pause menu's lists of players and friends.
 pub(crate) unsafe extern "C" fn player_list_update(env: *mut Env, menu: u64) {
-    in_player_menus(|| unsafe { orig::player_list_update(env, menu) });
+    with_player_menus(|| unsafe { orig::player_list_update(env, menu) });
 }
 
 pub(crate) unsafe extern "C" fn player_list_input(env: *mut Env, menu: u64, input: u32) -> u32 {
-    in_player_menus(|| unsafe { orig::player_list_input(env, menu, input) })
+    with_player_menus(|| unsafe { orig::player_list_input(env, menu, input) })
 }
 
 /// Hook for `CPlayerListMenu::Populate(MenuScreenId)`, which the menu's
 /// movie calls back as a list opens (outside `CPauseMenu::Update`): it
 /// asks the players' crews, without which the list shows none of them.
 pub(crate) unsafe extern "C" fn player_list_populate(env: *mut Env, menu: u64, screen: u64) -> u32 {
-    in_player_menus(|| unsafe { orig::player_list_populate(env, menu, screen) })
+    with_player_menus(|| unsafe { orig::player_list_populate(env, menu, screen) })
+}
+
+thread_local! {
+    /// A friends list is telling the player it is empty.
+    static NO_FRIENDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Hook for `CPlayerListMenu::HandleNoPlayers()`: a list with no one in it
+/// (its refresh found none) warns "the internet connection has been lost",
+/// whatever the list; Social Club's lists were empty only when offline. A
+/// friends list is empty until the player has a friend: it says so (see
+/// `menu_warning`).
+pub(crate) unsafe extern "C" fn player_list_empty(env: *mut Env, menu: u64) {
+    let friends = is_friends_menu(unsafe { Mem::of(env) }, menu);
+    let outer = NO_FRIENDS.replace(friends);
+    unsafe { orig::player_list_empty(env, menu) };
+    NO_FRIENDS.set(outer);
+}
+
+/// Hook for `CMenuBase::SHOW_WARNING_MESSAGE_EX(PM_COLUMNS, char const*,
+/// char const*, int)` (the text's label, then the title's): an empty
+/// friends list's warning gets the labels of no friends (texts.rs).
+pub(crate) unsafe extern "C" fn menu_warning(env: *mut Env, menu: u64, column: u32, text: u64, title: u64, flags: u32) {
+    let ours = if NO_FRIENDS.get() { unsafe { no_friends_labels(env) } } else { None };
+    let (text, title) = ours.unwrap_or((text, title));
+    unsafe { orig::menu_warning(env, menu, column, text, title, flags) }
+}
+
+/// The labels of an empty friends list's warning, in the game's heap
+/// (made once).
+unsafe fn no_friends_labels(env: *mut Env) -> Option<(u64, u64)> {
+    static LABELS: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let mut labels = LABELS.lock().unwrap();
+    if labels.is_none() {
+        let m = unsafe { Mem::of(env) };
+        let place = |label: &str| {
+            let at = unsafe { orig::builtin_malloc(env, label.len() as u64 + 1) };
+            (at != 0).then(|| {
+                m.write_str(at, label, label.len() + 1);
+                at
+            })
+        };
+        *labels = place(crate::texts::NO_FRIENDS).zip(place(crate::texts::NO_FRIENDS_TITLE));
+    }
+    *labels
 }
 
 /// Hook for `SocialClubMgr::IsConnectedToSocialClub() const`: connected
@@ -629,11 +693,12 @@ pub(crate) unsafe extern "C" fn friends_with(env: *mut Env, gamer: u32, handle: 
     unsafe { orig::friends_with(env, gamer, handle) }
 }
 
-/// The vtables of `CMPFriendPlayerCardDataManager` (the FRIENDS tab) and
-/// `CActivePlayerCardDataManager` (the ONLINE tab's Players), and a card
-/// data manager's state (0: to read the players, 6: ready, 8 and 9:
-/// failed) and when it started reading (the engine's frame time).
-const CARD_DATA: [u64; 2] = [6188416, 6187512];
+/// The vtables of `CMPFriendPlayerCardDataManager` and
+/// `CSPFriendPlayerCardDataManager` (the FRIENDS tab, online and in the
+/// story) and `CActivePlayerCardDataManager` (the ONLINE tab's Players),
+/// and a card data manager's state (0: to read the players, 6: ready, 8
+/// and 9: failed) and when it started reading (the engine's frame time).
+const CARD_DATA: [u64; 3] = [6188416, 6188096, 6187512];
 const CARD_DATA_STATE: u64 = 204;
 const CARD_DATA_STARTED: u64 = 212;
 const FRAME_TIME: u64 = 12321192;
@@ -795,6 +860,8 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.player_list_update = Some(player_list_update);
     hooks.player_list_input = Some(player_list_input);
     hooks.player_list_populate = Some(player_list_populate);
+    hooks.player_list_empty = Some(player_list_empty);
+    hooks.menu_warning = Some(menu_warning);
     hooks.social_club_connected = Some(social_club_connected);
     hooks.gamer_online = Some(gamer_online);
     hooks.presence_send = Some(presence_send);

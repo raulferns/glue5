@@ -62,6 +62,9 @@ pub struct D3d {
     pub raster: u32,
     pub viewport: Option<[f32; 6]>,
     pub scissor: Option<[u32; 4]>,
+    /// The pixels of each 4x4 block the draws cover, of 16 (0: all): a
+    /// stipple fade (`op::STIPPLE`).
+    pub stipple: u32,
 }
 
 impl Default for D3d {
@@ -86,6 +89,7 @@ impl Default for D3d {
             raster: 0,
             viewport: None,
             scissor: None,
+            stipple: 0,
         }
     }
 }
@@ -400,6 +404,13 @@ impl Gpu {
             }
             op::PRESENT => self.present(c.w(0)),
             op::SCENE_DONE => self.scene_done(),
+            op::STIPPLE => {
+                let level = c.w(0).min(16) % 16;
+                if self.s.stipple != level {
+                    self.s.stipple = level;
+                    self.pdirty = true;
+                }
+            }
             op::FENCE => {
                 self.works.push(Work::Store { at: c.addr(0), value: c.w(2) });
                 self.flush("fence");
@@ -1183,9 +1194,9 @@ impl Gpu {
             }
             self.stats.decode_wait += t0.elapsed();
         }
-        // Memory goes right after the next submit: batches handed over
-        // earlier may still be waiting for theirs. Cached bind groups must
-        // not keep it.
+        // Handed to the submit thread with this batch, which lets it go
+        // after submitting it (see submit.rs): batches handed over earlier
+        // may still be waiting for theirs.
         match self.objs.remove(id) {
             Some(Obj::Texture(t)) => {
                 self.srv_object_changed(id);
@@ -1335,6 +1346,10 @@ impl Gpu {
         let mut frames_line = frame_times(st.frame_ms) + &on_screen(crate::present::take_on_screen());
         if let Some(ms) = crate::present::take_upscaling() {
             frames_line += &format!(", upscaling {ms:.2} ms GPU");
+        }
+        // The mods' drawings laid out (only when there are some).
+        if let (n @ 1.., ms) = crate::sprites::take_stats() {
+            frames_line += &format!(", sprites {:.2} ms a list ({n})", ms / n as f64);
         }
         let [encode, submit, gpu_wait, drawable, present, release] = self.submitter.stats.take();
         let per_frame = |d: Duration| d.as_secs_f64() * 1000.0 / frames as f64;

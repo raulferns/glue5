@@ -98,8 +98,9 @@ pub struct FriendsPage {
     removing: Option<String>,
 }
 
-/// What the game lets the page do: `started`, a game runs; `online`, it is
-/// GTA Online (friends are invited to its session, joined from it).
+/// What the game lets the page do: `started`, a game runs; `online`, it
+/// reaches GTA Online (the story too: friends are joined from it; invited
+/// to its session in GTA Online).
 pub struct Context {
     pub started: bool,
     pub online: bool,
@@ -182,7 +183,7 @@ fn friend_row(ui: &mut egui::Ui, f: &FriendInfo, page: &mut FriendsPage, game: &
     // Its session, when friends may join it (or it invited); an invite to
     // this player's, playing GTA Online.
     let can_join = f.lobby.is_some() && f.playing == Some(Playing::Online) && (!game.started || game.online);
-    let can_invite = game.online && f.playing.is_some();
+    let can_invite = game.online && friends::in_gta_online() && f.playing.is_some();
     ui.push_id(&f.key, |ui| {
         setting(ui, &format!("{dot}{}", f.name), Control::Actions, Some(status), |ui| {
             // A phone's row has room for short words.
@@ -260,7 +261,8 @@ fn invites_tab(ui: &mut egui::Ui, snapshot: &Snapshot, game: &Context, actions: 
     for f in invites {
         ui.push_id(("invite", &f.key), |ui| {
             setting(ui, &f.name, Control::Actions, Some("Sent you a multiplayer invite."), |ui| {
-                // Accepted from the start page or GTA Online (not story mode).
+                // Accepted from the start page or a game that reaches GTA
+                // Online (not the benchmark).
                 let can_accept = !game.started || game.online;
                 let labels: &[&str] = if can_accept { &["Decline", "Accept"] } else { &["Decline"] };
                 let buttons = action_buttons(ui, labels);
@@ -302,7 +304,7 @@ fn find_tab(ui: &mut egui::Ui, snapshot: &Snapshot, page: &mut FriendsPage) {
 }
 
 /// Joins a friend's session: from the start page into its lobby first;
-/// from GTA Online, the game asks whether to leave this session.
+/// from the game, it asks whether to leave this session, or the story.
 fn join(f: &FriendInfo, game: &Context, actions: &mut Vec<Action>) {
     if game.started {
         friends::join(&f.key);

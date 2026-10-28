@@ -665,6 +665,20 @@ impl P2p {
         }
     }
 
+    /// Leaves the lobbies and their players (the game is back in the story).
+    pub(crate) fn leave_lobbies(&self) {
+        let mut state = self.state.locked();
+        let state = &mut *state;
+        for lobby in state.lobbies.drain(..) {
+            state.dht.remove(&lobby.key);
+        }
+        state.peers.clear();
+        state.trying.clear();
+        self.flags.store(0, Ordering::Relaxed);
+        *self.waiting.locked() = None;
+        log::info!("p2p: out of the lobbies");
+    }
+
     /// Visits a friend's lobby (`name`), the friend at `via` introducing
     /// its players: the game can then join a session there. The oldest
     /// lobby visited makes room.

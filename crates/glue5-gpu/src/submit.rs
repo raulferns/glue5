@@ -53,8 +53,14 @@ pub struct Present {
     pub height: u32,
     /// The scene without the HUD, for a temporal upscaler (see scene.rs).
     pub scene: Option<crate::scene::SceneInputs>,
+    /// The frame's camera (view-projection, row vectors), while sprites in
+    /// the world want it.
+    pub camera: Option<[[f32; 4]; 4]>,
 }
 
+/// An object the engine destroyed, held until its batch is submitted and
+/// then dropped (see `run`).
+#[expect(dead_code, reason = "held to be dropped, never read")]
 pub enum Grave {
     Texture(wgpu::Texture),
     Buffer(wgpu::Buffer),
@@ -269,21 +275,21 @@ fn run(
             }
             last_shown = Some(Instant::now());
         }
-        // Destroying takes wgpu's device-wide resource lock for writing: it
-        // waits for the encoding threads, which hold it through a whole
-        // batch, and whatever takes it meanwhile waits behind (the command
-        // thread's recording too; 7-9 ms a frame where the engine streams).
-        // So objects go when no batch is being encoded, or two frames on.
+        // Objects the engine destroyed go when no batch is being encoded, or
+        // two frames on: wgpu's resource locks, which the encoding threads
+        // hold through a whole batch, would hold up whatever waits behind
+        // (the command thread's recording too; 7-9 ms a frame where the
+        // engine streams). They are dropped, not destroyed: wgpu frees their
+        // memory once nothing submitted or cached uses them. Destroying
+        // frees it after the last submission wgpu finds using them, and on
+        // a Pixel 8a (Mali-G715) the GPU then read freed memory about one
+        // launch in six (a page fault: the device lost); dropping them kept
+        // the same memory (the bind groups that hold them are aged).
         graves.extend(batch.graves);
         graves_frames += (batch.frame && !graves.is_empty()) as u32;
         if !graves.is_empty() && (encoding.load(Ordering::Acquire) == 0 || graves_frames >= 2) {
             let t = Instant::now();
-            for grave in graves.drain(..) {
-                match grave {
-                    Grave::Texture(t) => t.destroy(),
-                    Grave::Buffer(b) => b.destroy(),
-                }
-            }
+            graves.clear();
             graves_frames = 0;
             stats.release_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }

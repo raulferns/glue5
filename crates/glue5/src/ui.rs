@@ -24,6 +24,7 @@ use crate::settings::{PerfOverlay, Settings};
 mod chip;
 mod credits;
 mod friends;
+mod menus;
 mod mods;
 mod pages;
 mod perf;
@@ -89,6 +90,10 @@ pub enum Action {
     FindServers,
     /// Stream from this server (an address found or typed).
     UseServer(String),
+    /// The system's file picker, for a GPU driver package (Android).
+    AddDriver,
+    /// Delete the GPU driver package with this id.
+    RemoveDriver(String),
 }
 
 /// What a text field of the app's takes: the system keyboard follows it.
@@ -102,6 +107,8 @@ pub enum TextKind {
     Address,
     /// The player's name.
     Name,
+    /// A number (a mod's menu's typed entry).
+    Number,
 }
 
 /// Where the focused text field keeps its [`TextKind`] (egui's memory).
@@ -185,7 +192,8 @@ pub struct Status<'a> {
     pub mode: Mode,
     /// The last benchmark's results.
     pub benchmark: Option<&'a crate::benchmark::Results>,
-    /// The game running is GTA Online.
+    /// The game running reaches GTA Online (GTA Online, the story, the
+    /// sandbox).
     pub online: bool,
     /// Friend requests and game invites waiting for an answer.
     pub friend_requests: usize,
@@ -206,6 +214,9 @@ pub struct Status<'a> {
     pub searching: bool,
     /// A sign over the game: it waits for the server, or the server is away.
     pub stream_alert: Option<StreamAlert>,
+    /// The GPU drivers the user can add, where this GPU takes them (Android,
+    /// Adreno) or some were added.
+    pub drivers: Option<&'a crate::drivers::Drivers>,
 }
 
 /// The settings button over the game, sized like the touch controls: at the
@@ -274,6 +285,9 @@ pub struct Ui {
     /// Where the focused text field was last drawn (the system keyboard
     /// keeps it in view).
     text_rect: Option<Rect>,
+    /// The on-screen keyboard's height over the window's bottom, in points:
+    /// the pages end above it.
+    keyboard: f32,
     /// The settings button's icon.
     gear_icon: Option<egui::TextureHandle>,
 }
@@ -331,6 +345,7 @@ impl Ui {
             chip: Default::default(),
             menus_button: None,
             text_rect: None,
+            keyboard: 0.0,
             gear_icon,
         }
     }
@@ -375,10 +390,11 @@ impl Ui {
         self.repaint();
     }
 
-    /// The mods' menus (F7); again, back.
+    /// The mods' menus (F7); again, closed (where the player was in them
+    /// stays for the next time).
     pub fn toggle_mod_menus(&mut self) {
         if self.page == Some(Page::Mods) {
-            self.back();
+            self.show(self.behind);
         } else {
             self.mods.show_menus();
             self.show(Some(Page::Mods));
@@ -436,12 +452,25 @@ impl Ui {
                 self.repaint();
             }
             Some(Page::Settings) => self.show(self.home),
+            // Out of a field, or up a menu, first.
+            Some(Page::Mods) if self.mods.back(&self.ctx) => self.repaint(),
             Some(Page::Credits | Page::Friends | Page::Servers | Page::Mods) => self.show(self.behind),
             _ => {}
         }
     }
 
+    /// A mod asked for its menu (`menu:show()`): the Mods page opens at it,
+    /// unless a page is open.
+    pub fn show_mod_menu(&mut self, module: &str, menu: u32) {
+        if self.page.is_none() && self.mods.show_menu(module, menu) {
+            self.show(Some(Page::Mods));
+        }
+    }
+
     fn show(&mut self, page: Option<Page>) {
+        if self.page == Some(Page::Mods) && page != Some(Page::Mods) {
+            self.mods.closed();
+        }
         let secondary = |p: Option<Page>| matches!(p, Some(Page::Credits | Page::Friends | Page::Servers | Page::Mods));
         if secondary(page) && self.page != page {
             // One opened from another goes back where the first came from
@@ -490,6 +519,18 @@ impl Ui {
     /// keyboard on touch screens).
     pub fn wants_text(&self) -> bool {
         self.page.is_some() && self.ctx.egui_wants_keyboard_input()
+    }
+
+    /// The on-screen keyboard's height over the window's bottom, in points
+    /// ([`crate::keyboard::overlap`]): an open page is drawn again above it
+    /// as it moves.
+    pub fn keyboard(&mut self, overlap: f32) {
+        if overlap != self.keyboard {
+            self.keyboard = overlap;
+            if self.page.is_some() {
+                self.repaint();
+            }
+        }
     }
 
     /// What the focused text field takes, and where it is (in points).
@@ -698,13 +739,16 @@ impl Ui {
         let ppp = pixels_per_point(window);
         let screen = Rect::from_min_size(Pos2::ZERO, screen_size(window));
         let safe = safe_rect(window);
+        // A page ends above the on-screen keyboard (egui's content rect, where
+        // the sheets go); what is drawn over the game keeps to the safe area.
+        let keyboard = if self.page.is_some() { self.keyboard } else { 0.0 };
         let mut raw = egui::RawInput {
             screen_rect: Some(screen),
             safe_area_insets: Some(SafeAreaInsets(egui::epaint::MarginF32 {
                 left: safe.min.x - screen.min.x,
                 right: screen.max.x - safe.max.x,
                 top: safe.min.y - screen.min.y,
-                bottom: screen.max.y - safe.max.y,
+                bottom: (screen.max.y - safe.max.y).max(keyboard),
             })),
             time: Some(self.start.elapsed().as_secs_f64()),
             events: std::mem::take(&mut self.events),
@@ -763,7 +807,8 @@ impl Ui {
                 back = friends_page(&ctx, &mut self.friends, game, &mut actions);
             }
             Some(Page::Servers) => back = servers_page(&ctx, &mut self.servers, settings, status, &mut actions),
-            Some(Page::Mods) => back = mods_page(&ctx, &mut self.mods, settings, status),
+            // Its X closes it, from inside a menu too (back goes up a menu).
+            Some(Page::Mods) => go = mods_page(&ctx, &mut self.mods, settings, status).then_some(self.behind),
             None => {}
         }
         let mut output = ctx.end_pass();
@@ -878,7 +923,7 @@ fn pixels_per_point(window: &Window) -> f32 {
 
 /// Points per unit of SDL's window coordinates (event and safe area
 /// positions).
-fn points_per_window_unit(window: &Window) -> f32 {
+pub(crate) fn points_per_window_unit(window: &Window) -> f32 {
     window.pixel_density() / pixels_per_point(window)
 }
 

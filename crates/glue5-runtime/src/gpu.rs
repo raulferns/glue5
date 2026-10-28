@@ -77,6 +77,10 @@ pub mod op {
     /// Host commands, put in the ring by the host's hooks (not the engine's
     /// backend): the scene is finished in the back buffer, the HUD follows.
     pub const SCENE_DONE: u32 = 64;
+    /// The draws that follow fade as a stipple does, covering `w0` of 16
+    /// pixels in each 4x4 block (0: no stipple): an entity fading whose
+    /// shader has no technique for it (see the runtime's fades.rs).
+    pub const STIPPLE: u32 = 65;
 }
 
 /// Starts a backend on the ring; called once, from the engine thread that

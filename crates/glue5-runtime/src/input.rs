@@ -80,13 +80,33 @@ static PADS: Mutex<[Gamepad; MAX_PADS]> =
 /// it counts as held until the engine's next read.
 static PRESSED: Mutex<[u16; MAX_PADS]> = Mutex::new([0; MAX_PADS]);
 
+/// Buttons pressed and released since [`take_gamepad_changes`] last read
+/// each pad: its reader (the mods, once a frame) sees a tap that began and
+/// ended in between, as the engine does.
+static CHANGES: Mutex<[(u16, u16); MAX_PADS]> = Mutex::new([(0, 0); MAX_PADS]);
+
 /// Sets what pad `slot` reports to the engine from its next update on.
 pub fn set_gamepad(slot: usize, pad: Gamepad) {
     if slot < MAX_PADS {
         let mut pads = PADS.lock().unwrap();
-        PRESSED.lock().unwrap()[slot] |= pad.buttons & !pads[slot].buttons;
+        let (down, up) = (pad.buttons & !pads[slot].buttons, pads[slot].buttons & !pad.buttons);
+        PRESSED.lock().unwrap()[slot] |= down;
+        let mut changes = CHANGES.lock().unwrap();
+        changes[slot].0 |= down;
+        changes[slot].1 |= up;
         pads[slot] = pad;
     }
+}
+
+/// Pad `slot`'s buttons: held now, and pressed and released since the last
+/// call (for one reader besides the engine: the mods).
+pub fn take_gamepad_changes(slot: usize) -> (u16, u16, u16) {
+    if slot >= MAX_PADS {
+        return (0, 0, 0);
+    }
+    let pads = PADS.lock().unwrap();
+    let (pressed, released) = std::mem::take(&mut CHANGES.lock().unwrap()[slot]);
+    (pads[slot].buttons, pressed, released)
 }
 
 // rage::ioPad (136 bytes per pad, 4 pads).

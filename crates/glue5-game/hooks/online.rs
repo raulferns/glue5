@@ -14,7 +14,25 @@
     ("friend_matchmaking", "CNetworkSession::DoFriendMatchmaking(int, int, unsigned int, unsigned int)"),
     // Called once: the network's settings from the tunables (their defaults).
     ("network_tunables_read", "CNetworkTunablesListener::OnTunablesRead()"),
+    // The player's privileges (user content among them), as an online
+    // player's in the story too.
+    ("refresh_privileges", "CLiveManager::RefreshPrivileges()"),
+    // Whether the local player is online: in GTA Online, and in the story
+    // for what leads there (online.rs's `online_here`); the switch from the
+    // story to GTA Online, and back.
     ("presence_online", "rage::rlPresence::IsOnline(int)"),
+    ("local_player_online", "NetworkInterface::IsLocalPlayerOnline(bool)"),
+    ("ros_credentials_held", "NetworkInterface::HasValidRosCredentials(int)"),
+    // An invite the player accepted (a friend's session joined, an invite),
+    // pending until the scripts take it: from the story, that leads there.
+    ("session_info_valid", "rage::rlSessionInfo::IsValid() const"),
+    // The scripts' network events (the sign-in state changed: the story's
+    // scripts told the player is online, for that invite).
+    ("event_network_group", "GetEventScriptNetworkGroup()"),
+    ("event_network_add", "CEventGroupScriptNetwork::Add(rage::fwEvent const&)"),
+    ("ref_aware_drop", "rage::fwRefAwareBaseImpl<rage::datBase>::~fwRefAwareBaseImpl()"),
+    ("switch_to_multiplayer", "streaming_commands::SetupScriptCommands()::scrWrapped_SWITCH_TO_MULTI_FIRSTPART::Call(rage::scrThread::Info&)"),
+    ("return_to_story", "CNetworkSession::OnReturnToSinglePlayer()"),
     // The checks on the way into freemode that Rockstar's services would
     // pass: the hardware bail, privileges, the prologue, the store, the
     // network features, the mugshot photo.

@@ -12,6 +12,10 @@
     ("player_list_update", "CPlayerListMenu::Update()"),
     ("player_list_input", "CPlayerListMenu::UpdateInput(int)"),
     ("player_list_populate", "CPlayerListMenu::Populate(MenuScreenId)"),
+    // An empty list says "the internet connection has been lost": for the
+    // friends lists, the warning gets the texts of no friends.
+    ("player_list_empty", "CPlayerListMenu::HandleNoPlayers()"),
+    ("menu_warning", "CMenuBase::SHOW_WARNING_MESSAGE_EX(PM_COLUMNS, char const*, char const*, int)"),
     ("social_club_connected", "SocialClubMgr::IsConnectedToSocialClub() const"),
     ("gamer_online", "rage::rlGamerInfo::IsOnline() const"),
     // The data behind the pause menu's lists of friends (their cards).

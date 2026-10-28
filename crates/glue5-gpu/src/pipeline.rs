@@ -56,6 +56,9 @@ pub struct Recipe {
     pub variant: [u128; 4],
     /// Uses the HUD coverage program rather than the original depth blit.
     pub hud_mask: bool,
+    /// A stipple fade: the pixel stage covers this many of 16 pixels in each
+    /// 4x4 block (0: all; see [`shader::with_stipple`]).
+    pub stipple: u8,
 }
 
 /// The slots an input layout uses, each once, in element order, with the
@@ -272,10 +275,11 @@ impl Compiler {
                 let reads = |l: &u32| p.locations.contains(l) || (clip && *l == shader::CLIP_LOCATION);
                 let ps_remap = remap.as_ref().filter(|m| m.iter().any(|(from, _)| reads(from)));
                 let no_depth = p.frag_depth && r.depth_format.is_none();
-                if !alpha_test && !clip && ps_remap.is_none() && !no_depth {
+                let stipple = r.stipple;
+                if !alpha_test && !clip && ps_remap.is_none() && !no_depth && stipple == 0 {
                     Some(p.module(&self.device).ok_or_else(|| anyhow::anyhow!("pixel module failed"))?)
                 } else {
-                    let key = format!("{alpha_test}|{clip}|{ps_remap:?}|{no_depth}");
+                    let key = format!("{alpha_test}|{clip}|{ps_remap:?}|{no_depth}|{stipple}");
                     let module = p.variant(&self.device, &key, |text| {
                         let mut text = text.to_owned();
                         if alpha_test && let Some(t) = shader::with_alpha_test(&text) {
@@ -289,6 +293,9 @@ impl Compiler {
                         }
                         if let Some(map) = ps_remap {
                             text = shader::with_locations(&text, Stage::Pixel, map);
+                        }
+                        if stipple != 0 && let Some(t) = shader::with_stipple(&text, stipple) {
+                            text = t;
                         }
                         text
                     });
@@ -622,6 +629,9 @@ impl Recipe {
         if self.variant != [0; 4] {
             v["variant"] = json!(self.variant.map(|m| format!("{m:x}")));
         }
+        if self.stipple != 0 {
+            v["stipple"] = json!(self.stipple);
+        }
         v
     }
 
@@ -679,6 +689,7 @@ impl Recipe {
             depth_format: v.get("ds").and_then(Value::as_str).and_then(format::by_name),
             read_only: u("ro").unwrap_or(0) as u8,
             hud_mask: v.get("hud_mask").and_then(Value::as_bool).unwrap_or(false),
+            stipple: u("stipple").unwrap_or(0).min(15) as u8,
             variant: match v.get("variant") {
                 None => [0; 4],
                 Some(a) => {

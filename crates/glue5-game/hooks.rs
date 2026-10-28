@@ -23,6 +23,7 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/skin.rs"),
     include!("hooks/shader_settings.rs"),
     include!("hooks/shadow_reveal.rs"),
+    include!("hooks/lod_lights.rs"),
     include!("hooks/device_reset.rs"),
     include!("hooks/readback.rs"),
     include!("hooks/audio_update.rs"),
@@ -46,6 +47,7 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/stream.rs"),
     include!("hooks/prompts.rs"),
     include!("hooks/draw_lists.rs"),
+    include!("hooks/fades.rs"),
     include!("hooks/mods.rs"),
 ];
 
@@ -65,6 +67,8 @@ pub const CALLED_ONLY: &[&str] = &[
     "settings_instance",
     // shadow_reveal
     "effect_lookup_var", "effect_set_local",
+    // lod_lights
+    "d3d_map_hint",
     // device_reset
     "gpu_fence", "sprite_depth_texture", "effect_set_texture",
     // readback

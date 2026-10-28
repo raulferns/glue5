@@ -10,6 +10,16 @@ pub(super) fn focus(r: Response) -> Response {
     r
 }
 
+/// A field being edited stays in sight: while it has the focus and is not
+/// all inside the visible part of its scroll area (the page ended above the
+/// on-screen keyboard, ...), the area scrolls to it, frame after frame
+/// until it is (it follows the sheet as it shrinks).
+pub(super) fn keep_in_view(ui: &Ui, focused: bool, rect: Rect) {
+    if focused && !ui.clip_rect().contains_rect(rect) {
+        ui.scroll_to_rect(rect, None);
+    }
+}
+
 pub(super) fn close_button(ui: &mut Ui) -> Response {
     let scale = density(ui);
     let (r, response) = ui.allocate_exact_size(vec2(44.0 * scale, 44.0 * scale), Sense::click());
@@ -152,6 +162,7 @@ pub(super) fn text_field(ui: &mut Ui, label: &str, kind: TextKind, text: &mut St
         ui.painter().rect_stroke(rect, radius, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
         ui.ctx().data_mut(|d| d.insert_temp(Id::new(super::TEXT_KIND), kind));
     }
+    keep_in_view(ui, edit.has_focus(), rect);
     focus(edit)
 }
 
@@ -403,6 +414,53 @@ mod tests {
         assert!((value - 0.8).abs() < 0.001);
         assert!(changed);
         assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+    }
+
+    #[test]
+    fn a_field_being_edited_stays_above_the_keyboard() {
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut text = String::new();
+        let (mut field, mut clip, mut content) = (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
+        // The field is the last thing of a sheet that fits, until a 300-pt
+        // keyboard comes up.
+        for frame in 0..12 {
+            let keyboard = if frame < 3 { 0.0 } else { 300.0 };
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(390.0, 844.0))),
+                    safe_area_insets: Some(SafeAreaInsets(epaint::MarginF32 { bottom: keyboard, ..Default::default() })),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |root| {
+                    content = root.ctx().content_rect();
+                    let sheet = Area::new(Id::new("sheet")).fixed_pos(content.min).default_size(content.size());
+                    sheet.show(root.ctx(), |ui| {
+                        ui.set_width(content.width());
+                        ui.set_height(content.height());
+                        ScrollArea::vertical().max_height(content.height()).show(ui, |ui| {
+                            for row in 0..12 {
+                                ui.add_sized(vec2(content.width(), 44.0), Label::new(format!("Row {row}")));
+                            }
+                            let response = text_field(ui, "Plate", TextKind::Text, &mut text, "", 8);
+                            if frame == 1 {
+                                response.request_focus();
+                            }
+                            field = response.rect;
+                            clip = ui.clip_rect();
+                        });
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            if frame == 2 {
+                assert!(clip.contains_rect(field), "in sight before the keyboard: {field:?} in {clip:?}");
+            }
+        }
+        assert!(content.bottom() <= 844.0 - 300.0);
+        assert!(clip.bottom() <= content.bottom() + 0.5, "{clip:?} in {content:?}");
+        assert!(clip.contains_rect(field), "above the keyboard: {field:?} in {clip:?}");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Home and the floating settings window share the same responsive controls.
 use super::widgets::{
-    Control, action_button, choice, close_button, focus, segmented, setting, slider, text_field, toggle,
+    Control, action_button, action_buttons, choice, close_button, focus, segmented, setting, slider, text_field, toggle,
 };
 use super::{Action, Mode, Page, SettingsTab, Status, TextKind, WARN, theme};
+use crate::drivers::Drivers;
 use crate::paths::{self, MOBILE, TOUCH, TV};
 use crate::settings::{
     self, Corner, OverlayDetail, PerfOverlay, RENDER_SCALES, Settings, Source, TouchAim, TouchMode, Upscaling,
@@ -433,6 +434,12 @@ fn info(
     if let Some(why) = status.last_failure {
         card(ui, |ui| last_failure(ui, why, status.graphics_reset, actions));
     }
+    if let Some(why) = status.drivers.and_then(|d| d.fallback.as_deref()) {
+        card(ui, |ui| {
+            card_title(ui, "GPU DRIVER", Some(("Phone's", WARN)));
+            ui.label(RichText::new(why).small().color(theme::MUTED));
+        });
+    }
     ui.label(RichText::new(open_hint()).small().color(theme::MUTED));
 }
 
@@ -859,6 +866,9 @@ fn settings_items(
                     )
                 });
             }
+            if let Some(drivers) = status.drivers {
+                gpu_driver(ui, settings, drivers, started.is_none(), actions);
+            }
         }
         SettingsTab::Controls => {
             setting(ui, "Touch controls", Control::Choice, None, |ui| {
@@ -988,6 +998,38 @@ fn settings_items(
     }
 }
 
+/// The GPU driver the renderer opens at launch: the phone's or one the user
+/// added (Android, Adreno GPUs); before the game, adding and removing them.
+fn gpu_driver(ui: &mut egui::Ui, settings: &mut Settings, drivers: &Drivers, before_game: bool, actions: &mut Vec<Action>) {
+    let mut options = vec![(None, "Phone's")];
+    options.extend(drivers.packages.iter().map(|p| (Some(p.id.as_str()), p.name.as_str())));
+    let mut chosen = settings.gpu_driver.as_deref().filter(|id| options.iter().any(|(o, _)| *o == Some(id)));
+    let shown = if chosen == drivers.in_use.as_deref() { drivers.running.as_str() } else { "Next launch" };
+    let r = setting(ui, "GPU driver", Control::Choice, Some(shown), |ui| choice(ui, &mut chosen, &options))
+        .on_hover_text("Phone's: the driver it came with. Others: Adreno Tools packages added here");
+    if r.changed() {
+        settings.gpu_driver = chosen.map(str::to_owned);
+    }
+    if before_game {
+        let subtitle = if drivers.adding { "Adding…" } else { "Adreno Tools packages (.zip): Turnip, Qualcomm" };
+        setting(ui, "GPU drivers", Control::Actions, Some(subtitle), |ui| {
+            ui.add_enabled_ui(!drivers.adding, |ui| {
+                let remove = settings.gpu_driver.clone();
+                let labels: &[&str] = if remove.is_some() { &["Remove", "Add…"] } else { &["Add…"] };
+                let mut buttons = action_buttons(ui, labels).into_iter();
+                if let Some(id) = remove
+                    && buttons.next().is_some_and(|b| b.on_hover_text("Delete the chosen driver").clicked())
+                {
+                    actions.push(Action::RemoveDriver(id));
+                }
+                if buttons.next().is_some_and(|b| b.clicked()) {
+                    actions.push(Action::AddDriver);
+                }
+            });
+        });
+    }
+}
+
 fn next_start(differs: bool) -> Option<&'static str> {
     differs.then_some("Next start")
 }
@@ -1021,7 +1063,7 @@ fn game_folder(ui: &mut egui::Ui, settings: &mut Settings, status: &Status, acti
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Page, SettingsTab, Status, settings_page, start_page, theme};
+    use super::{Drivers, Mode, Page, SettingsTab, Status, settings_page, start_page, theme};
     use crate::settings::{PerfOverlay, Settings, Upscaling};
     use egui::{Id, Pos2, Rect, SafeAreaInsets, vec2};
     use std::path::Path;
@@ -1053,6 +1095,7 @@ mod tests {
             servers: &[],
             searching: false,
             stream_alert: None,
+            drivers: None,
         }
     }
 
@@ -1116,12 +1159,20 @@ mod tests {
         for (overlay, last) in [(PerfOverlay::Off, "Performance overlay"), (PerfOverlay::Glue5, "Overlay position")] {
             let mut settings = Settings::default();
             settings.overlay = overlay;
-            phone_video_options(settings, last);
+            phone_video_options(settings, None, last);
         }
+        // With an Adreno GPU, its drivers last.
+        let packages = vec![crate::drivers::Package { id: "turnip".into(), name: "Turnip".into(), library: "vulkan.ad07XX.so".into() }];
+        let drivers =
+            Drivers { packages, in_use: None, running: "Driver Build: 0e9a8a8".into(), adding: false, fallback: None };
+        let mut settings = Settings::default();
+        settings.gpu_driver = Some("turnip".into());
+        phone_video_options(settings, Some(&drivers), "GPU drivers");
     }
 
     /// The Video tab on a phone, `last` its last option.
-    fn phone_video_options(mut settings: Settings, last: &str) {
+    fn phone_video_options(mut settings: Settings, drivers: Option<&Drivers>, last: &str) {
+        let status = Status { drivers, ..status() };
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let mut tab = SettingsTab::Video;
@@ -1155,7 +1206,7 @@ mod tests {
                     settings_page(
                         root.ctx(),
                         &mut settings,
-                        &status(),
+                        &status,
                         None,
                         &mut tab,
                         &mut None,

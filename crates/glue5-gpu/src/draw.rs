@@ -491,7 +491,7 @@ impl Gpu {
         let mut key = std::mem::take(&mut self.key);
         key.clear();
         key.extend([vs.id, ps.map_or(0, |p| p.id), self.s.layout, self.s.topology, strip as u32]);
-        key.extend([self.s.blend, self.s.depth_stencil, self.s.raster, info.tail]);
+        key.extend([self.s.blend, self.s.depth_stencil, self.s.raster, info.tail, self.s.stipple]);
         key.extend(layout.slots.iter().map(|&(slot, _)| stride(slot)));
         key.extend(float32.iter().flat_map(|m| (0..4).map(move |i| (m >> (32 * i)) as u32)));
         let cell = match self.fast_pipes.get(&key[..]) {
@@ -520,6 +520,7 @@ impl Gpu {
                         ps.map_or(0, |p| p.depth),
                     ],
                     hud_mask: ps.is_some_and(|p| p.hud_mask),
+                    stipple: if ps.is_some() { self.s.stipple as u8 } else { 0 },
                 }
                 .canonical();
                 let cell = self.pipeline_for(Arc::new(recipe), vs.clone(), ps.cloned());

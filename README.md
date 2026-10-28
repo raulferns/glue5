@@ -49,6 +49,7 @@
 - **Mods in Luau, with a Studio.** Write mods in your browser, with every
   one of the game's 6,000+ native functions typed and documented. Menus
   that work with touch and controllers. Coding agents can drive it too.
+  Glue Trainer, a complete trainer, comes with it.
 
 ## Screenshots
 

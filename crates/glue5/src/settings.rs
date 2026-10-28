@@ -46,6 +46,9 @@ pub struct Settings {
     /// macOS and iOS 26): twice the frames shown, half a frame more of
     /// latency.
     pub frame_generation: bool,
+    /// The GPU driver the user added that the renderer opens at launch
+    /// (Android, Adreno GPUs: drivers.rs); none: the phone's own.
+    pub gpu_driver: Option<String>,
     /// The performance overlay over the game, and how the application's
     /// own shows.
     pub overlay: PerfOverlay,
@@ -220,6 +223,7 @@ impl Default for Settings {
             upscaler: Upscaling::MetalFx,
             sharpness: 0.5,
             frame_generation: false,
+            gpu_driver: None,
             overlay: PerfOverlay::Off,
             overlay_detail: OverlayDetail::Standard,
             overlay_corner: Corner::TopLeft,

@@ -30,6 +30,13 @@ const PROJECTS: &[(&str, &str, &str, &str)] = &[
     ("bcdec_rs", "Texture decoding", "MIT", "https://github.com/ScanMountGoat/image_dds"),
     ("snow", "The Noise protocol: friends' encrypted channel", "Apache-2.0 / MIT", "https://github.com/mcginty/snow"),
     ("Zstandard", "The game's small files, packed to stream", "BSD-3-Clause", "https://facebook.github.io/zstd"),
+    #[cfg(target_os = "android")]
+    (
+        "libadrenotools",
+        "GPU drivers added for Adreno GPUs, with liblinkernsbypass, by Billy Laws",
+        "BSD-2-Clause",
+        "https://github.com/bylaws/libadrenotools",
+    ),
     #[cfg(target_vendor = "apple")]
     ("objc2", "Apple's frameworks from Rust", "MIT", "https://github.com/madsmtm/objc2"),
     #[cfg(windows)]

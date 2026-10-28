@@ -783,6 +783,7 @@ re!(RE_VS_OUTPUT_MEMBER, r"@location\((\d+)u\)(\s*\n\s*\w+\s*:)");
 re!(RE_MAIN_INNER_CALL, r"(\n\s*main_inner\((?u:[^;])*\);)");
 re!(RE_PS_MAIN_BODY, r"(@fragment\s*fn\s+main\s*\()((?:(?u:[^()])|\((?u:[^)])*\))*)(\)(?u:[^{])*\{)");
 re!(RE_CLIP_ENABLE, r"enable\s+clip_distances\s*;\s*");
+re!(RE_POSITION_INPUT, r"@builtin\(position\)\s*(\w+)\s*:");
 re!(RE_CLIP_MEMBER, r"@builtin\(clip_distances\)\s*(\w+)\s*:\s*array<f32,\s*\d+u?>\s*,?\s*");
 re!(RE_DEPTH_MEMBER, r"@builtin\(frag_depth\)\s*(\w+)\s*:\s*f32\s*,?\s*");
 re!(
@@ -1168,6 +1169,32 @@ pub fn with_clipping(text: Option<&str>, at: u32) -> Option<String> {
     };
     let head = format!("{}{params}{}{}", &main[1], &main[3], test(&var));
     Some(text.replacen(&main[0], &head, 1))
+}
+
+/// A pixel shader that covers `level` of 16 pixels in each 4x4 block (1 to
+/// 15) and discards the others first, in a 4x4 ordered dither: a stipple
+/// fade, which the engine makes with the blend state's sample mask (the
+/// backend has none) and draws with techniques some shaders lack (see the
+/// runtime's fades.rs).
+pub fn with_stipple(text: &str, level: u8) -> Option<String> {
+    let main = RE_PS_MAIN_BODY.captures(text)?;
+    let params = &main[2];
+    let (params, var) = match RE_POSITION_INPUT.captures(params) {
+        Some(c) => (params.to_owned(), c[1].to_owned()),
+        None if params.trim().is_empty() => ("@builtin(position) g5_position : vec4<f32>".to_owned(), "g5_position".to_owned()),
+        None => (format!("{params}, @builtin(position) g5_position : vec4<f32>"), "g5_position".to_owned()),
+    };
+    // Bayer 4x4: 4 * M(low bits) + M(high bits), M the 2x2 one: ((x ^ y) << 1) | y.
+    let test = format!(
+        "\n  let g5_x = u32({var}.x) & 3u;\n  let g5_y = u32({var}.y) & 3u;\n  \
+         let g5_low = (((g5_x ^ g5_y) & 1u) << 1u) | (g5_y & 1u);\n  \
+         let g5_high = ((((g5_x ^ g5_y) >> 1u) & 1u) << 1u) | (g5_y >> 1u);\n  \
+         if ((4u * g5_low + g5_high) >= {level}u) {{\n    discard;\n  }}"
+    );
+    let head = format!("{}{params}{}{test}", &main[1], &main[3]);
+    let text = text.replacen(&main[0], &head, 1);
+    // What the shader samples after the discard is in non-uniform control flow.
+    Some(if text.contains("derivative_uniformity") { text } else { format!("diagnostic(off, derivative_uniformity);\n{text}") })
 }
 
 /// Moves inter-stage locations (`map`: from -> to) in a vertex shader's
@@ -1662,11 +1689,42 @@ fn main(@location(0u) v0 : vec2<f32>) -> tint_symbol_1 {
             } else if text.contains("@builtin(clip_distances)") || text.contains("@fragment") {
                 failed.push(format!("{}: not adapted for GPUs without clip distances", path.display()));
             }
+            // As a stipple fade draws it.
+            if text.contains("@fragment") {
+                let ok = with_stipple(&text, 6)
+                    .ok_or_else(|| "not rewritten".to_owned())
+                    .and_then(|t| naga::front::wgsl::parse_str(&t).map_err(|e| e.to_string()))
+                    .and_then(|m| validator.validate(&m).map(|_| ()).map_err(|e| format!("{e:?}")));
+                if let Err(e) = ok {
+                    failed.push(format!("{} (stipple): {}", path.display(), e.lines().next().unwrap_or("")));
+                }
+            }
             let bindings = reflect_bindings(&text);
             assert!(bindings.iter().all(|(_, b)| b.binding != PACKED_CBUFFERS || b.kind == Kind::Uniform));
         }
         assert!(failed.is_empty(), "{} of {n} failed:\n{}", failed.len(), failed[..failed.len().min(10)].join("\n"));
         assert!(n > 4000);
+    }
+
+    #[test]
+    fn stipples() {
+        let validate = |text: &str| {
+            let module = naga::front::wgsl::parse_str(text).unwrap();
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap();
+        };
+        // Without a position input: one is added.
+        let plain = "@group(0) @binding(0) var t : texture_2d<f32>;\n@group(0) @binding(1) var s : sampler;\n\
+                     @fragment\nfn main(@location(0u) uv : vec4<f32>) -> @location(0) vec4<f32> {\n  return textureSample(t, s, uv.xy);\n}\n";
+        let out = with_stipple(plain, 6).unwrap();
+        assert!(out.contains("@builtin(position) g5_position") && out.contains(">= 6u"));
+        validate(&out);
+        // With one: it is read.
+        let positioned = "@fragment\nfn main(@builtin(position) p : vec4<f32>) -> @location(0) vec4<f32> {\n  return p;\n}\n";
+        let out = with_stipple(positioned, 12).unwrap();
+        assert!(out.contains("u32(p.x)") && !out.contains("g5_position"));
+        validate(&out);
     }
 
     #[test]

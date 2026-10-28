@@ -15,7 +15,10 @@
 mod app;
 mod audio;
 mod benchmark;
+mod device;
+mod drivers;
 mod haptics;
+mod keyboard;
 mod keymap;
 mod pads;
 mod paths;
@@ -23,6 +26,8 @@ mod settings;
 mod sharing;
 mod touch;
 mod ui;
+
+pub use device::name as device_name;
 
 use sdl3::messagebox::{MessageBoxFlag, show_simple_message_box};
 

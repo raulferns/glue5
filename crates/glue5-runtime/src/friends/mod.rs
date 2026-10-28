@@ -1965,6 +1965,12 @@ pub fn pending() -> usize {
     with(|s, _| s.pending()).unwrap_or(0)
 }
 
+/// Whether the player is in GTA Online (its friends may be invited to its
+/// session), not in the story or the menus.
+pub fn in_gta_online() -> bool {
+    with(|s, _| s.local.playing == Playing::Online).unwrap_or(false)
+}
+
 pub fn snapshot() -> Snapshot {
     with(|s, _| {
         let mut friends: Vec<FriendInfo> = s

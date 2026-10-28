@@ -29,7 +29,8 @@ packages they need with sdkmanager (versions in
 
 Every task first runs `mise run setup`, which prepares wgpu, wgpu-core,
 wgpu-hal and wasm2c with [our patches](../patches/README.md) (only when
-they change). Run cargo by hand through mise too: in a shell with
+they change), and fetches the other sources the build takes at pinned
+versions (Luau, libadrenotools for Android, ...). Run cargo by hand through mise too: in a shell with
 `mise activate`, or `mise exec -- cargo ...`.
 
 Compiled C objects are cached in `target/glue5-tools/objcache`, shared by
@@ -147,12 +148,14 @@ and `GLUE5_*` variables on to the device.
 | `RUST_LOG` | Log filter (default `info`): renderer statistics every 10 s (frame times, CPU time per stage, memory). |
 | `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too (it is always in `game.log` in the user folder). |
 | `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-benchmark -benchmarkIterations=1`. |
+| `GLUE5_DEVICE_NAME` | The name GLUE 5 Studio's pages show for this device (by default its own: the computer's or the phone's name in the system's settings; on iOS, "iPhone" or "iPad" without Apple's user-assigned-device-name entitlement). |
 | `GLUE5_PLAY=1` | Start the game without the start page (`--play` on a computer). |
 | `GLUE5_GPU_PROFILE=1` | GPU time per render pass in the statistics. |
 | `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1`, `GLUE5_NO_ETC2=1` | A phone GPU's fallbacks on a desktop GPU, for testing. |
 | `GAMERESOURCEMB`, `KEEPTHREADS` | The engine's module settings, as the browser build reads them. |
 | `GLUE5_ALLOW_UNKNOWN_BUILD=1` | Build against a `game.wasm` other than the supported one. |
 | `GLUE5_TEAM` | The Apple development team that signs the iOS and tvOS apps. |
+| `GLUE5_BUNDLE_ID` | The iOS and tvOS apps' bundle identifier (default `local.glue5`): another one when Apple says the default "is not available" to your team. |
 
 ## Optimised builds (experimental)
 

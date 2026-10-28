@@ -27,7 +27,7 @@ use crate::paths::{self, MOBILE, TOUCH, TV};
 use crate::settings::{self, PerfOverlay, Settings, Source, TouchMode, Upscaling};
 use crate::touch::{self, Touch};
 use crate::ui::{self, Action, Mode, Page, Started, Status, Ui};
-use crate::{audio, benchmark, keymap, pads};
+use crate::{audio, benchmark, drivers, keymap, pads};
 
 /// The settings button's opacity over the game while the touch controls
 /// are hidden (a controller in use, or touch off): there, but faint.
@@ -92,15 +92,20 @@ pub fn run() -> Result<()> {
         builder.metal_view();
     }
     let window = builder.build()?;
+    crate::keyboard::init(&window);
     let pixels = window.size_in_pixels();
     settings.for_screen(pixels.1);
 
     let presentation = Presentation::new(pixels, settings.vsync, upscaler(&settings));
     presentation.set_metal_hud(settings.overlay == PerfOverlay::MetalHud);
     let overlay = glue5_gpu::Overlay::default();
-    let instance = glue5_gpu::instance();
+    // On the GPU driver the user chose (Android), if it opens.
     #[cfg(target_os = "android")]
-    let surfaces = instance.clone();
+    let (instance, mut driver_note) = drivers::instance(&user_dir, &mut settings.gpu_driver);
+    #[cfg(not(target_os = "android"))]
+    let (instance, driver_note) = (glue5_gpu::instance(), None::<String>);
+    #[cfg(target_os = "android")]
+    let mut surfaces = instance.clone();
     // The window outlives the renderer: the process exits with it.
     #[cfg(not(target_os = "tvos"))]
     let surface = unsafe {
@@ -121,7 +126,24 @@ pub fn run() -> Result<()> {
         surface,
         presentation: presentation.clone(),
         overlay: overlay.clone(),
-    })?;
+    });
+    // A driver the user added that loads but cannot open its GPU: the
+    // phone's, now.
+    #[cfg(target_os = "android")]
+    let screen = match screen {
+        Err(e) if settings.gpu_driver.is_some() => {
+            driver_note = Some(drivers::device_failed(&user_dir, &mut settings.gpu_driver, &e));
+            let instance = glue5_gpu::instance();
+            surfaces = instance.clone();
+            let surface = unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_display_and_window(&window, &window)?)?
+            };
+            Screen::open(glue5_gpu::Window { instance, surface, presentation: presentation.clone(), overlay: overlay.clone() })
+        }
+        screen => screen,
+    };
+    let screen = screen?;
+    let drivers = gpu_drivers(&user_dir, &settings, &screen.adapter_info(), driver_note);
     // While the system resizes the window in a loop of its own (macOS,
     // Windows), events wait for it to end, and so does this loop; SDL still
     // calls watches, and from there the renderer follows the window. The
@@ -203,6 +225,10 @@ pub fn run() -> Result<()> {
         touch_mouse: Default::default(),
         lifecycle,
         folder: None,
+        driver_mark: drivers.as_ref().is_some_and(|d| d.in_use.is_some()),
+        drivers,
+        driver_pick: None,
+        driver_adding: None,
         game_dir: None,
         problem: None,
         stream: None,
@@ -211,6 +237,7 @@ pub fn run() -> Result<()> {
         sharing: None,
         studio: None,
         studio_failed: None,
+        device: crate::device::name(),
         servers: Arc::default(),
         stream_waiting: None,
         last_failure: None,
@@ -230,6 +257,10 @@ pub fn run() -> Result<()> {
         game: None,
     };
     app.last_failure = std::fs::read_to_string(app.user_dir.join(FAILURE_FILE)).ok();
+    if app.drivers.as_ref().is_some_and(|d| d.fallback.is_some()) {
+        // The setting went back to the phone's driver.
+        app.settings.save(&app.user_dir);
+    }
     app.find_game(args.game_dir.as_deref());
     if args.play {
         match app.settings.source {
@@ -328,6 +359,10 @@ impl Typing {
             Typing::App(ui::TextKind::Code) => (TextInputType::Text, Capitalization::Letters, false),
             Typing::App(ui::TextKind::Address) => (TextInputType::Text, Capitalization::None, false),
             Typing::App(ui::TextKind::Name) => (TextInputType::Text, Capitalization::Words, false),
+            Typing::App(ui::TextKind::Number) if cfg!(not(target_os = "ios")) => {
+                (TextInputType::Number, Capitalization::None, false)
+            }
+            Typing::App(ui::TextKind::Number) => (TextInputType::Text, Capitalization::None, false),
             Typing::Game(TextType::Email) => (TextInputType::Email, Capitalization::None, false),
             Typing::Game(TextType::Password) => (TextInputType::PasswordHidden, Capitalization::None, false),
             Typing::Game(TextType::Numeric) if cfg!(not(target_os = "ios")) => {
@@ -385,7 +420,14 @@ struct App {
     /// menu's).
     touch_mouse: touch::Mouse,
     lifecycle: Arc<Lifecycle>,
-    folder: Option<FolderPick>,
+    folder: Option<Pick>,
+    /// The GPU drivers the user can add, where the settings show them.
+    drivers: Option<drivers::Drivers>,
+    /// The launch's driver mark is still there (see drivers.rs).
+    driver_mark: bool,
+    /// The file picker for a driver package, then its unpacking.
+    driver_pick: Option<Pick>,
+    driver_adding: Option<std::thread::JoinHandle<Result<drivers::Package, String>>>,
     /// The game's folder, once found.
     game_dir: Option<PathBuf>,
     /// Why it was not, or a folder chosen that is not one.
@@ -405,7 +447,10 @@ struct App {
     studio: Option<(glue5_mods::studio::Studio, ui::StudioInfo)>,
     /// The Studio could not start (both ports taken): when, and as what; not
     /// tried again for a while.
-    studio_failed: Option<(Instant, (bool, String))>,
+    studio_failed: Option<(Instant, bool)>,
+    /// This device's name, which the Studio's pages show (read once: UIKit
+    /// wants the main thread).
+    device: String,
     /// Servers found on the network by the last search, and whether one runs.
     servers: Arc<Mutex<(bool, Vec<ui::FoundServer>)>>,
     /// Engine reads have waited for the server since then.
@@ -633,6 +678,13 @@ impl App {
     fn update(&mut self, page_before: Option<Page>) -> Result<bool> {
         self.keep_sources();
         self.update_studio();
+        // A mod asked for its menu (`menu:show()`): not while something is
+        // typed (nor over another page, `show_mod_menu`).
+        if let Some((module, menu)) = glue5_mods::take_menu_show()
+            && self.typing.is_none()
+        {
+            self.ui.show_mod_menu(&module, menu);
+        }
         let in_game = self.game.is_some();
         // Touch controls: a virtual pad in slot 0 unless a controller has it.
         let show = in_game
@@ -745,6 +797,7 @@ impl App {
         let stream = stream.as_ref().map(|c| (c.server(), c.status()));
         let stream_alert = self.stream_alert(stream.as_ref().map(|(_, s)| s));
         let servers = self.servers.lock().unwrap().clone();
+        self.ui.keyboard(crate::keyboard::overlap(&self.window));
         if in_game || (!self.lifecycle.background.load(Ordering::Relaxed) && self.ui.wants_frame()) {
             let status = Status {
                 game_dir: self.game_dir.as_deref(),
@@ -761,7 +814,7 @@ impl App {
                 preparing: self.play_requested.then(|| self.screen.as_ref().and_then(Screen::progress)).flatten(),
                 mode: self.mode,
                 benchmark: self.benchmark.as_ref(),
-                online: self.game.is_some() && self.mode == Mode::Online,
+                online: self.game.is_some() && matches!(self.mode, Mode::Story | Mode::Sandbox | Mode::Online),
                 friend_requests: glue5_runtime::friends::pending(),
                 source: self.settings.source,
                 stream: stream.as_ref().map(|(server, status)| (*server, status)),
@@ -772,17 +825,21 @@ impl App {
                 servers: &servers.1,
                 searching: servers.0,
                 stream_alert,
+                drivers: self.drivers.as_ref(),
             };
             // The settings button: on touch screens always, so that it stays
             // with a controller in use or the touch controls off.
             let gear =
                 (in_game && (TOUCH || show)).then_some(if show { self.settings.touch_opacity } else { GEAR_ALONE });
             actions = self.ui.frame(&self.window, &mut self.settings, &status, show.then_some(&self.touch), gear);
-            if let Some(screen) = &mut self.screen
-                && !screen.show_ui()
-            {
-                // Not shown (the window not visible yet, ...): again soon.
-                self.ui.repaint_in(Duration::from_millis(100));
+            if let Some(screen) = &mut self.screen {
+                if !screen.show_ui() {
+                    // Not shown (the window not visible yet, ...): again soon.
+                    self.ui.repaint_in(Duration::from_millis(100));
+                } else if self.driver_mark {
+                    self.driver_mark = false;
+                    drivers::shown(&self.user_dir);
+                }
             }
         }
         for action in actions {
@@ -796,7 +853,7 @@ impl App {
                     }
                     self.play()?;
                 }
-                Action::ChooseGame => self.folder = Some(FolderPick::start(&self.window)),
+                Action::ChooseGame => self.folder = Some(Pick::folder(&self.window)),
                 Action::FindGame => self.find_game(None),
                 Action::ResetGraphics => self.reset_graphics(),
                 Action::JoinFriend { key, lobby } => {
@@ -823,12 +880,24 @@ impl App {
                     self.settings.source = Source::Server;
                     self.settings.save(&self.user_dir);
                 }
+                Action::AddDriver => self.driver_pick = Some(Pick::zip(&self.window)),
+                Action::RemoveDriver(id) => {
+                    drivers::remove(&self.user_dir, &id);
+                    if self.settings.gpu_driver.as_deref() == Some(id.as_str()) {
+                        self.settings.gpu_driver = None;
+                    }
+                    self.settings.save(&self.user_dir);
+                    if let Some(d) = &mut self.drivers {
+                        d.packages = drivers::list(&self.user_dir);
+                    }
+                }
             }
         }
+        self.add_driver();
         if self.play_requested {
             self.play()?;
         }
-        if let Some(choice) = self.folder.as_ref().and_then(FolderPick::poll) {
+        if let Some(choice) = self.folder.as_ref().and_then(Pick::poll) {
             self.folder = None;
             self.chosen(choice);
         }
@@ -836,8 +905,10 @@ impl App {
         let page = self.ui.page();
         if page != page_before {
             if let Some(input) = self.game.as_ref().and_then(|g| g.input.as_ref()) {
-                // Nothing stays pressed in the game behind a page.
+                // Nothing stays pressed in the game behind a page (nor for
+                // the mods).
                 input.release_all();
+                glue5_mods::input::release_all();
             }
             if matches!(page_before, Some(Page::Settings | Page::Servers | Page::Mods)) {
                 self.settings.save(&self.user_dir);
@@ -878,6 +949,9 @@ impl App {
         if typing != self.typing {
             if self.typing.is_some() {
                 self.text_input.stop(&self.window);
+            }
+            if let Some(typing) = typing {
+                crate::keyboard::typing(matches!(typing, Typing::App(_)));
             }
             if let Some(typing) = typing
                 && let Err(e) = self.text_input.start_with_options(&self.window, typing.options())
@@ -993,7 +1067,7 @@ impl App {
         let s = &self.settings;
         let back_buffer = settings::render_size(self.window.size_in_pixels(), s.render_scale(), s.low_memory);
         if s.mods {
-            glue5_mods::install(&paths::mods_dir(&self.user_dir));
+            glue5_mods::install(&mods_dir(&self.user_dir));
         }
         let game = glue5_runtime::start(
             glue5_runtime::Config {
@@ -1007,9 +1081,12 @@ impl App {
                 benchmark: self.mode == Mode::Benchmark,
                 low_memory: s.low_memory,
                 max_fps: s.max_fps,
-                online: (self.mode == Mode::Online).then(|| glue5_runtime::Online {
+                // The story and the sandbox with the network up: GTA Online
+                // from their pause menu.
+                online: matches!(self.mode, Mode::Story | Mode::Sandbox | Mode::Online).then(|| glue5_runtime::Online {
                     name: s.online_name.trim().into(),
                     lobby: self.join.take().unwrap_or_default(),
+                    freemode: self.mode == Mode::Online,
                 }),
                 language: preferred_language(),
             },
@@ -1084,6 +1161,46 @@ impl App {
             sdl3::messagebox::show_message_box(MessageBoxFlag::ERROR, buttons, "Glue 5", &text, &self.window, None);
         if let Ok(ClickedButton::CustomButton(ButtonData { button_id: 1, .. })) = shown {
             relaunch(false);
+        }
+    }
+
+    /// The driver package picked (Settings › Video), unpacked by a thread of
+    /// its own: a zip of tens of megabytes, from wherever the picker found it.
+    fn add_driver(&mut self) {
+        if let Some(choice) = self.driver_pick.as_ref().and_then(Pick::poll) {
+            self.driver_pick = None;
+            if let Some(path) = choice {
+                let user_dir = self.user_dir.clone();
+                self.driver_adding = Some(std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut zip = Vec::new();
+                    let mut file = sdl3::iostream::IOStream::from_file(&path, "r").map_err(|e| e.to_string())?;
+                    file.read_to_end(&mut zip).map_err(|e| e.to_string())?;
+                    drivers::add(&user_dir, &zip)
+                }));
+                if let Some(d) = &mut self.drivers {
+                    d.adding = true;
+                }
+            }
+        }
+        if !self.driver_adding.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            if self.driver_adding.is_some() {
+                self.ui.repaint_in(Duration::from_millis(200));
+            }
+            return;
+        }
+        let added = self.driver_adding.take().and_then(|t| t.join().ok()).unwrap_or(Err("it failed".into()));
+        match added {
+            Ok(p) => {
+                self.ui.note(format!("{} added: Glue 5 runs on it from the next launch.", p.name));
+                self.settings.gpu_driver = Some(p.id);
+                self.settings.save(&self.user_dir);
+            }
+            Err(e) => self.ui.note(format!("Cannot add the GPU driver: {e}")),
+        }
+        if let Some(d) = &mut self.drivers {
+            d.adding = false;
+            d.packages = drivers::list(&self.user_dir);
         }
     }
 
@@ -1261,7 +1378,7 @@ impl App {
     /// while it is on.
     fn update_studio(&mut self) {
         if self.settings.mods && glue5_mods::dir().is_none() {
-            glue5_mods::open(&paths::mods_dir(&self.user_dir));
+            glue5_mods::open(&mods_dir(&self.user_dir));
         }
         // None yet, "New" pressed, or not a code (an edited settings file).
         let code = match glue5_mods::studio::normalize(&self.settings.studio_code) {
@@ -1272,22 +1389,29 @@ impl App {
                 self.settings.studio_code.clone()
             }
         };
-        let wanted = (self.settings.mods && glue5_mods::dir().is_some() && self.settings.studio)
-            .then(|| (self.settings.studio_lan, code.clone()));
-        if self.studio.as_ref().map(|(s, _)| (s.lan(), s.token().to_string())) == wanted {
+        let wanted = (self.settings.mods && glue5_mods::dir().is_some() && self.settings.studio).then_some(self.settings.studio_lan);
+        if let Some((studio, info)) = &mut self.studio
+            && Some(studio.lan()) == wanted
+        {
+            // A new code: what is paired stays paired, the server serves on.
+            if studio.code() != code {
+                studio.set_code(&code);
+                info.code = studio.pairing_code();
+                self.ui.repaint();
+            }
             return;
         }
-        if let (Some((at, tried)), Some(w)) = (&self.studio_failed, &wanted)
-            && tried == w
+        if let (Some((at, tried)), Some(lan)) = (&self.studio_failed, wanted)
+            && *tried == lan
             && at.elapsed() < Duration::from_secs(10)
         {
             return;
         }
         self.studio = None;
-        if let Some((lan, code)) = wanted {
+        if let Some(lan) = wanted {
             // The usual port, else any (another app has it).
-            let started = glue5_mods::studio::Studio::start(glue5_mods::studio::PORT, lan, &code)
-                .or_else(|_| glue5_mods::studio::Studio::start(0, lan, &code));
+            let started = glue5_mods::studio::Studio::start(glue5_mods::studio::PORT, lan, &code, &self.device)
+                .or_else(|_| glue5_mods::studio::Studio::start(0, lan, &code, &self.device));
             match started {
                 Ok(studio) => {
                     let host = if lan {
@@ -1297,6 +1421,7 @@ impl App {
                     };
                     let info = ui::StudioInfo {
                         url: studio.url(&host),
+                        control: studio.control_url(&host),
                         code: studio.pairing_code(),
                         lan,
                     };
@@ -1305,7 +1430,7 @@ impl App {
                 }
                 Err(e) => {
                     log::warn!("studio: {e}");
-                    self.studio_failed = Some((Instant::now(), (lan, code)));
+                    self.studio_failed = Some((Instant::now(), lan));
                 }
             }
         }
@@ -1520,6 +1645,14 @@ impl App {
     }
 }
 
+/// The mods folder, with the mods that come with GLUE 5 put there (once a
+/// run of the app).
+fn mods_dir(user_dir: &Path) -> PathBuf {
+    let dir = paths::mods_dir(user_dir);
+    glue5_mods::bundled::install(&dir);
+    dir
+}
+
 /// The whole game downloaded from a server into `dir`: a copy (it has the
 /// server's catalog) that is complete (it lost the partial copy's marker).
 fn is_whole_download(dir: &Path) -> bool {
@@ -1647,12 +1780,25 @@ fn game_input(
             let (ww, wh) = window.size();
             input.mouse_position((x * bw / ww as f32) as i32, (y * bh / wh as f32) as i32);
             input.mouse_motion(xrel.round() as i32, yrel.round() as i32);
+            glue5_mods::input::mouse_position(x / ww.max(1) as f32, y / wh.max(1) as f32);
         }
-        Event::MouseButtonDown { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), true),
-        Event::MouseButtonUp { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), false),
-        Event::MouseWheel { y, .. } => input.mouse_wheel(y.round() as i32),
+        Event::MouseButtonDown { mouse_btn, .. } => {
+            input.mouse_button(mouse_bit(mouse_btn), true);
+            glue5_mods::input::mouse_button(mouse_bit(mouse_btn), true);
+        }
+        Event::MouseButtonUp { mouse_btn, .. } => {
+            input.mouse_button(mouse_bit(mouse_btn), false);
+            glue5_mods::input::mouse_button(mouse_bit(mouse_btn), false);
+        }
+        Event::MouseWheel { y, .. } => {
+            input.mouse_wheel(y.round() as i32);
+            glue5_mods::input::mouse_wheel(y.round() as i32);
+        }
         Event::Window { win_event: WindowEvent::FocusGained, .. } => input.focus(true),
-        Event::Window { win_event: WindowEvent::FocusLost, .. } => input.focus(false),
+        Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+            input.focus(false);
+            glue5_mods::input::release_all();
+        }
         _ => {}
     }
 }
@@ -1679,6 +1825,8 @@ fn relaunch(play: bool) {
 fn key(input: &InputBlock, sc: sdl3::keyboard::Scancode, down: bool) {
     if let Some(vk) = keymap::vk(sc) {
         input.key(vk, down);
+        // The key itself for the mods, not its generic code or alias.
+        glue5_mods::input::key(vk, down);
         if let Some(generic) = keymap::generic(vk) {
             input.key(generic, down);
         }
@@ -1699,21 +1847,54 @@ fn mouse_bit(b: MouseButton) -> u32 {
     }
 }
 
-/// The system's folder picker, answered asynchronously (SDL calls back on
-/// the main thread while events are pumped).
-struct FolderPick(Arc<Mutex<Option<Option<PathBuf>>>>);
+/// What the settings show of the GPU drivers the user can add: on Android
+/// with an Adreno GPU (Qualcomm's), or once some were added; `fallback`,
+/// why the one chosen does not run.
+fn gpu_drivers(
+    user_dir: &Path,
+    settings: &Settings,
+    info: &wgpu::AdapterInfo,
+    fallback: Option<String>,
+) -> Option<drivers::Drivers> {
+    const QUALCOMM: u32 = 0x5143;
+    let packages = drivers::list(user_dir);
+    if !cfg!(target_os = "android") || (info.vendor != QUALCOMM && packages.is_empty() && fallback.is_none()) {
+        return None;
+    }
+    // Its version, as the driver gives it (Qualcomm's: its build, date,
+    // compiler...).
+    let version = info.driver_info.split(',').next().map(str::trim).filter(|v| !v.is_empty());
+    let running = version.unwrap_or(&info.driver).chars().take(60).collect();
+    Some(drivers::Drivers { packages, in_use: settings.gpu_driver.clone(), running, adding: false, fallback })
+}
 
-impl FolderPick {
-    fn start(window: &sdl3::video::Window) -> FolderPick {
-        let picked: Arc<Mutex<Option<Option<PathBuf>>>> = Default::default();
+/// The system's folder or file picker, answered asynchronously (SDL calls
+/// back on the main thread while events are pumped).
+struct Pick(Picked);
+
+type Picked = Arc<Mutex<Option<Option<PathBuf>>>>;
+
+impl Pick {
+    fn folder(window: &sdl3::video::Window) -> Pick {
+        let picked = Picked::default();
+        sdl3::dialog::show_open_folder_dialog(None::<&str>, false, window, Pick::answer(&picked));
+        Pick(picked)
+    }
+
+    /// A zip file (Android: a content:// URI, which SDL opens too).
+    fn zip(window: &sdl3::video::Window) -> Pick {
+        let picked = Picked::default();
+        let filters = [sdl3::dialog::DialogFileFilter { name: "Zip archives", pattern: "zip" }];
+        if let Err(e) = sdl3::dialog::show_open_file_dialog(&filters, None::<&str>, false, window, Pick::answer(&picked)) {
+            log::warn!("no file picker: {e:?}");
+            *picked.lock().unwrap() = Some(None);
+        }
+        Pick(picked)
+    }
+
+    fn answer(picked: &Picked) -> sdl3::dialog::DialogCallback {
         let slot = picked.clone();
-        sdl3::dialog::show_open_folder_dialog(
-            None::<&str>,
-            false,
-            window,
-            Box::new(move |result, _| *slot.lock().unwrap() = Some(result.ok().and_then(|mut v| v.pop()))),
-        );
-        FolderPick(picked)
+        Box::new(move |result, _| *slot.lock().unwrap() = Some(result.ok().and_then(|mut v| v.pop())))
     }
 
     /// `Some(choice)` once answered (`Some(None)`: cancelled).
