@@ -27,6 +27,7 @@
 //! Which lobby the player's session is in, for its kind, is online.rs's.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use glue5_game::{Env, exports, orig};
@@ -229,11 +230,18 @@ pub(crate) unsafe fn update(env: *mut Env) {
         }
     }
     // Friends' sessions the player chose to join: the game asks whether to
-    // leave this one, or the story (kept while it is between sessions).
-    let ours = state.session.map(|(id, _)| id).or_else(|| (!super::in_gta_online()).then_some(0));
-    if let Some(ours) = ours {
-        for id in super::take_joins() {
-            unsafe { join(env, ours, id, true, false) };
+    // leave this one, or the story (kept while it is between sessions). In
+    // GTA Online before the player may join one (in the creator, the
+    // tutorial), the friend is followed instead.
+    let online = super::in_gta_online();
+    if let Some(ours) = state.session.map(|(id, _)| id).or_else(|| (!online).then_some(0)) {
+        let joins = super::take_joins();
+        if online && !joins.is_empty() && !unsafe { may_join(env) } {
+            joins.into_iter().for_each(super::follow_gamer);
+        } else {
+            for id in joins {
+                unsafe { join(env, ours, id, true, false) };
+            }
         }
     }
     drop(state);
@@ -277,9 +285,13 @@ unsafe fn session_id(env: *mut Env, text: &str) -> Option<u64> {
 }
 
 /// Joins the session of the friend followed (gamer id `id`), once this
-/// player's own has settled; done when they share one.
+/// player's own has settled and it may join one; done when they share one.
 unsafe fn follow(env: *mut Env, state: &mut State, id: u64, now: Instant) {
     let Some((ours, since)) = state.session else { return };
+    if !unsafe { may_join(env) } {
+        super::follow_later();
+        return;
+    }
     let may_ask = now - since >= SETTLED && state.joined.is_none_or(|t| now - t >= JOIN_AGAIN);
     match unsafe { join(env, ours, id, may_ask, true) } {
         Some(Joining::There) => {
@@ -289,6 +301,43 @@ unsafe fn follow(env: *mut Env, state: &mut State, id: u64, now: Instant) {
         Some(Joining::Asked) => state.joined = Some(now),
         None => {}
     }
+}
+
+/// Whether GTA Online's scripts block invites (`NETWORK_BLOCK_INVITES`: on
+/// the way into freemode, in the tutorial).
+static INVITES_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Hook for `InviteMgr::BlockInvitesFromScript(bool)`.
+unsafe extern "C" fn invites_blocked(env: *mut Env, block: u32) {
+    INVITES_BLOCKED.store(block != 0, Ordering::Relaxed);
+    unsafe { orig::invites_blocked(env, block) }
+}
+
+/// `MPPLY_LAST_MP_CHAR` (the player's character slot) and
+/// `MP<slot>_CHAR_ISACTIVE` (whether the slot has a character): the stats
+/// the scripts ask.
+const LAST_CHARACTER: u32 = 0x2f2f_120f;
+const CHARACTER_ACTIVE: [u32; 2] = [0x79dc_c136, 0x8819_ed33];
+
+/// Whether GTA Online's scripts take the player into a friend's session
+/// now: it has a character (the creator is behind it) and they do not
+/// block invites. They drop the invite otherwise ("you need to create a
+/// character", "still on the tutorial"). Asked in a game session only: the
+/// engine's stats are not there from the start.
+unsafe fn may_join(env: *mut Env) -> bool {
+    if INVITES_BLOCKED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let m = unsafe { Mem::of(env) };
+    unsafe {
+        with_stack(env, 8, |out| {
+            let slot = if crate::stats::get_int(env, LAST_CHARACTER, out, u32::MAX) != 0 { m.u32(out) } else { 0 };
+            m.set_u32(out, 0);
+            let active = CHARACTER_ACTIVE[(slot as usize).min(1)];
+            crate::stats::get_bool(env, active, out, u32::MAX) != 0 && m.u32(out) != 0
+        })
+    }
+    .unwrap_or(false)
 }
 
 enum Joining {
@@ -868,6 +917,7 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.presence_post = Some(presence_post);
     hooks.session_invites = Some(session_invites);
     hooks.session_by_gamer = Some(session_by_gamer);
+    hooks.invites_blocked = Some(invites_blocked);
     hooks.invite_accept = Some(invite_accept);
 }
 

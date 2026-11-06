@@ -426,24 +426,6 @@ by its MIN alpha blend and keeps the original depth pixel program with the
 world-space transform vertex shader. Neither correction changes game assets.
 The same mask variant is selected when compiling recorded recipes ahead.
 
-**Fading peds (stipple fades).** An entity fading (its alpha below 255: a
-ped coming or going with the distance, a script's SET_ENTITY_ALPHA) is
-drawn in the deferred fade pass, which forces the "deferredalphaclip"
-technique group without MSAA (stipple fades: the engine's stipple is the
-blend state's sample mask, which the backend's SET_BLEND drops). A shader
-with no technique for the forced group draws nothing, and this game's
-`ped.fxc` has none (its hair shaders do): a fading ped was its hair. The
-runtime's `fades.rs` hooks `grmShader::BeginDraw`: when it gives no passes
-for a fade group, the shader's "deferred" technique draws instead, and the
-fading entity's alpha (`CShaderLib::SetStippleAlpha`) goes to the renderer
-as `op::STIPPLE` (a host command, as `SCENE_DONE`), off again at `EndDraw`.
-With a stipple on, the recipe has the level (of 16 pixels in each 4x4
-block) and the pixel program discards the others in a 4x4 ordered dither
-(`shader::with_stipple`, every game shader validates with it). The cost is
-a branch on a failed BeginDraw, and up to 15 pixel variants of the ped
-programs, compiled when first used (a fading ped is missing until then)
-and recorded for the next start.
-
 ## Application UI and game menus
 
 The engine supplies the PC front end, including loading screens, the pause

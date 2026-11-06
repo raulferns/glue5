@@ -20,7 +20,11 @@ PC: the pause menu's **ONLINE** tab (**Play GTA Online** and its
 sessions, **Join Friends**, the creators); its **FRIENDS** tab shows your
 friends and who is playing. A friend's invite, or **Join** on the Friends
 page, takes you to your friend's session too: the game asks whether to
-leave, loads your GTA Online character and goes there. The story itself
+leave, loads your GTA Online character and goes there. With no character
+yet you make one first: the invite waits through the creator (and the
+tutorial, if you play it) and then takes you to your friend. Touch play
+aims with assistance, a friend with a mouse aims freely: you play together
+all the same, with no warning about the targeting mode. The story itself
 stays offline: only those menus and the way into GTA Online see the
 network.
 

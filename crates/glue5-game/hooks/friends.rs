@@ -48,6 +48,9 @@
     ("invite_accept", "InviteMgr::AcceptInvite(rage::rlSessionInfo const&, rage::rlGamerInfo const&, rage::rlGamerHandle const&, unsigned int, unsigned int, int, char const*, int, int)"),
     ("join_request", "InviteMgr::HandleJoinRequest(rage::rlSessionInfo const&, rage::rlGamerInfo const&, rage::rlGamerHandle const&, unsigned int)"),
     ("invite_auto_confirm", "InviteMgr::AutoConfirmInvite()"),
+    // Invites blocked by the scripts (on the way into freemode, in the
+    // tutorial): a friend's session waits.
+    ("invites_blocked", "InviteMgr::BlockInvitesFromScript(bool)"),
     // A session's info, as text for friends and back.
     ("session_info", "rage::snSession::GetSessionInfo() const"),
     ("session_info_text", "rage::rlSessionInfo::ToString(char*, unsigned int, unsigned int*) const"),

@@ -8,9 +8,11 @@
 //! It costs little: the renderer gathers its figures only while it shows
 //! (glue5_gpu::perf), the overlay is redrawn 20 times a second (its one
 //! line 4 times), its numbers change 4 times a second and the threads are
-//! read once a second.
+//! read once a second, on a thread of their own: on Windows that walks every
+//! thread of the system (tens of milliseconds), which no frame waits for.
 
 use std::collections::HashMap;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, FontId, Id, LayerId, Order, Pos2, Rect, Shape, Stroke, pos2, vec2};
@@ -71,6 +73,8 @@ struct Threads {
     /// CPU time so far, by thread.
     last: HashMap<u64, Duration>,
     at: Option<Instant>,
+    /// The next sample, being read off the frame.
+    pending: Option<JoinHandle<(Instant, Vec<glue5_runtime::cpu::Thread>)>>,
     /// The busiest, with their share of a core (percent).
     busiest: Vec<(String, f32)>,
     /// The engine's main thread's share.
@@ -79,9 +83,22 @@ struct Threads {
 }
 
 impl Threads {
-    fn sample(&mut self) {
-        let now = Instant::now();
-        let threads = glue5_runtime::cpu::threads();
+    /// Takes the sample read meanwhile, and starts the next when due.
+    fn update(&mut self, now: Instant) {
+        if self.pending.as_ref().is_some_and(|p| p.is_finished()) {
+            if let Some(Ok((at, threads))) = self.pending.take().map(JoinHandle::join) {
+                self.sample(at, threads);
+            }
+        }
+        if self.pending.is_none() && self.at.is_none_or(|t| now - t >= THREADS) {
+            self.pending = std::thread::Builder::new()
+                .name("perf threads".into())
+                .spawn(|| (Instant::now(), glue5_runtime::cpu::threads()))
+                .ok();
+        }
+    }
+
+    fn sample(&mut self, now: Instant, threads: Vec<glue5_runtime::cpu::Thread>) {
         let wall = self.at.map(|t| now - t);
         let mut shares: Vec<(String, f32)> = Vec::new();
         let mut last = HashMap::with_capacity(threads.len());
@@ -133,8 +150,8 @@ impl PerfHud {
             self.figures = figures(&snapshot);
         }
         let detail = settings.overlay_detail;
-        if detail != OverlayDetail::Minimal && self.threads.at.is_none_or(|t| now - t >= THREADS) {
-            self.threads.sample();
+        if detail != OverlayDetail::Minimal {
+            self.threads.update(now);
         }
         // The frame time aimed at: the frame rate's limit, else the display's.
         let budget = 1000.0 / if settings.max_fps > 0 { settings.max_fps as f32 } else { status.refresh_rate.max(1.0) };

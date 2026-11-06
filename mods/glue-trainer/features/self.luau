@@ -346,14 +346,6 @@ local function body(root: Menu)
 			next = 0
 		end,
 	})
-	-- Faded as the game fades people (a stipple: some pixels drawn, the others not).
-	bind.slider(root, "self.alpha", "See-through", 255, 0, 255, { step = 15, note = "255: solid; less to fade, as a ghost" }, function(v)
-		if v >= 255 then
-			entity.resetEntityAlpha(game.me())
-		else
-			entity.setEntityAlpha(game.me(), v, false)
-		end
-	end)
 	-- Fire from the mouth, as long as it is on (and fireproof meanwhile).
 	local flame: number? = nil
 	bind.feature(root, "self.breatheFire", "Breathe fire", "Flames from your mouth", {

@@ -79,6 +79,10 @@ struct Args {
     /// (as the app's story mode), instead of straight into freemode.
     #[arg(long, requires = "online")]
     story: bool,
+    /// Play as the touch controls do (a phone's): the engine on its pad
+    /// path, aim assist Full (the Targeting Mode touch play forces).
+    #[arg(long)]
+    touch: bool,
     /// The game's benchmark (a fly-through of the map; the run ends with
     /// it, results in the user directory).
     #[arg(long)]
@@ -264,6 +268,10 @@ fn main() -> Result<()> {
         }
         None => None,
     };
+    if args.touch {
+        glue5_runtime::input::set_touch_play(true);
+        glue5_runtime::input::set_touch_targeting(glue5_runtime::input::Targeting::Full);
+    }
     let game = glue5_runtime::start(
         glue5_runtime::Config {
             game_dir,

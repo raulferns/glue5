@@ -39,10 +39,12 @@ const METHODS: u64 = 64;
 /// sessions (the lobby is the LAN, vnet.rs), no cloud files, catalog,
 /// shop transactions or online policies to wait for, sessions for everyone
 /// whatever their aim (the game keeps players aiming freely, with a mouse,
-/// apart from assisted ones, as touch play on a phone is: they never met), and the story's prologue taken as played (joining a
-/// friend's session asks for it: "GTA Online will be available once you
-/// have completed the prologue", and the game answered the friend's
-/// session every frame).
+/// apart from assisted ones, as touch play on a phone is: they never met;
+/// invites and their sessions' hosts too, `event_network_add` and
+/// `host_aim_preference`), and the story's prologue taken as played
+/// (joining a friend's session asks for it: "GTA Online will be available
+/// once you have completed the prologue", and the game answered the
+/// friend's session every frame).
 pub(crate) const ENGINE_ARGS: &[&str] = &[
     "-lan",
     "-netSessionIgnoreAim",
@@ -305,6 +307,36 @@ unsafe fn tell_online(env: *mut Env) {
         let _ = exports::_emscripten_stack_restore(env, top);
     }
     log::info!("online: the story's scripts told the player is online, for an invite");
+}
+
+/// The invite events the scripts get (`CEventNetworkInviteAccepted`,
+/// `CEventNetworkInviteConfirmed`: their vtables) and, in their data, the
+/// aim of the invite's session (the script's field 16, at +160).
+const INVITE_EVENTS: [u64; 2] = [6208512, 6209600];
+const INVITE_AIM: u64 = 160;
+
+/// Hook for `CEventGroupScriptNetwork::Add(rage::fwEvent const&)`: the
+/// scripts' network events. An invite's session aims as the player does:
+/// sessions here are for everyone whatever their aim (`ENGINE_ARGS`'
+/// -netSessionIgnoreAim), and the scripts would turn the invite down
+/// otherwise ("a different targeting mode"), or make the player aim as
+/// the session does, which touch play's aim assist then undoes, the
+/// warning coming again.
+pub(crate) unsafe extern "C" fn event_network_add(env: *mut Env, group: u64, event: u64) -> u64 {
+    let m = unsafe { Mem::of(env) };
+    if INVITE_EVENTS.contains(&m.u64(event)) {
+        m.set_u32(event + INVITE_AIM, unsafe { orig::gamepad_aim_state(env) });
+    }
+    unsafe { orig::event_network_add(env, group, event) }
+}
+
+/// Hook for `NETWORK_SESSION_GET_HOST_AIM_PREFERENCE`: the session's host
+/// aims as the player does, for the same reason; the scripts joining a
+/// session by an invite would make the player aim as the host otherwise.
+pub(crate) unsafe extern "C" fn host_aim_preference(env: *mut Env, info: u64) {
+    unsafe { orig::host_aim_preference(env, info) };
+    let m = unsafe { Mem::of(env) };
+    m.set_u32(m.u64(info), unsafe { orig::aim_state(env) });
 }
 
 /// Rockstar's cloud tunables never come: their request counts as over
@@ -844,6 +876,8 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.rl_offline_name = Some(offline_name);
     hooks.live_manager_init = Some(live_manager_init);
     hooks.live_manager_update = Some(live_manager_update);
+    hooks.event_network_add = Some(event_network_add);
+    hooks.host_aim_preference = Some(host_aim_preference);
     hooks.session_host_config = Some(session_host_config);
     hooks.freeroam_matchmaking = Some(freeroam_matchmaking);
     hooks.friend_matchmaking = Some(friend_matchmaking);
